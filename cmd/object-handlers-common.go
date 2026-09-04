@@ -228,6 +228,30 @@ func writeHeadersPrecondition(w http.ResponseWriter, objInfo ObjectInfo) {
 	}
 }
 
+// Validates the preconditions for DELETE. Returns true if DELETE operation should not proceed.
+// Preconditions supported are:
+//
+//	If-Match
+func checkPreconditionsDELETE(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo, opts ObjectOptions) bool {
+	// Return false for methods other than DELETE.
+	if r.Method != http.MethodDelete {
+		return false
+	}
+
+	// If-Match : Delete the object only if its entity tag (ETag) is the same as the one specified;
+	// otherwise return a 412 (precondition failed).
+	ifMatchETagHeader := r.Header.Get(xhttp.IfMatch)
+	if ifMatchETagHeader != "" {
+		if !isETagEqual(objInfo.ETag, ifMatchETagHeader) {
+			writeHeadersPrecondition(w, objInfo)
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL)
+			return true
+		}
+	}
+
+	return false
+}
+
 // Validates the preconditions. Returns true if GET/HEAD operation should not proceed.
 // Preconditions supported are:
 //

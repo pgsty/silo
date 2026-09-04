@@ -2007,6 +2007,23 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	if opts.CheckPrecondFn != nil {
+		if gerr != nil {
+			if isErrObjectNotFound(gerr) || isErrVersionNotFound(gerr) {
+				// If-Match on a missing object cannot be satisfied.
+				if opts.HasIfMatch {
+					return objInfo, gerr
+				}
+			} else {
+				// For any other error (e.g. quorum errors), do not proceed with
+				// conditional delete without a verified ObjectInfo/ETag.
+				return objInfo, gerr
+			}
+		} else if opts.CheckPrecondFn(goi) {
+			return objInfo, PreConditionFailed{}
+		}
+	}
+
 	if opts.EvalMetadataFn != nil {
 		dsc, err := opts.EvalMetadataFn(&goi, gerr)
 		if err != nil {

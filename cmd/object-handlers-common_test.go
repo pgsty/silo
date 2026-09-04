@@ -179,3 +179,80 @@ func TestCheckPreconditions(t *testing.T) {
 		})
 	}
 }
+
+// Tests - checkPreconditionsDELETE()
+func TestCheckPreconditionsDELETE(t *testing.T) {
+	objInfo := ObjectInfo{ETag: "abc123"}
+
+	testCases := []struct {
+		name         string
+		method       string
+		ifMatch      string
+		expectedFlag bool
+		expectedCode int
+	}{
+		// Non-DELETE method should always return false
+		{
+			name:         "Non-DELETE method ignored",
+			method:       http.MethodGet,
+			ifMatch:      "abc123",
+			expectedFlag: false,
+			expectedCode: 200,
+		},
+		// If-Match with matching ETag — precondition passes, delete proceeds
+		{
+			name:         "If-Match matching ETag",
+			method:       http.MethodDelete,
+			ifMatch:      "abc123",
+			expectedFlag: false,
+			expectedCode: 200,
+		},
+		// If-Match with non-matching ETag — precondition fails, 412
+		{
+			name:         "If-Match non-matching ETag",
+			method:       http.MethodDelete,
+			ifMatch:      "wrong-etag",
+			expectedFlag: true,
+			expectedCode: 412,
+		},
+		// If-Match with wildcard — always matches
+		{
+			name:         "If-Match wildcard",
+			method:       http.MethodDelete,
+			ifMatch:      "*",
+			expectedFlag: false,
+			expectedCode: 200,
+		},
+		// If-Match with quoted ETag — should still match
+		{
+			name:         "If-Match quoted ETag",
+			method:       http.MethodDelete,
+			ifMatch:      "\"abc123\"",
+			expectedFlag: false,
+			expectedCode: 200,
+		},
+		// No conditional headers — no precondition check
+		{
+			name:         "No conditional headers",
+			method:       http.MethodDelete,
+			expectedFlag: false,
+			expectedCode: 200,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(tc.method, "/bucket/a", bytes.NewReader([]byte{}))
+			if tc.ifMatch != "" {
+				request.Header.Set(xhttp.IfMatch, tc.ifMatch)
+			}
+			actualFlag := checkPreconditionsDELETE(t.Context(), recorder, request, objInfo, ObjectOptions{})
+			if tc.expectedFlag != actualFlag {
+				t.Errorf("test: %s, got flag: %v, want: %v", tc.name, actualFlag, tc.expectedFlag)
+			}
+			if tc.expectedCode != recorder.Code {
+				t.Errorf("test: %s, got code: %d, want: %d", tc.name, recorder.Code, tc.expectedCode)
+			}
+		})
+	}
+}

@@ -77,7 +77,7 @@ type ObjectOptions struct {
 	MaxParts            int                 // used in GetObjectAttributes. Signals how many parts we should return
 	PartNumberMarker    int                 // used in GetObjectAttributes. Signals the part number after which results should be returned
 	PartNumber          int                 // only useful in case of GetObject/HeadObject
-	CheckPrecondFn      CheckPreconditionFn // only set during GetObject/HeadObject/CopyObjectPart preconditional valuation
+	CheckPrecondFn      CheckPreconditionFn // optional precondition check for conditional requests (If-Match, If-None-Match, etc.)
 	EvalMetadataFn      EvalMetadataFn      // only set for retention settings, meant to be used only when updating metadata in-place.
 	DeleteReplication   ReplicationState    // Represents internal replication state needed for Delete replication
 	Transition          TransitionOptions

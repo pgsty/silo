@@ -3730,6 +3730,57 @@ func testAPIDeleteObjectHandler(obj ObjectLayer, instanceType, bucketName string
 		}
 	}
 
+	// Test DELETE precondition checks (If-Match).
+	// Upload a dedicated object so that the tests below have a known ETag to work with.
+	precondObjectName := "test-precond-object"
+	precondData := generateBytesData(1 * humanize.MiByte)
+	_, err = obj.PutObject(context.Background(), bucketName, precondObjectName,
+		mustGetPutObjReader(t, bytes.NewReader(precondData), int64(len(precondData)), "", ""),
+		ObjectOptions{})
+	if err != nil {
+		t.Fatalf("MinIO %s: Failed to put precondition test object: %v", instanceType, err)
+	}
+
+	// (1) If-Match with a wrong ETag must return 412 and the object must remain.
+	rec1 := httptest.NewRecorder()
+	req1, err := newTestSignedRequestV4(http.MethodDelete, getDeleteObjectURL("", bucketName, precondObjectName),
+		0, nil, credentials.AccessKey, credentials.SecretKey,
+		map[string]string{xhttp.IfMatch: "wrong-etag"})
+	if err != nil {
+		t.Fatalf("MinIO %s: Failed to create DELETE request with wrong If-Match: %v", instanceType, err)
+	}
+	apiRouter.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusPreconditionFailed {
+		t.Errorf("MinIO %s: If-Match (wrong ETag): expected status %d, got %d",
+			instanceType, http.StatusPreconditionFailed, rec1.Code)
+	}
+	// The object must still exist after a failed conditional delete.
+	if _, err = obj.GetObjectInfo(context.Background(), bucketName, precondObjectName, ObjectOptions{}); err != nil {
+		t.Errorf("MinIO %s: If-Match (wrong ETag): object should still exist after failed delete, got err: %v",
+			instanceType, err)
+	}
+
+	// (2) If-Match on a non-existent key must return 404 with a NoSuchKey error code.
+	rec3 := httptest.NewRecorder()
+	req3, err := newTestSignedRequestV4(http.MethodDelete, getDeleteObjectURL("", bucketName, "non-existent-key"),
+		0, nil, credentials.AccessKey, credentials.SecretKey,
+		map[string]string{xhttp.IfMatch: "some-etag-value"})
+	if err != nil {
+		t.Fatalf("MinIO %s: Failed to create DELETE request for non-existent key with If-Match: %v", instanceType, err)
+	}
+	apiRouter.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusNotFound {
+		t.Errorf("MinIO %s: If-Match on missing key: expected status %d, got %d",
+			instanceType, http.StatusNotFound, rec3.Code)
+	}
+	var apiErr3 APIErrorResponse
+	if xmlErr := xml.Unmarshal(rec3.Body.Bytes(), &apiErr3); xmlErr != nil {
+		t.Errorf("MinIO %s: If-Match on missing key: failed to parse error response: %v", instanceType, xmlErr)
+	} else if apiErr3.Code != "NoSuchKey" {
+		t.Errorf("MinIO %s: If-Match on missing key: expected S3 error code %q, got %q",
+			instanceType, "NoSuchKey", apiErr3.Code)
+	}
+
 	// Test for Anonymous/unsigned http request.
 	anonReq, err := newTestRequest(http.MethodDelete, getDeleteObjectURL("", bucketName, anonObjectName), 0, nil)
 	if err != nil {

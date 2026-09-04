@@ -2846,6 +2846,19 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
+	ifMatch := r.Header.Get(xhttp.IfMatch)
+
+	if ifMatch != "" {
+		opts.HasIfMatch = true
+		opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+			if _, err := DecryptObjectInfo(&oi, r); err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return true
+			}
+			return checkPreconditionsDELETE(ctx, w, r, oi, opts)
+		}
+	}
+
 	rcfg, _ := globalBucketObjectLockSys.Get(bucket)
 	if rcfg.LockEnabled && opts.DeletePrefix {
 		apiErr := toAPIError(ctx, errInvalidArgument)
@@ -2910,7 +2923,17 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
+		if _, ok := err.(PreConditionFailed); ok {
+			// Request was aborted by CheckPrecondFn (e.g. precondition, auth/decrypt).
+			// Response has already been written by the closure; do not write another.
+			return
+		}
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			if opts.HasIfMatch {
+				// If-Match conditional delete on a non-existent object should fail.
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
+			}
 			// Send an event when the object is not found
 			objInfo.Name = object
 			objInfo.VersionID = opts.VersionID
