@@ -501,6 +501,7 @@ func initAllSubsystems(ctx context.Context) {
 	globalTierConfigMgr = NewTierConfigMgr()
 
 	globalTransitionState = newTransitionState(GlobalContext)
+	globalAccessTierState = newAccessTierState(GlobalContext)
 	globalSiteResyncMetrics = newSiteResyncMetrics(GlobalContext)
 }
 
@@ -1068,6 +1069,10 @@ func serverMain(ctx *cli.Context) {
 
 		bootstrapTrace("globalTransitionState.Init", func() {
 			globalTransitionState.Init(newObject)
+		})
+		bootstrapTrace("globalAccessTierState.Init", func() {
+			globalAccessTierState.Init(newObject)
+			go globalAccessTracker.run(GlobalContext, newObject)
 		})
 
 		go func() {

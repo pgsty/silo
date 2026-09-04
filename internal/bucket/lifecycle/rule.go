@@ -41,6 +41,7 @@ type Rule struct {
 	Expiration          Expiration          `xml:"Expiration,omitempty"`
 	Transition          Transition          `xml:"Transition,omitempty"`
 	DelMarkerExpiration DelMarkerExpiration `xml:"DelMarkerExpiration,omitempty"`
+	AccessTransition    AccessTransition    `xml:"AccessTransition,omitempty"`
 	// FIXME: add a type to catch unsupported AbortIncompleteMultipartUpload AbortIncompleteMultipartUpload `xml:"AbortIncompleteMultipartUpload,omitempty"`
 	NoncurrentVersionExpiration NoncurrentVersionExpiration `xml:"NoncurrentVersionExpiration,omitempty"`
 	NoncurrentVersionTransition NoncurrentVersionTransition `xml:"NoncurrentVersionTransition,omitempty"`
@@ -171,10 +172,13 @@ func (r Rule) Validate() error {
 	if err := r.validateNoncurrentTransition(); err != nil {
 		return err
 	}
+	if err := r.AccessTransition.Validate(); err != nil {
+		return err
+	}
 	if (!r.Filter.Tag.IsEmpty() || len(r.Filter.And.Tags) != 0) && !r.DelMarkerExpiration.Empty() {
 		return errInvalidRuleDelMarkerExpiration
 	}
-	if !r.Expiration.set && !r.Transition.set && !r.NoncurrentVersionExpiration.set && !r.NoncurrentVersionTransition.set && r.DelMarkerExpiration.Empty() {
+	if !r.Expiration.set && !r.Transition.set && !r.NoncurrentVersionExpiration.set && !r.NoncurrentVersionTransition.set && r.DelMarkerExpiration.Empty() && !r.AccessTransition.set {
 		return errXMLNotWellFormed
 	}
 	return nil

@@ -118,6 +118,10 @@ type ObjectOptions struct {
 	SkipRebalancing bool
 
 	SrcPoolIdx int // set by PutObject/CompleteMultipart operations due to rebalance; used to prevent rebalance src, dst pools to be the same
+	// DstPoolIdx forces a data-movement write onto a specific server pool.
+	// It is ignored unless DataMovement is true; a pointer keeps pool zero
+	// distinguishable from the unset value.
+	DstPoolIdx *int
 
 	DataMovement bool // indicates an going decommisionning or rebalacing
 

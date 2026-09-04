@@ -225,6 +225,17 @@ For deployments with [bucket](https://silo.pgsty.com/administration/bucket-repli
 | `minio_node_ilm_transition_active_tasks`                     | Number of active ILM transition tasks.                                                                     |
 | `minio_node_ilm_transition_pending_tasks`                    | Number of pending ILM transition tasks in the queue.                                                       |
 | `minio_node_ilm_transition_missed_immediate_tasks`           | Number of missed immediate ILM transition tasks.                                                           |
+| `minio_node_ilm_access_tier_active_tasks`                    | Number of active access-tier pool moves.                                                                   |
+| `minio_node_ilm_access_tier_pending_tasks`                   | Number of pending access-tier pool moves.                                                                  |
+| `minio_node_ilm_access_tier_promotions_total`                | Total objects promoted by access-tier ILM.                                                                 |
+| `minio_node_ilm_access_tier_demotions_total`                 | Total objects demoted by access-tier ILM.                                                                  |
+| `minio_node_ilm_access_tier_bytes_moved_total`               | Total logical bytes moved by access-tier ILM.                                                              |
+| `minio_node_ilm_access_tier_failures_total`                  | Total failed access-tier ILM moves.                                                                        |
+| `minio_node_ilm_access_tier_skipped_watermark_total`         | Promotions skipped because the hot pool reached its watermark.                                             |
+| `minio_node_ilm_access_tier_skipped_max_size_total`          | Promotions skipped because the cluster hot-tier size cap was reached.                                      |
+| `minio_node_ilm_access_tier_skipped_bucket_quota_total`      | Promotions skipped because the bucket hot-tier quota was reached.                                          |
+| `minio_node_ilm_access_tier_hot_bytes`                       | Logical bytes currently accounted to the hot tier, labeled by bucket.                                      |
+| `minio_node_ilm_access_tier_samples_dropped_total`           | GET samples dropped because the access tracker queue was full.                                             |
 | `minio_node_ilm_versions_scanned`                            | Total number of object versions checked for ilm actions since server start.                                |
 | `minio_node_ilm_action_count_delete_action`                  | Total action outcome of lifecycle checks since server start for deleting object                            |
 | `minio_node_ilm_action_count_delete_version_action`          | Total action outcome of lifecycle checks since server start for deleting a version                         |

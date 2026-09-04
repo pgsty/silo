@@ -226,6 +226,128 @@ aws s3api restore-object --bucket srcbucket \
 
 Note that transition event notification is a Silo extension.
 
+## 5. Access-based tiering between server pools
+
+Silo can move frequently read objects to a faster server pool and return them
+to a slower pool after they become idle. This is different from remote ILM
+transition: the object remains a native local object and all versions move
+together.
+
+Access tiering requires at least two server pools. Pool indices follow the
+order on the server command line:
+
+~~~sh
+silo server /srv/nvme{1...4} /srv/hdd{1...8}
+#             pool 0 (fast)   pool 1 (slow)
+~~~
+
+Server pools are erasure-coding expansion units, not individual drives. Each
+pool should consist of internally homogeneous media.
+
+The feature is disabled by default. Configure the topology and safety limits
+with `mc admin config set`; ILM is a dynamic subsystem, so this applies without
+a restart. Environment variables (`MINIO_ILM_ACCESS_TIERING`,
+`MINIO_ILM_ACCESS_POOLS`, `MINIO_ILM_ACCESS_MAX_SIZE`,
+`MINIO_ILM_ACCESS_PROMOTE_WATERMARK`, `MINIO_ILM_ACCESS_BIN_WIDTH`,
+`MINIO_ILM_ACCESS_BINS`, `MINIO_ILM_ACCESS_FLUSH`,
+`MINIO_ILM_ACCESS_MIN_RESIDENCY`, `MINIO_ILM_ACCESS_WORKERS`,
+`MINIO_ILM_ACCESS_MAX_TRACKED`) are read at process start and override the
+stored config.
+
+~~~sh
+mc admin config set local ilm \
+  access_tiering=on \
+  access_pools="0,1" \
+  access_max_size="2TiB" \
+  access_promote_watermark=85 \
+  access_bin_width=1m \
+  access_bins=12 \
+  access_flush=1m \
+  access_min_residency=24h \
+  access_workers=10 \
+  access_max_tracked=1000000
+~~~
+
+The pool list is ordered hottest to coldest. With three or more pools,
+promotion always targets the first index and demotion always targets the last;
+intermediate pools are not hop targets. An access_max_size value of zero means
+no cluster-wide logical-byte cap. Promotion also stops when the hottest pool
+reaches access_promote_watermark.
+
+New PUTs still land via the usual free-space pool picker; they are not steered
+onto the cold pool. Size the capacity pool larger than the hot pool so new
+objects tend to land there.
+
+Add an AccessTransition to the bucket lifecycle XML:
+
+~~~xml
+<LifecycleConfiguration>
+  <AccessTierQuota>500GiB</AccessTierQuota>
+  <Rule>
+    <ID>hot-logs</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <And>
+        <Prefix>logs/</Prefix>
+        <ObjectSizeGreaterThan>65536</ObjectSizeGreaterThan>
+      </And>
+    </Filter>
+    <AccessTransition>
+      <Window>10m</Window>
+      <PromoteAfterAccesses>100</PromoteAfterAccesses>
+      <DemoteAfterAccesses>5</DemoteAfterAccesses>
+      <DemoteAfterIdle>24h</DemoteAfterIdle>
+    </AccessTransition>
+  </Rule>
+</LifecycleConfiguration>
+~~~
+
+This promotes a matching object after 100 successful GETs in 10 minutes. An
+object becomes eligible to return to the coldest configured pool only after
+access tiering has already moved it (the `x-minio-internal-ilm-atier` stamp),
+it has stayed put for the server-wide minimum residency, it has been idle at
+least 24 hours, and it has no more than 5 GETs in the window. Objects that
+landed on the hot pool via a normal PUT never demote. Prefix, tag, and
+object-size lifecycle filters are honored.
+
+Access-based moves are a parallel path: they are not lifecycle `Eval` actions
+and do not appear in S3 prediction headers. If the same object is also due
+for age-based remote `Transition` or expiry, that scanner action wins and
+demotion discovery is skipped for that pass; promotions still run from the
+GET tracker. Site replication copies expiry rules only, same as remote
+Transition, so AccessTransition stays local to the cluster.
+
+AccessTierQuota is an optional bucket-wide cap. Promotion checks, in order:
+
+1. hot-pool used percentage;
+2. cluster-wide access_max_size;
+3. bucket AccessTierQuota.
+
+Demotion is not blocked by these caps and is processed before promotion.
+Access moves pause during rebalance or decommission, never target a suspended
+pool, skip remotely transitioned objects and objects with excessive version
+counts, and recheck eligibility while holding the object namespace lock.
+
+The hit counter is intentionally best effort. Only successfully served GET
+requests count; HEAD requests do not. Counters are merged across nodes and
+bounded by access_max_tracked. A rule window longer than
+access_bin_width multiplied by access_bins is clamped to retained history.
+
+AccessTransition and AccessTierQuota are Silo lifecycle extensions. A stock
+AWS SDK that reads and rewrites the lifecycle configuration may discard
+unknown fields. Use a raw signed S3 PUT lifecycle request, such as
+[setup_ilm_access_tiering.sh](setup_ilm_access_tiering.sh), when installing
+the rule. Save the XML above as `rule.xml`, then run:
+
+~~~sh
+AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+  ./setup_ilm_access_tiering.sh http://127.0.0.1:9000 testbucket us-east-1 rule.xml
+~~~
+
+Access-tier activity is exposed under /minio/metrics/v3/ilm, including move
+counts, moved bytes, queue depth, hot bytes per bucket, failed moves, dropped
+GET samples, and separate skip counters for each capacity limit.
+
 ## Explore Further
 
 - [MinIO Go client API reference (S3-compatible SDK)](https://pkg.go.dev/github.com/minio/minio-go/v7)

@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
 	"github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
@@ -101,9 +102,54 @@ func (a Action) Delete() bool {
 
 // Lifecycle - Configuration for bucket lifecycle.
 type Lifecycle struct {
-	XMLName         xml.Name   `xml:"LifecycleConfiguration"`
+	XMLName xml.Name `xml:"LifecycleConfiguration"`
+	// AccessTierQuota caps how many bytes of this bucket access-based ILM
+	// may keep on the fastest pool, e.g. "500GiB". Empty means unlimited.
+	// It is bucket-wide rather than per-rule so it cannot be declared
+	// inconsistently by two rules matching the same object.
+	AccessTierQuota string     `xml:"AccessTierQuota,omitempty"`
 	Rules           []Rule     `xml:"Rule"`
 	ExpiryUpdatedAt *time.Time `xml:"ExpiryUpdatedAt,omitempty"`
+}
+
+// HasAccessTransition returns 'true' if any enabled rule carries a usable
+// AccessTransition. Used as a cheap per-bucket gate before consulting the
+// access tracker.
+func (lc Lifecycle) HasAccessTransition() bool {
+	for _, rule := range lc.Rules {
+		if rule.Status == Disabled {
+			continue
+		}
+		if !rule.AccessTransition.IsNull() {
+			return true
+		}
+	}
+	return false
+}
+
+// AccessRule returns the first enabled rule matching obj that carries a usable
+// AccessTransition, along with its rule ID.
+func (lc Lifecycle) AccessRule(obj ObjectOpts) (AccessTransition, string, bool) {
+	for _, rule := range lc.FilterRules(obj) {
+		if !rule.AccessTransition.IsNull() {
+			return rule.AccessTransition, rule.ID, true
+		}
+	}
+	return AccessTransition{}, "", false
+}
+
+// AccessQuotaBytes returns the bucket-wide fast-pool byte cap, 0 meaning
+// unlimited. The value is validated at PUT time, so a parse failure here is
+// treated as unlimited rather than as an error.
+func (lc Lifecycle) AccessQuotaBytes() uint64 {
+	if lc.AccessTierQuota == "" {
+		return 0
+	}
+	sz, err := humanize.ParseBytes(lc.AccessTierQuota)
+	if err != nil {
+		return 0
+	}
+	return sz
 }
 
 // HasTransition returns 'true' if lifecycle document has Transition enabled.
@@ -158,6 +204,12 @@ func (lc *Lifecycle) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err e
 					return err
 				}
 				lc.ExpiryUpdatedAt = &t
+			case "AccessTierQuota":
+				var q string
+				if err = d.DecodeElement(&q, &se); err != nil {
+					return err
+				}
+				lc.AccessTierQuota = q
 			default:
 				return xml.UnmarshalError(fmt.Sprintf("expected element type <Rule> but have <%s>", se.Name.Local))
 			}
@@ -208,6 +260,9 @@ func (lc Lifecycle) HasActiveRules(prefix string) bool {
 		if !rule.Transition.IsNull() { // this allows for Transition.Days to be zero.
 			return true
 		}
+		if !rule.AccessTransition.IsNull() {
+			return true
+		}
 	}
 	return false
 }
@@ -246,6 +301,12 @@ func (lc Lifecycle) Validate(lr lock.Retention) error {
 	// Lifecycle config should have at least one rule
 	if len(lc.Rules) == 0 {
 		return errLifecycleNoRule
+	}
+
+	if lc.AccessTierQuota != "" {
+		if _, err := humanize.ParseBytes(lc.AccessTierQuota); err != nil {
+			return errAccessInvalidQuotaSize
+		}
 	}
 
 	// Validate all the rules in the lifecycle config

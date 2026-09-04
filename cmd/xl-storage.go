@@ -583,6 +583,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 	}
 
 	poolIdx, setIdx, _ := s.GetDiskLoc()
+	hotPool, hotPoolOK := globalILMConfig.accessCfg().HotPool()
 
 	disks, err := objAPI.GetDisks(poolIdx, setIdx)
 	if err != nil {
@@ -592,6 +593,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 	cache.Info.updates = updates
 
 	dataUsageInfo, err := scanDataFolder(ctx, disks, s, cache, func(item scannerItem) (sizeSummary, error) {
+		item.poolIdx = poolIdx
 		// Look for `xl.meta/xl.json' at the leaf.
 		if !strings.HasSuffix(item.Path, SlashSeparator+xlStorageFormatFile) &&
 			!strings.HasSuffix(item.Path, SlashSeparator+xlStorageFormatFileV1) {
@@ -655,6 +657,9 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 				sizeS.versions++
 			}
 			sizeS.totalSize += sz
+			if hotPoolOK && poolIdx == hotPool {
+				sizeS.hotTierSize += sz
+			}
 
 			// Skip tier accounting if object version is a delete-marker or a free-version
 			// tracking deleted transitioned objects

@@ -19,11 +19,12 @@ func _() {
 	_ = x[lcEventSrc_s3PutObject-8]
 	_ = x[lcEventSrc_s3CopyObject-9]
 	_ = x[lcEventSrc_s3CompleteMultipartUpload-10]
+	_ = x[lcEventSrc_AccessTier-11]
 }
 
-const _lcEventSrc_name = "NoneHealScannerDecomRebals3HeadObjects3GetObjects3ListObjectss3PutObjects3CopyObjects3CompleteMultipartUpload"
+const _lcEventSrc_name = "NoneHealScannerDecomRebals3HeadObjects3GetObjects3ListObjectss3PutObjects3CopyObjects3CompleteMultipartUploadAccessTier"
 
-var _lcEventSrc_index = [...]uint8{0, 4, 8, 15, 20, 25, 37, 48, 61, 72, 84, 109}
+var _lcEventSrc_index = [...]uint8{0, 4, 8, 15, 20, 25, 37, 48, 61, 72, 84, 109, 119}
 
 func (i lcEventSrc) String() string {
 	idx := int(i) - 0

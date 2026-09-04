@@ -39,6 +39,7 @@ const (
 	lcEventSrc_s3PutObject
 	lcEventSrc_s3CopyObject
 	lcEventSrc_s3CompleteMultipartUpload
+	lcEventSrc_AccessTier
 )
 
 //revive:enable:var-naming

@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"sync"
+	"time"
 
 	"github.com/minio/minio/internal/config/ilm"
 )
@@ -27,6 +28,16 @@ var globalILMConfig = ilmConfig{
 	cfg: ilm.Config{
 		ExpirationWorkers: 100,
 		TransitionWorkers: 100,
+		// Access tiering stays off until configured, but the counter
+		// geometry must be sane from the start: the tracker divides by
+		// AccessBinWidth before any config is loaded.
+		AccessPromoteWatermark: 85,
+		AccessBinWidth:         time.Minute,
+		AccessBins:             12,
+		AccessFlush:            time.Minute,
+		AccessMinResidency:     24 * time.Hour,
+		AccessWorkers:          10,
+		AccessMaxTracked:       1000000,
 	},
 }
 
@@ -47,6 +58,25 @@ func (c *ilmConfig) getTransitionWorkers() int {
 	defer c.mu.RUnlock()
 
 	return c.cfg.TransitionWorkers
+}
+
+// accessCfg returns a copy of the access tiering settings. Callers take the
+// whole struct rather than one getter per field because the promotion and
+// demotion paths need a consistent view of several knobs at once.
+func (c *ilmConfig) accessCfg() ilm.Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.cfg
+}
+
+// accessTieringEnabled is the cheap gate used on the scanner path.
+func (c *ilmConfig) accessTieringEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	_, ok := c.cfg.HotPool()
+	return ok
 }
 
 func (c *ilmConfig) update(cfg ilm.Config) {

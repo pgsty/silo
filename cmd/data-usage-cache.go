@@ -61,6 +61,7 @@ type dataUsageEntry struct {
 	Children dataUsageHashMap `msg:"ch"`
 	// These fields do no include any children.
 	Size          int64             `msg:"sz"`
+	HotTierSize   int64             `msg:"hts"`
 	Objects       uint64            `msg:"os"`
 	Versions      uint64            `msg:"vs"` // Versions that are not delete markers.
 	DeleteMarkers uint64            `msg:"dms"`
@@ -134,8 +135,8 @@ func (ts tierStats) add(u tierStats) tierStats {
 	}
 }
 
-//msgp:encode ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6 dataUsageEntryV7
-//msgp:marshal ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6 dataUsageEntryV7
+//msgp:encode ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6 dataUsageEntryV7 dataUsageEntryV8
+//msgp:marshal ignore dataUsageEntryV2 dataUsageEntryV3 dataUsageEntryV4 dataUsageEntryV5 dataUsageEntryV6 dataUsageEntryV7 dataUsageEntryV8
 
 //msgp:tuple dataUsageEntryV2
 type dataUsageEntryV2 struct {
@@ -199,14 +200,30 @@ type dataUsageEntryV7 struct {
 	Compacted     bool              `msg:"c"`
 }
 
+// dataUsageEntryV8 is the on-disk shape before access-tier accounting was
+// introduced. Keep it so caches written by the previous release decode
+// without being discarded.
+type dataUsageEntryV8 struct {
+	Children dataUsageHashMap `msg:"ch"`
+	// These fields do no include any children.
+	Size          int64             `msg:"sz"`
+	Objects       uint64            `msg:"os"`
+	Versions      uint64            `msg:"vs"`
+	DeleteMarkers uint64            `msg:"dms"`
+	ObjSizes      sizeHistogram     `msg:"szs"`
+	ObjVersions   versionsHistogram `msg:"vh"`
+	AllTierStats  *allTierStats     `msg:"ats,omitempty"`
+	Compacted     bool              `msg:"c"`
+}
+
 // dataUsageCache contains a cache of data usage entries latest version.
 type dataUsageCache struct {
 	Info  dataUsageCacheInfo
 	Cache map[string]dataUsageEntry
 }
 
-//msgp:encode ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6 dataUsageCacheV7
-//msgp:marshal ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6 dataUsageCacheV7
+//msgp:encode ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6 dataUsageCacheV7 dataUsageCacheV8
+//msgp:marshal ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6 dataUsageCacheV7 dataUsageCacheV8
 
 // dataUsageCacheV2 contains a cache of data usage entries version 2.
 type dataUsageCacheV2 struct {
@@ -244,6 +261,12 @@ type dataUsageCacheV7 struct {
 	Cache map[string]dataUsageEntryV7
 }
 
+// dataUsageCacheV8 contains a cache of data usage entries version 8.
+type dataUsageCacheV8 struct {
+	Info  dataUsageCacheInfo
+	Cache map[string]dataUsageEntryV8
+}
+
 //msgp:ignore dataUsageEntryInfo
 type dataUsageEntryInfo struct {
 	Name   string
@@ -272,6 +295,7 @@ type dataUsageCacheInfo struct {
 
 func (e *dataUsageEntry) addSizes(summary sizeSummary) {
 	e.Size += summary.totalSize
+	e.HotTierSize += summary.hotTierSize
 	e.Versions += summary.versions
 	e.DeleteMarkers += summary.deleteMarkers
 	e.ObjSizes.add(summary.totalSize)
@@ -291,6 +315,7 @@ func (e *dataUsageEntry) merge(other dataUsageEntry) {
 	e.Versions += other.Versions
 	e.DeleteMarkers += other.DeleteMarkers
 	e.Size += other.Size
+	e.HotTierSize += other.HotTierSize
 
 	for i, v := range other.ObjSizes[:] {
 		e.ObjSizes[i] += v
@@ -431,6 +456,7 @@ func (d *dataUsageCache) dui(path string, buckets []BucketInfo) DataUsageInfo {
 	flat := d.flatten(*e)
 	dui := DataUsageInfo{
 		LastUpdate:              d.Info.LastUpdate,
+		ScannerCycle:            d.Info.NextCycle,
 		ObjectsTotalCount:       flat.Objects,
 		VersionsTotalCount:      flat.Versions,
 		DeleteMarkersTotalCount: flat.DeleteMarkers,
@@ -781,6 +807,7 @@ func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]Bucke
 		flat := d.flatten(*e)
 		bui := BucketUsageInfo{
 			Size:                    uint64(flat.Size),
+			HotTierSize:             uint64(max(flat.HotTierSize, 0)),
 			VersionsCount:           flat.Versions,
 			ObjectsCount:            flat.Objects,
 			DeleteMarkersCount:      flat.DeleteMarkers,
@@ -980,7 +1007,8 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 // Bumping the cache version will drop data from previous versions
 // and write new data with the new version.
 const (
-	dataUsageCacheVerCurrent = 8
+	dataUsageCacheVerCurrent = 9
+	dataUsageCacheVerV8      = 8
 	dataUsageCacheVerV7      = 7
 	dataUsageCacheVerV6      = 6
 	dataUsageCacheVerV5      = 5
@@ -1181,6 +1209,33 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			}
 		}
 
+		return nil
+	case dataUsageCacheVerV8:
+		// Zstd compressed.
+		dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(2))
+		if err != nil {
+			return err
+		}
+		defer dec.Close()
+		dold := &dataUsageCacheV8{}
+		if err = dold.DecodeMsg(msgp.NewReader(dec)); err != nil {
+			return err
+		}
+		d.Info = dold.Info
+		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
+		for k, v := range dold.Cache {
+			d.Cache[k] = dataUsageEntry{
+				Children:      v.Children,
+				Size:          v.Size,
+				Objects:       v.Objects,
+				Versions:      v.Versions,
+				DeleteMarkers: v.DeleteMarkers,
+				ObjSizes:      v.ObjSizes,
+				ObjVersions:   v.ObjVersions,
+				AllTierStats:  v.AllTierStats,
+				Compacted:     v.Compacted,
+			}
+		}
 		return nil
 	case dataUsageCacheVerCurrent:
 		// Zstd compressed.

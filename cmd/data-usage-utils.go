@@ -46,7 +46,8 @@ type BucketTargetUsageInfo struct {
 // - total objects in a bucket
 // - object size histogram per bucket
 type BucketUsageInfo struct {
-	Size uint64 `json:"size"`
+	Size        uint64 `json:"size"`
+	HotTierSize uint64 `json:"hotTierSize,omitempty"`
 	// Following five fields suffixed with V1 are here for backward compatibility
 	// Total Size for objects that have not yet been replicated
 	ReplicationPendingSizeV1 uint64 `json:"objectsPendingReplicationTotalSize"`
@@ -78,6 +79,10 @@ type DataUsageInfo struct {
 	// LastUpdate is the timestamp of when the data usage info was last updated.
 	// This does not indicate a full scan.
 	LastUpdate time.Time `json:"lastUpdate"`
+	// ScannerCycle changes only after a complete scanner pass. Background
+	// consumers use it to distinguish a partial cache update from a baseline
+	// that has visited every bucket and server pool.
+	ScannerCycle uint32 `json:"scannerCycle,omitempty"`
 
 	// Objects total count across all buckets
 	ObjectsTotalCount uint64 `json:"objectsCount"`
