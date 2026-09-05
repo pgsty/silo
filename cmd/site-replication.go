@@ -1978,6 +1978,23 @@ func updateLocalBucketCORSMetadata(ctx context.Context, objectAPI ObjectLayer, b
 	return applyBucketCORSMetadata(ctx, objectAPI, bucket, configData, time.Time{}, true)
 }
 
+// localCORSUpdatedAt returns the timestamp a locally originated CORS update
+// must carry: now, advanced strictly past both bucket creation and the current
+// CORS timestamp. A CORS event stamped before bucket creation is discarded as
+// belonging to an older incarnation of the bucket, so a local write must never
+// land at or below that floor.
+func localCORSUpdatedAt(meta BucketMetadata, now time.Time) time.Time {
+	updatedAt := now.UTC()
+	floor := meta.Created
+	if current := meta.CorsConfigUpdatedAt.UTC(); current.After(floor) {
+		floor = current
+	}
+	if !updatedAt.After(floor) {
+		updatedAt = floor.Add(time.Nanosecond)
+	}
+	return updatedAt
+}
+
 func applyBucketCORSMetadata(ctx context.Context, objectAPI ObjectLayer, bucket string, configData []byte, sourceUpdatedAt time.Time, local bool) (time.Time, error) {
 	if bucket == "" || (configData != nil && len(configData) == 0) {
 		return time.Time{}, errInvalidArgument
@@ -2011,14 +2028,7 @@ func applyBucketCORSMetadata(ctx context.Context, objectAPI ObjectLayer, bucket 
 	localState := newCORSReplicationState(meta.CorsConfigXML, meta.CorsConfigUpdatedAt)
 	updatedAt := sourceUpdatedAt.UTC()
 	if local {
-		updatedAt = UTCNow()
-		floor := meta.Created
-		if localState.updatedAt.After(floor) {
-			floor = localState.updatedAt
-		}
-		if !updatedAt.After(floor) {
-			updatedAt = floor.Add(time.Nanosecond)
-		}
+		updatedAt = localCORSUpdatedAt(meta, UTCNow())
 	} else {
 		// CreatedAt is the bucket-lineage floor: an event from an older
 		// incarnation of the bucket must not change the current one.
