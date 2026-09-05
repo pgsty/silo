@@ -3863,7 +3863,16 @@ func isBktQuotaCfgReplicated(total int, quotaCfgs []*madmin.BucketQuota) bool {
 			prev = q
 			continue
 		}
-		if prev.Quota != q.Quota || prev.Type != q.Type {
+		if prev.Type != q.Type {
+			return false
+		}
+		if prev.Type == madmin.HardQuota {
+			if getBucketQuotaSize(prev) != getBucketQuotaSize(q) {
+				return false
+			}
+			continue
+		}
+		if prev.Size != q.Size || prev.Quota != q.Quota {
 			return false
 		}
 	}

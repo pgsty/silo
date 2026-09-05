@@ -167,8 +167,8 @@ func loadClusterUsageBucketMetrics(ctx context.Context, m MetricValues, c *metri
 		m.Set(usageBucketVersionsCount, float64(usage.VersionsCount), "bucket", bucket)
 		m.Set(usageBucketDeleteMarkersCount, float64(usage.DeleteMarkersCount), "bucket", bucket)
 
-		if quota != nil && quota.Quota > 0 {
-			m.Set(usageBucketQuotaTotalBytes, float64(quota.Quota), "bucket", bucket)
+		if quotaSize := getBucketQuotaSize(quota); quotaSize > 0 {
+			m.Set(usageBucketQuotaTotalBytes, float64(quotaSize), "bucket", bucket)
 		}
 
 		for k, v := range usage.ObjectSizesHistogram {

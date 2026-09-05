@@ -25,7 +25,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -177,14 +176,7 @@ func veeamSOSAPIGetObject(ctx context.Context, bucket, object string, rs *HTTPRa
 			Used: int64(binfo.Size),
 		}
 
-		var quotaSize int64
-		if q != nil && q.Type == madmin.HardQuota {
-			if q.Size > 0 {
-				quotaSize = int64(q.Size)
-			} else if q.Quota > 0 {
-				quotaSize = int64(q.Quota)
-			}
-		}
+		quotaSize := int64(getBucketQuotaSize(q))
 
 		if quotaSize == 0 {
 			info := objAPI.StorageInfo(ctx, true)

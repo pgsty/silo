@@ -43,6 +43,17 @@ func NewBucketQuotaSys() *BucketQuotaSys {
 	return &BucketQuotaSys{}
 }
 
+// getBucketQuotaSize returns the effective enforced hard-quota size.
+func getBucketQuotaSize(quota *madmin.BucketQuota) uint64 {
+	if quota == nil || quota.Type != madmin.HardQuota {
+		return 0
+	}
+	if quota.Size > 0 {
+		return quota.Size
+	}
+	return quota.Quota
+}
+
 var bucketStorageCache = cachevalue.New[DataUsageInfo]()
 
 // Init initialize bucket quota.
@@ -110,14 +121,7 @@ func (sys *BucketQuotaSys) enforceQuotaHard(ctx context.Context, bucket string, 
 		return err
 	}
 
-	var quotaSize uint64
-	if q != nil && q.Type == madmin.HardQuota {
-		if q.Size > 0 {
-			quotaSize = q.Size
-		} else if q.Quota > 0 {
-			quotaSize = q.Quota
-		}
-	}
+	quotaSize := getBucketQuotaSize(q)
 	if quotaSize > 0 {
 		if uint64(size) >= quotaSize { // check if file size already exceeds the quota
 			return BucketQuotaExceeded{Bucket: bucket}

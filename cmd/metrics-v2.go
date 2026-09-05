@@ -3314,10 +3314,10 @@ func getBucketUsageMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
 				VariableLabels: map[string]string{"bucket": bucket},
 			})
 
-			if quota != nil && quota.Quota > 0 {
+			if quotaSize := getBucketQuotaSize(quota); quotaSize > 0 {
 				metrics = append(metrics, MetricV2{
 					Description:    getBucketUsageQuotaTotalBytesMD(),
-					Value:          float64(quota.Quota),
+					Value:          float64(quotaSize),
 					VariableLabels: map[string]string{"bucket": bucket},
 				})
 			}
