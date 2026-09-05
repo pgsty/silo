@@ -1712,35 +1712,68 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 	// apply default bucket configuration/governance headers for dest side.
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, dstBucket, dstObject, getObjectInfo, retPerms, holdPerms, replicaTrusted)
-	if s3Err == ErrNone && retentionMode.Valid() {
-		if dstOpts.ReplicationRequest {
-			srcTimestamp := dstOpts.ReplicationSourceRetentionTimestamp
-			if storedLock.retentionIsOlderThan(srcTimestamp) {
+	if s3Err == ErrNone {
+		// A replica update is ordered by its source timestamp alone, whether or
+		// not it still carries a value: an update newer than the stored state
+		// applies, and a removal is just an update with no value. An update that
+		// is stale, or that carries no source timestamp at all and is therefore
+		// unordered, leaves the stored state in place instead of erasing it.
+		switch {
+		case !dstOpts.ReplicationRequest:
+			if retentionMode.Valid() {
 				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
 				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
-				srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
-			} else {
-				storedLock.restoreRetention(srcInfo.UserDefined)
+				srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = UTCNow().Format(time.RFC3339Nano)
 			}
-		} else {
-			srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
-			srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
-			srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = UTCNow().Format(time.RFC3339Nano)
+		case !replicaTrusted && !retentionMode.Valid():
+			// A trusted peer that did not mark this request as a replica sends
+			// no replicated state, so a missing value carries no instruction and
+			// the rebuilt metadata is left as it is.
+		case !storedLock.retentionIsOlderThan(dstOpts.ReplicationSourceRetentionTimestamp):
+			storedLock.restoreRetention(srcInfo.UserDefined)
+		default:
+			if retentionMode.Valid() {
+				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
+				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
+			}
+			srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = dstOpts.ReplicationSourceRetentionTimestamp.UTC().Format(time.RFC3339Nano)
 		}
-	}
 
-	if s3Err == ErrNone && legalHold.Status.Valid() {
-		if dstOpts.ReplicationRequest {
-			srcTimestamp := dstOpts.ReplicationSourceLegalholdTimestamp
-			if storedLock.legalHoldIsOlderThan(srcTimestamp) {
+		// Legal hold has no removal in S3: an explicitly empty header is already
+		// rejected as an invalid status, so the only value-less shape that gets
+		// here is an absent one, and that conveys no legal-hold change even when
+		// an orphaned timestamp comes with it. Only a valid status can win.
+		switch {
+		case !dstOpts.ReplicationRequest:
+			if legalHold.Status.Valid() {
 				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = string(legalHold.Status)
-				srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
-			} else {
-				storedLock.restoreLegalHold(srcInfo.UserDefined)
+				srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = UTCNow().Format(time.RFC3339Nano)
 			}
-		} else {
+		case !replicaTrusted && !legalHold.Status.Valid():
+			// As above: a marker-only request carries no legal-hold update.
+		case legalHold.Status.Valid() && storedLock.legalHoldIsOlderThan(dstOpts.ReplicationSourceLegalholdTimestamp):
 			srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = string(legalHold.Status)
-			srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = UTCNow().Format(time.RFC3339Nano)
+			srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = dstOpts.ReplicationSourceLegalholdTimestamp.UTC().Format(time.RFC3339Nano)
+		default:
+			storedLock.restoreLegalHold(srcInfo.UserDefined)
+		}
+
+		if replicaTrusted {
+			// An SSE-C key rotation snapshots every stored reserved key into
+			// encMetadata above, before this decision exists, and the merge that
+			// preserves the encryption headers would put the stored ordering
+			// timestamps back over it. For a trusted replica the decision just
+			// made is authoritative, so let the snapshot agree with it.
+			for _, key := range []string{
+				ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp,
+				ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp,
+			} {
+				if value, ok := srcInfo.UserDefined[key]; ok {
+					encMetadata[key] = value
+				} else {
+					delete(encMetadata, key)
+				}
+			}
 		}
 	}
 	if s3Err != ErrNone {

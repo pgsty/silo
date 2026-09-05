@@ -386,22 +386,24 @@ func (s objectLockState) legalHoldIsOlderThan(src time.Time) bool {
 // restoreRetention and restoreLegalHold put the stored state back into
 // metadata that was rebuilt from a request whose update was not applied.
 func (s objectLockState) restoreRetention(metadata map[string]string) {
+	// The stored timestamp orders the next update and must survive even when
+	// the stored value is empty, which is how a removal is recorded.
+	if s.retentionTimestamp != "" {
+		metadata[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = s.retentionTimestamp
+	}
 	if s.mode == "" {
 		return
 	}
 	metadata[strings.ToLower(xhttp.AmzObjectLockMode)] = s.mode
 	metadata[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = s.retainUntil
-	if s.retentionTimestamp != "" {
-		metadata[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = s.retentionTimestamp
-	}
 }
 
 func (s objectLockState) restoreLegalHold(metadata map[string]string) {
+	if s.legalHoldTimestamp != "" {
+		metadata[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = s.legalHoldTimestamp
+	}
 	if s.legalHold == "" {
 		return
 	}
 	metadata[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = s.legalHold
-	if s.legalHoldTimestamp != "" {
-		metadata[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = s.legalHoldTimestamp
-	}
 }

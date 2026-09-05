@@ -948,3 +948,467 @@ func testAPICopyObjectReplicaLegalHoldTimestamp(obj ObjectLayer, instanceType, b
 		t.Fatalf("%s: after newer OFF: hold=%q legal-hold timestamp=%q retention timestamp present=%v", instanceType, hold, stamp, retention)
 	}
 }
+
+// Object Lock replication ordering fixtures. A replicated lock update carries
+// the source value plus the reserved timestamp that orders it; a removal is an
+// update that carries the ordering timestamp and no value.
+const (
+	objectLockTestRetainUntil = "2030-01-01T00:00:00Z"
+	objectLockTestStamp0900   = "2026-09-03T09:00:00Z"
+	objectLockTestStamp0930   = "2026-09-03T09:30:00Z"
+	objectLockTestStamp1000   = "2026-09-03T10:00:00Z"
+	objectLockTestStamp1100   = "2026-09-03T11:00:00Z"
+)
+
+// objectLockFields is the Object Lock state stored on an object version,
+// including the reserved timestamps that order replicated updates.
+type objectLockFields struct {
+	mode, retainUntil, retentionStamp string
+	legalHold, legalHoldStamp         string
+}
+
+// putObjectLockVersion seeds a versioned object carrying meta and returns its
+// version id.
+func putObjectLockVersion(t *testing.T, obj ObjectLayer, bucket, object string, meta map[string]string) string {
+	t.Helper()
+	info, err := obj.PutObject(t.Context(), bucket, object,
+		mustGetPutObjReader(t, bytes.NewReader([]byte("data")), 4, "", ""),
+		ObjectOptions{Versioned: true, UserDefined: meta})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.VersionID
+}
+
+// readObjectLockFields returns the Object Lock state stored on a version.
+func readObjectLockFields(t *testing.T, obj ObjectLayer, bucket, object, versionID string) objectLockFields {
+	t.Helper()
+	info, err := obj.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: versionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return objectLockFields{
+		mode:           info.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)],
+		retainUntil:    info.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)],
+		retentionStamp: info.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp],
+		legalHold:      info.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)],
+		legalHoldStamp: info.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp],
+	}
+}
+
+// sendReplicaLockCopy issues the signed CopyObject a replication sender emits
+// for a metadata update: the version copied onto itself with the REPLACE
+// tagging directive, the trusted replication headers, and extra on top. It
+// fails the test unless every empty-valued header survived onto the wire and
+// the handler accepted the request.
+func sendReplicaLockCopy(t *testing.T, apiRouter http.Handler, cred auth.Credentials, bucket, object, versionID string, extra map[string]string) {
+	t.Helper()
+	headers := map[string]string{
+		xhttp.AmzCopySource:                 url.QueryEscape(SlashSeparator+bucket+SlashSeparator+object) + "?versionId=" + versionID,
+		xhttp.AmzTagDirective:               replaceDirective,
+		xhttp.MinIOSourceReplicationRequest: "true",
+		xhttp.AmzBucketReplicationStatus:    "REPLICA",
+	}
+	for key, value := range extra {
+		headers[key] = value
+	}
+	req, err := newTestSignedRequestV4(http.MethodPut, getCopyObjectURL("", bucket, object)+"?versionId="+versionID, 0, nil,
+		cred.AccessKey, cred.SecretKey, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range headers {
+		if _, ok := req.Header[http.CanonicalHeaderKey(key)]; value == "" && !ok {
+			t.Fatalf("empty %s header was dropped before the handler", key)
+		}
+	}
+	rec := httptest.NewRecorder()
+	apiRouter.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replica CopyObject: status %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAPICopyObjectReplicaAbsentLockFieldsPreserveNewerState verifies that a
+// replica CopyObject carrying no Object Lock values leaves the stored retention
+// and legal hold alone when it does not win: its source retention timestamp is
+// older than the stored one, and it carries no legal-hold update at all. A
+// missing value is not on its own an instruction to erase.
+func TestAPICopyObjectReplicaAbsentLockFieldsPreserveNewerState(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		objAPITest:        testAPICopyObjectReplicaAbsentLockFieldsPreserveNewerState,
+		makeBucketOptions: MakeBucketOptions{LockEnabled: true},
+	})
+}
+
+func testAPICopyObjectReplicaAbsentLockFieldsPreserveNewerState(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, cred auth.Credentials, t *testing.T,
+) {
+	object := "replication-trust/lock-absent-fields"
+	versionID := putObjectLockVersion(t, obj, bucketName, object, map[string]string{
+		strings.ToLower(xhttp.AmzObjectLockMode):                   "GOVERNANCE",
+		strings.ToLower(xhttp.AmzObjectLockRetainUntilDate):        objectLockTestRetainUntil,
+		ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp: objectLockTestStamp1000,
+		strings.ToLower(xhttp.AmzObjectLockLegalHold):              "ON",
+		ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp: objectLockTestStamp1000,
+	})
+
+	// A tag-only replica update: stale retention ordering, and no legal-hold
+	// update at all.
+	sendReplicaLockCopy(t, apiRouter, cred, bucketName, object, versionID, map[string]string{
+		xhttp.AmzObjectTagging:                    "application=independent-tag-update",
+		xhttp.MinIOSourceTaggingTimestamp:         objectLockTestStamp1100,
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp0930,
+	})
+
+	want := objectLockFields{
+		mode: "GOVERNANCE", retainUntil: objectLockTestRetainUntil, retentionStamp: objectLockTestStamp1000,
+		legalHold: "ON", legalHoldStamp: objectLockTestStamp1000,
+	}
+	if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != want {
+		t.Errorf("%s: replica update without Object Lock values changed stored state: got %+v, want %+v", instanceType, got, want)
+	}
+}
+
+// TestAPICopyObjectReplicaRetentionRemovalKeepsOrderingTimestamp verifies that
+// a replicated retention removal both applies and records its own ordering
+// timestamp, so a retained update that arrives later with an older timestamp
+// cannot resurrect the retention it removed.
+func TestAPICopyObjectReplicaRetentionRemovalKeepsOrderingTimestamp(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		objAPITest:        testAPICopyObjectReplicaRetentionRemovalKeepsOrderingTimestamp,
+		makeBucketOptions: MakeBucketOptions{LockEnabled: true},
+	})
+}
+
+func testAPICopyObjectReplicaRetentionRemovalKeepsOrderingTimestamp(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, cred auth.Credentials, t *testing.T,
+) {
+	object := "replication-trust/lock-retention-removal"
+	versionID := putObjectLockVersion(t, obj, bucketName, object, map[string]string{
+		strings.ToLower(xhttp.AmzObjectLockMode):                   "GOVERNANCE",
+		strings.ToLower(xhttp.AmzObjectLockRetainUntilDate):        objectLockTestRetainUntil,
+		ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp: objectLockTestStamp0900,
+	})
+
+	// The removal is newer than the stored retention, so it applies.
+	sendReplicaLockCopy(t, apiRouter, cred, bucketName, object, versionID, map[string]string{
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp1000,
+	})
+	want := objectLockFields{retentionStamp: objectLockTestStamp1000}
+	if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != want {
+		t.Errorf("%s: after replica retention removal: got %+v, want %+v", instanceType, got, want)
+	}
+
+	// A retained update that arrives afterwards with an older source timestamp
+	// must lose, and the removal timestamp must survive the rejection.
+	sendReplicaLockCopy(t, apiRouter, cred, bucketName, object, versionID, map[string]string{
+		xhttp.AmzObjectLockMode:                   "GOVERNANCE",
+		xhttp.AmzObjectLockRetainUntilDate:        objectLockTestRetainUntil,
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp0930,
+	})
+	if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != want {
+		t.Errorf("%s: after stale retained replica update: got %+v, want %+v", instanceType, got, want)
+	}
+}
+
+// TestAPICopyObjectReplicaObjectLockOrdering covers the replica lock shapes the
+// two regression tests above do not reach: the present-but-empty retention pair
+// a sender emits after a retention removal, the REPLACE metadata directive
+// under which only the restore helpers can carry stored timestamps forward, and
+// an orphaned legal-hold timestamp arriving without a status.
+func TestAPICopyObjectReplicaObjectLockOrdering(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		objAPITest:        testAPICopyObjectReplicaObjectLockOrdering,
+		makeBucketOptions: MakeBucketOptions{LockEnabled: true},
+	})
+}
+
+func testAPICopyObjectReplicaObjectLockOrdering(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, cred auth.Credentials, t *testing.T,
+) {
+	retained := func(stamp string) map[string]string {
+		return map[string]string{
+			strings.ToLower(xhttp.AmzObjectLockMode):                   "GOVERNANCE",
+			strings.ToLower(xhttp.AmzObjectLockRetainUntilDate):        objectLockTestRetainUntil,
+			ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp: stamp,
+		}
+	}
+	// The shape PutObjectRetention leaves behind after a removal: the public
+	// keys present but empty, with the ordering timestamp of the removal.
+	removedUnderHold := map[string]string{
+		strings.ToLower(xhttp.AmzObjectLockMode):                   "",
+		strings.ToLower(xhttp.AmzObjectLockRetainUntilDate):        "",
+		ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp: objectLockTestStamp1000,
+		strings.ToLower(xhttp.AmzObjectLockLegalHold):              "ON",
+		ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp: objectLockTestStamp1000,
+	}
+	// A stale retained update carrying an orphaned newer legal-hold timestamp.
+	staleRetentionOrphanedHold := map[string]string{
+		xhttp.AmzObjectLockMode:                   "GOVERNANCE",
+		xhttp.AmzObjectLockRetainUntilDate:        objectLockTestRetainUntil,
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp0930,
+		xhttp.MinIOSourceObjectLegalHoldTimestamp: objectLockTestStamp1100,
+	}
+
+	testCases := []struct {
+		name            string
+		stored          map[string]string
+		headers         map[string]string
+		replaceMetadata bool
+		want            objectLockFields
+	}{
+		{
+			// A newer present-empty removal applies and keeps its timestamp,
+			// exactly as the absent-header shape does.
+			name:   "present-empty-retention-newer",
+			stored: retained(objectLockTestStamp0900),
+			headers: map[string]string{
+				xhttp.AmzObjectLockMode:                   "",
+				xhttp.AmzObjectLockRetainUntilDate:        "",
+				xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp1000,
+			},
+			want: objectLockFields{retentionStamp: objectLockTestStamp1000},
+		},
+		{
+			// The same removal arriving late must not erase newer retention.
+			name:   "present-empty-retention-stale",
+			stored: retained(objectLockTestStamp1000),
+			headers: map[string]string{
+				xhttp.AmzObjectLockMode:                   "",
+				xhttp.AmzObjectLockRetainUntilDate:        "",
+				xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp0930,
+			},
+			want: objectLockFields{
+				mode: "GOVERNANCE", retainUntil: objectLockTestRetainUntil, retentionStamp: objectLockTestStamp1000,
+			},
+		},
+		{
+			// REPLACE rebuilds the metadata from the request headers, which
+			// never carry the reserved timestamps, so the restore helpers are
+			// the only thing that can keep the removal timestamp and the hold.
+			name:            "replace-directive-restores-stored-state",
+			stored:          removedUnderHold,
+			headers:         staleRetentionOrphanedHold,
+			replaceMetadata: true,
+			want: objectLockFields{
+				retentionStamp: objectLockTestStamp1000,
+				legalHold:      "ON", legalHoldStamp: objectLockTestStamp1000,
+			},
+		},
+		{
+			// Under COPY the reserved timestamps ride along on their own, but
+			// an orphaned legal-hold timestamp still carries no status and must
+			// not clear the stored hold.
+			name:    "copy-directive-orphaned-legal-hold-timestamp",
+			stored:  removedUnderHold,
+			headers: staleRetentionOrphanedHold,
+			want: objectLockFields{
+				retentionStamp: objectLockTestStamp1000,
+				legalHold:      "ON", legalHoldStamp: objectLockTestStamp1000,
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			object := "replication-trust/lock-ordering/" + testCase.name
+			versionID := putObjectLockVersion(t, obj, bucketName, object, testCase.stored)
+			headers := testCase.headers
+			if testCase.replaceMetadata {
+				headers = make(map[string]string, len(testCase.headers)+1)
+				for key, value := range testCase.headers {
+					headers[key] = value
+				}
+				headers[xhttp.AmzMetadataDirective] = replaceDirective
+			}
+			sendReplicaLockCopy(t, apiRouter, cred, bucketName, object, versionID, headers)
+			if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != testCase.want {
+				t.Fatalf("%s: got %+v, want %+v", instanceType, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestAPICopyObjectReplicaRetentionRemovalUnderBucketKMS verifies that the
+// replication ordering timestamps reach the Object Lock decision when the
+// destination bucket applies default SSE-KMS. That path builds its own
+// ObjectOptions, and dropping the timestamps there would leave every
+// replicated lock update unordered and silently restore the stored value.
+func TestAPICopyObjectReplicaRetentionRemovalUnderBucketKMS(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		objAPITest:        testAPICopyObjectReplicaRetentionRemovalUnderBucketKMS,
+		makeBucketOptions: MakeBucketOptions{LockEnabled: true},
+	})
+}
+
+func testAPICopyObjectReplicaRetentionRemovalUnderBucketKMS(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, cred auth.Credentials, t *testing.T,
+) {
+	previousKMS := GlobalKMS
+	GlobalKMS = kms.NewStub("object-lock-replication")
+	defer func() { GlobalKMS = previousKMS }()
+	sseXML := []byte(`<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>object-lock-replication</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>`)
+	if _, err := globalBucketMetadataSys.Update(t.Context(), bucketName, bucketSSEConfig, sseXML); err != nil {
+		t.Fatalf("%s: configure bucket encryption: %v", instanceType, err)
+	}
+
+	object := "replication-trust/lock-kms-removal"
+	versionID := putObjectLockVersion(t, obj, bucketName, object, map[string]string{
+		strings.ToLower(xhttp.AmzObjectLockMode):                   "GOVERNANCE",
+		strings.ToLower(xhttp.AmzObjectLockRetainUntilDate):        objectLockTestRetainUntil,
+		ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp: objectLockTestStamp0900,
+	})
+	sendReplicaLockCopy(t, apiRouter, cred, bucketName, object, versionID, map[string]string{
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp1000,
+	})
+
+	want := objectLockFields{retentionStamp: objectLockTestStamp1000}
+	if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != want {
+		t.Errorf("%s: replica retention removal into an SSE-KMS bucket: got %+v, want %+v", instanceType, got, want)
+	}
+}
+
+// ssecKeyHeaders returns the SSE-C request headers for key, either as the
+// destination key or as the copy-source key.
+func ssecKeyHeaders(key []byte, copySource bool) map[string]string {
+	sum := md5.Sum(key)
+	encoded, digest := base64.StdEncoding.EncodeToString(key), base64.StdEncoding.EncodeToString(sum[:])
+	if copySource {
+		return map[string]string{
+			xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm: xhttp.AmzEncryptionAES,
+			xhttp.AmzServerSideEncryptionCopyCustomerKey:       encoded,
+			xhttp.AmzServerSideEncryptionCopyCustomerKeyMD5:    digest,
+		}
+	}
+	return map[string]string{
+		xhttp.AmzServerSideEncryptionCustomerAlgorithm: xhttp.AmzEncryptionAES,
+		xhttp.AmzServerSideEncryptionCustomerKey:       encoded,
+		xhttp.AmzServerSideEncryptionCustomerKeyMD5:    digest,
+	}
+}
+
+// TestAPICopyObjectReplicaLockTimestampSurvivesSSECKeyRotation verifies that a
+// replicated Object Lock decision survives an in-place SSE-C key rotation. That
+// path snapshots the stored reserved metadata before the decision is made and
+// merges it back afterwards to preserve the encryption headers, which would
+// otherwise reinstate the ordering timestamp the decision replaced and let a
+// stale retained update resurrect a removed retention.
+func TestAPICopyObjectReplicaLockTimestampSurvivesSSECKeyRotation(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		objAPITest:        testAPICopyObjectReplicaLockTimestampSurvivesSSECKeyRotation,
+		makeBucketOptions: MakeBucketOptions{LockEnabled: true},
+	})
+}
+
+func testAPICopyObjectReplicaLockTimestampSurvivesSSECKeyRotation(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, cred auth.Credentials, t *testing.T,
+) {
+	previousTLS := globalIsTLS
+	globalIsTLS = true
+	defer func() { globalIsTLS = previousTLS }()
+
+	keyA, keyB := bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32)
+	keyC, keyD := bytes.Repeat([]byte{0x33}, 32), bytes.Repeat([]byte{0x44}, 32)
+	object := "replication-trust/lock-ssec-rotation"
+	putCopyChecksumSource(t, apiRouter, cred, bucketName, object,
+		bytes.Repeat([]byte("object lock ssec rotation "), 16), ssecKeyHeaders(keyA, false))
+	info, err := obj.GetObjectInfo(t.Context(), bucketName, object, ObjectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionID := info.VersionID
+
+	rotate := func(oldKey, newKey []byte, extra map[string]string) {
+		t.Helper()
+		headers := ssecKeyHeaders(oldKey, true)
+		for key, value := range ssecKeyHeaders(newKey, false) {
+			headers[key] = value
+		}
+		for key, value := range extra {
+			headers[key] = value
+		}
+		sendReplicaLockCopy(t, apiRouter, cred, bucketName, object, versionID, headers)
+	}
+
+	// Replicate a retention, then its removal, each during a key rotation.
+	rotate(keyA, keyB, map[string]string{
+		xhttp.AmzObjectLockMode:                   "GOVERNANCE",
+		xhttp.AmzObjectLockRetainUntilDate:        objectLockTestRetainUntil,
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp1000,
+	})
+	rotate(keyB, keyC, map[string]string{
+		xhttp.MinIOSourceObjectRetentionTimestamp: objectLockTestStamp1100,
+	})
+	want := objectLockFields{retentionStamp: objectLockTestStamp1100}
+	if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != want {
+		t.Errorf("%s: after replicated removal during key rotation: got %+v, want %+v", instanceType, got, want)
+	}
+
+	// The stale retained update that follows must still lose the comparison.
+	rotate(keyC, keyD, map[string]string{
+		xhttp.AmzObjectLockMode:                   "GOVERNANCE",
+		xhttp.AmzObjectLockRetainUntilDate:        objectLockTestRetainUntil,
+		xhttp.MinIOSourceObjectRetentionTimestamp: "2026-09-03T10:30:00Z",
+	})
+	if got := readObjectLockFields(t, obj, bucketName, object, versionID); got != want {
+		t.Errorf("%s: after stale retained replay during key rotation: got %+v, want %+v", instanceType, got, want)
+	}
+}
+
+// TestAPICopyObjectMarkerOnlyLeavesObjectLockUnchanged verifies that the
+// the new value-less handling reaches only an actual replica. A trusted peer that
+// sends the replication marker without REPLICA status is not replicating lock
+// state, so a REPLACE copy carrying no lock headers must write a version with
+// no retention and no legal hold, exactly as it did before.
+func TestAPICopyObjectMarkerOnlyLeavesObjectLockUnchanged(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		objAPITest:        testAPICopyObjectMarkerOnlyLeavesObjectLockUnchanged,
+		makeBucketOptions: MakeBucketOptions{LockEnabled: true},
+	})
+}
+
+func testAPICopyObjectMarkerOnlyLeavesObjectLockUnchanged(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, cred auth.Credentials, t *testing.T,
+) {
+	object := "replication-trust/lock-marker-only"
+	putObjectLockVersion(t, obj, bucketName, object, map[string]string{
+		strings.ToLower(xhttp.AmzObjectLockMode):                   "GOVERNANCE",
+		strings.ToLower(xhttp.AmzObjectLockRetainUntilDate):        objectLockTestRetainUntil,
+		ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp: objectLockTestStamp1000,
+		strings.ToLower(xhttp.AmzObjectLockLegalHold):              "ON",
+		ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp: objectLockTestStamp1000,
+	})
+
+	// The replication marker without REPLICA status: trusted, but not a replica.
+	req, err := newTestSignedRequestV4(http.MethodPut, getCopyObjectURL("", bucketName, object), 0, nil,
+		cred.AccessKey, cred.SecretKey, map[string]string{
+			xhttp.AmzCopySource:                 url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + object),
+			xhttp.AmzMetadataDirective:          replaceDirective,
+			xhttp.MinIOSourceReplicationRequest: "true",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	apiRouter.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: marker-only CopyObject: status %d: %s", instanceType, rec.Code, rec.Body.String())
+	}
+
+	if got := readObjectLockFields(t, obj, bucketName, object, ""); got != (objectLockFields{}) {
+		t.Errorf("%s: marker-only copy inherited Object Lock state: got %+v, want none", instanceType, got)
+	}
+}
