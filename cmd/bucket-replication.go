@@ -931,11 +931,17 @@ func equals(k1 string, keys ...string) bool {
 	return false
 }
 
+// nullVersionExcludedFromResync reports the exclusion at the head of getReplicationAction, kept
+// verbatim from upstream: an existing object resync leaves a null version alone when the source
+// modification time is later than the one the target reports, without comparing anything else.
+func nullVersionExcludedFromResync(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type) bool {
+	return opType == replication.ExistingObjectReplicationType &&
+		oi1.ModTime.Unix() > oi2.LastModified.Unix() && oi1.VersionID == nullVersionID
+}
+
 // returns replicationAction by comparing metadata between source and target
 func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type) replicationAction {
-	// Avoid resyncing null versions created prior to enabling replication if target has a newer copy
-	if opType == replication.ExistingObjectReplicationType &&
-		oi1.ModTime.Unix() > oi2.LastModified.Unix() && oi1.VersionID == nullVersionID {
+	if nullVersionExcludedFromResync(oi1, oi2, opType) {
 		return replicateNone
 	}
 	sz, _ := oi1.GetActualSize()
@@ -986,9 +992,21 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 		"X-Amz-Meta-",
 	}
 
+	// An empty object lock mode or retain-until-date records a removed retention, but
+	// it is omitted from GET/HEAD response headers: setObjectHeaders() skips both keys
+	// when the value is empty, and FilterObjectLockMetadata() drops them when the mode
+	// is not valid. The target can therefore never report them, so treat empty and
+	// absent as equal rather than as a permanent difference.
+	emptyLockValue := func(k, v string) bool {
+		return v == "" && equals(k, xhttp.AmzObjectLockMode, xhttp.AmzObjectLockRetainUntilDate)
+	}
+
 	// compare metadata on both maps to see if meta is identical
 	compareMeta1 := make(map[string]string)
 	for k, v := range oi1.UserDefined {
+		if emptyLockValue(k, v) {
+			continue
+		}
 		var found bool
 		for _, prefix := range compareKeys {
 			if !stringsHasPrefixFold(k, prefix) {
@@ -1004,6 +1022,10 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 
 	compareMeta2 := make(map[string]string)
 	for k, v := range oi2.Metadata {
+		val := strings.Join(v, ",")
+		if emptyLockValue(k, val) {
+			continue
+		}
 		var found bool
 		for _, prefix := range compareKeys {
 			if !stringsHasPrefixFold(k, prefix) {
@@ -1013,7 +1035,7 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 			break
 		}
 		if found {
-			compareMeta2[strings.ToLower(k)] = strings.Join(v, ",")
+			compareMeta2[strings.ToLower(k)] = val
 		}
 	}
 
@@ -1022,6 +1044,65 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 	}
 
 	return replicateNone
+}
+
+// objectRetentionGetter is the part of the replication target client used to confirm whether a
+// destination version still holds Object Lock retention.
+type objectRetentionGetter interface {
+	GetObjectRetention(ctx context.Context, bucketName, objectName, versionID string) (*minio.RetentionMode, *time.Time, error)
+}
+
+// retentionRemovedAtSource reports whether oi carries the shape a removed retention leaves behind,
+// an object lock key present with an empty value (cmd/object-handlers.go:3211-3215).
+func retentionRemovedAtSource(oi ObjectInfo) bool {
+	lkMap := caseInsensitiveMap(oi.UserDefined)
+	for _, k := range []string{xhttp.AmzObjectLockMode, xhttp.AmzObjectLockRetainUntilDate} {
+		if v, ok := lkMap.Lookup(k); ok && v == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// targetRetentionConfirmedAbsent reports whether the destination version is known to hold no
+// retention. A HEAD response omits retention both when the version has none and when the
+// replication credential lacks s3:GetObjectRetention (cmd/object-handlers.go:942-946), so the
+// comparison in getReplicationAction on its own cannot tell a removal that is already in sync from
+// one the destination still holds. Only NoSuchObjectLockConfiguration, the answer for a version
+// that carries no retention, and a response naming no retention mode count as absent. Everything
+// else is uncertainty and is treated as still present, so that the removal is resent exactly as it
+// is today: a denied or unreachable destination, a mode the SDK returned without recognizing since
+// it does not validate it, and InvalidRequest, which names a bucket with no Object Lock
+// configuration but is also what a destination answers when its own read of that configuration
+// fails (cmd/bucket-object-lock.go:39-50 returns an error with a zero Retention, discarded at
+// cmd/object-handlers.go:3275).
+func targetRetentionConfirmedAbsent(ctx context.Context, tgt objectRetentionGetter, bucket, object, versionID string) bool {
+	mode, _, err := tgt.GetObjectRetention(ctx, bucket, object, versionID)
+	if err != nil {
+		return minio.ToErrorResponse(err).Code == "NoSuchObjectLockConfiguration"
+	}
+	// An absent or empty mode is no retention. A non-empty mode is retention, whether or not this
+	// SDK recognizes it.
+	return mode == nil || *mode == ""
+}
+
+// replicationActionForTarget returns the action for a source version against a destination that
+// answered HEAD. It is getReplicationAction plus the confirmation that a removed retention which
+// compares as in sync really is: see targetRetentionConfirmedAbsent.
+func replicationActionForTarget(ctx context.Context, oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type, tgt objectRetentionGetter, bucket, object string) replicationAction {
+	rAction := getReplicationAction(oi1, oi2, opType)
+	if rAction != replicateNone || !retentionRemovedAtSource(oi1) {
+		return rAction
+	}
+	// A null version the resync deliberately leaves alone is not a comparison result, so it is
+	// not the confirmation's to reopen.
+	if nullVersionExcludedFromResync(oi1, oi2, opType) {
+		return rAction
+	}
+	if targetRetentionConfirmedAbsent(ctx, tgt, bucket, object, oi1.VersionID) {
+		return rAction
+	}
+	return replicateMetadata
 }
 
 // replicateObject replicates the specified version of the object to destination bucket
@@ -1467,7 +1548,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 	sOpts.Set(xhttp.AmzTagDirective, "ACCESS")
 	oi, cerr := tgt.StatObject(ctx, tgt.Bucket, object, sOpts)
 	if cerr == nil {
-		rAction = getReplicationAction(objInfo, oi, ri.OpType)
+		rAction = replicationActionForTarget(ctx, objInfo, oi, ri.OpType, tgt, tgt.Bucket, object)
 		rinfo.ReplicationStatus = replication.Completed
 		if rAction == replicateNone {
 			if ri.OpType == replication.ExistingObjectReplicationType &&
