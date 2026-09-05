@@ -50,7 +50,7 @@ livenessProbe:
 
 ## Readiness probe
 
-This probe always responds with '200 OK'. Only fails if 'etcd' is configured and unreachable. When readiness probe fails, Kubernetes like platforms turn-off routing to the container.
+This probe responds with '200 OK' once the server process is up: it fails only while the request queue is overloaded, or when the health operation against the configured KMS or 'etcd' fails. When readiness probe fails, Kubernetes like platforms turn-off routing to the container.
 
 ```
 readinessProbe:
@@ -120,3 +120,9 @@ X-Xss-Protection: 1; mode=block
 X-Minio-Write-Quorum: 3
 Date: Tue, 21 Jul 2020 00:35:43 GMT
 ```
+
+## Startup readiness window
+
+None of the probes above, and no `admin info` view, proves that the node which received the request can already serve the data path after a restart. Each node connects its erasure drives to its peers in a monitor loop: a remote drive that could not be connected during startup stays uninstalled on that node until a later pass, and the monitor waits 15 seconds after each completed pass, so that interval is a floor between attempts, not a bound on recovery. While a drive is uninstalled, the node's own liveness and readiness probes answer '200 OK', the cluster probes can report healthy as well, because they aggregate every peer's report of its own local drives rather than the drives this node has installed, and `mcli ready` inherits the same blind spot. Yet a PUT through that node can fail with '503 SlowDownWrite' for lack of write quorum, and a GET through it of an object that another node just wrote can answer '404 NoSuchKey'. In the review runs that established this, sampled I/O began succeeding roughly 13 to 15 seconds after the administrative views became healthy on a four-node loopback cluster, consistent with the reconnect interval, and every object acknowledged by other nodes during the window was readable afterwards; these are observations, not guarantees, since reconnection can keep failing.
+
+Automation that restarts a cluster and then immediately writes to it, such as an upgrade or failover runbook, should therefore gate on a bounded data-path check rather than on these probes: one small PUT through each node followed by a read of each object through every node, repeated until every request returns the correct bytes and the acknowledged version within one fixed deadline, with each request budgeted from the remaining deadline and SDK retries disabled, and with the acknowledged objects re-read afterwards. Record the time to first usable I/O separately from the probe result. Such a check proves sampled I/O at that moment for the erasure sets those keys hash to; it proves neither that every set is complete nor that there is headroom for a further node loss, since a set can admit writes with fewer than all of its drives installed. The probes remain the right signal for their stated purpose, process liveness and quorum membership, and are unchanged.
