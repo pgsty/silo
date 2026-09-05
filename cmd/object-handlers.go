@@ -1512,8 +1512,19 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// data instead, the rotation has to go through the regular re-encrypting
 	// copy, or the destination ends up holding plaintext under metadata that
 	// claims the object is encrypted.
+	//
+	// A checksum algorithm the client asks for has to be computed over the object
+	// data, which an in-place rotation never reads, so leave the fast path and
+	// let the re-encrypting copy compute, store and report it. A replica-trusted
+	// request is not such a client: getOpts.ReplicationRequest leaves its source
+	// reader encrypted, so a rewrite would hash ciphertext, and a replica has to
+	// keep the checksum its source assigned.
+	// Without a requested destination checksum algorithm, an in-place SSE-C
+	// rotation preserves the stored checksum state, including absence; it does
+	// not add the default CRC64NVME.
 	canRotateKeyInPlace := !srcInfo.Legacy &&
-		!copyRewritesObjectData(srcInfo.metadataOnly, copySrcOpts, dstOpts)
+		!copyRewritesObjectData(srcInfo.metadataOnly, copySrcOpts, dstOpts) &&
+		(replicaTrusted || !hash.NewChecksumHeader(r.Header).IsSet())
 
 	// If src == dst and either
 	// - the object is encrypted using SSE-C and two different SSE-C keys are present

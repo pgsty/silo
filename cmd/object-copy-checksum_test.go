@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"github.com/minio/minio/internal/auth"
+	objectreplication "github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
@@ -590,5 +591,263 @@ func testPutObjectRejectsMissingServerSideChecksum(obj ObjectLayer, instanceType
 				t.Fatalf("%s: failed PutObject left an object behind: %v", instanceType, err)
 			}
 		})
+	}
+}
+
+// copyChecksumSSECHeaders returns the SSE-C headers naming key for a request
+// that reads or writes the object itself.
+func copyChecksumSSECHeaders(key []byte) map[string]string {
+	digest := md5.Sum(key)
+	return map[string]string{
+		xhttp.AmzServerSideEncryptionCustomerAlgorithm: xhttp.AmzEncryptionAES,
+		xhttp.AmzServerSideEncryptionCustomerKey:       base64.StdEncoding.EncodeToString(key),
+		xhttp.AmzServerSideEncryptionCustomerKeyMD5:    base64.StdEncoding.EncodeToString(digest[:]),
+	}
+}
+
+// copyChecksumSSECCopySource returns the SSE-C headers naming key as the
+// CopyObject source key.
+func copyChecksumSSECCopySource(key []byte) map[string]string {
+	digest := md5.Sum(key)
+	return map[string]string{
+		xhttp.AmzServerSideEncryptionCopyCustomerAlgorithm: xhttp.AmzEncryptionAES,
+		xhttp.AmzServerSideEncryptionCopyCustomerKey:       base64.StdEncoding.EncodeToString(key),
+		xhttp.AmzServerSideEncryptionCopyCustomerKeyMD5:    base64.StdEncoding.EncodeToString(digest[:]),
+	}
+}
+
+// TestAPICopyObjectSSECKeyRotationChecksumAlgorithm covers an in-place SSE-C key
+// rotation that also requests a different checksum algorithm. The rotation fast
+// path only rewraps the object key and never reads the object data, so it cannot
+// honor the request; the copy has to fall through to the re-encrypting path that
+// recomputes, stores and reports the requested algorithm.
+func TestAPICopyObjectSSECKeyRotationChecksumAlgorithm(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:          t,
+		objAPITest: testAPICopyObjectSSECKeyRotationChecksumAlgorithm,
+		endpoints:  []string{"CopyObject", "PutObject", "GetObject"},
+	})
+}
+
+func testAPICopyObjectSSECKeyRotationChecksumAlgorithm(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, credentials auth.Credentials, t *testing.T,
+) {
+	previousTLS := globalIsTLS
+	globalIsTLS = true
+	defer func() { globalIsTLS = previousTLS }()
+
+	data := bytes.Repeat([]byte("rotate-and-upgrade-the-checksum-"), 32*1024)
+	object := "copy-checksum/rotate-checksum-algorithm.bin"
+	oldKey := bytes.Repeat([]byte{0x31}, 32)
+	newKey := bytes.Repeat([]byte{0x42}, 32)
+
+	putHeaders := copyChecksumSSECHeaders(oldKey)
+	putHeaders[xhttp.AmzChecksumCRC32] = mustChecksum(t, hash.ChecksumCRC32, data)
+	putCopyChecksumSource(t, apiRouter, credentials, bucketName, object, data, putHeaders)
+
+	rotate := copyChecksumSSECHeaders(newKey)
+	rotate[xhttp.AmzChecksumAlgo] = hash.ChecksumSHA256.String()
+	for name, value := range copyChecksumSSECCopySource(oldKey) {
+		rotate[name] = value
+	}
+	rec := copyChecksumRequest(t, apiRouter, credentials, bucketName, object, object, rotate)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: rotation with a requested algorithm failed: %d %s",
+			instanceType, rec.Code, rec.Body.String())
+	}
+	assertCopyChecksumResponse(t, rec, hash.ChecksumSHA256, data)
+
+	decryptHeaders := http.Header{}
+	for name, value := range copyChecksumSSECHeaders(newKey) {
+		decryptHeaders.Set(name, value)
+	}
+	oi := assertCopyChecksum(t, obj, bucketName, object, hash.ChecksumSHA256, data, false, decryptHeaders)
+	if stored, _ := oi.decryptChecksums(0, decryptHeaders); stored[hash.ChecksumCRC32.String()] != "" {
+		t.Fatalf("%s: rotation kept the superseded CRC32 checksum: %v", instanceType, stored)
+	}
+
+	getHeaders := copyChecksumSSECHeaders(newKey)
+	getHeaders[xhttp.AmzChecksumMode] = "ENABLED"
+	req, err := newTestSignedRequestV4(http.MethodGet, getGetObjectURL("", bucketName, object),
+		0, nil, credentials.AccessKey, credentials.SecretKey, getHeaders)
+	if err != nil {
+		t.Fatalf("failed to build GetObject request: %v", err)
+	}
+	response := httptest.NewRecorder()
+	apiRouter.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), data) {
+		t.Fatalf("%s: post-rotation GetObject returned %d with %d bytes, want 200 with %d bytes: %s",
+			instanceType, response.Code, response.Body.Len(), len(data), response.Body.String())
+	}
+	if got, want := response.Header().Get(xhttp.AmzChecksumSHA256),
+		mustChecksum(t, hash.ChecksumSHA256, data); got != want {
+		t.Fatalf("%s: post-rotation GetObject SHA256 %q, want %q", instanceType, got, want)
+	}
+	if got := response.Header().Get(xhttp.AmzChecksumCRC32); got != "" {
+		t.Fatalf("%s: post-rotation GetObject still returns the superseded CRC32 %q", instanceType, got)
+	}
+
+	stale, err := newTestSignedRequestV4(http.MethodGet, getGetObjectURL("", bucketName, object),
+		0, nil, credentials.AccessKey, credentials.SecretKey, copyChecksumSSECHeaders(oldKey))
+	if err != nil {
+		t.Fatalf("failed to build stale-key GetObject request: %v", err)
+	}
+	staleResponse := httptest.NewRecorder()
+	apiRouter.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusForbidden {
+		t.Fatalf("%s: GetObject with the rotated-out key returned %d, want 403",
+			instanceType, staleResponse.Code)
+	}
+}
+
+// TestAPICopyObjectSSECKeyRotationKeepsChecksumAbsence pins the compatibility
+// limitation accepted with pgsty/silo#113: without a requested algorithm an
+// in-place SSE-C rotation preserves the stored checksum state, including its
+// absence, so a checksum-less object does not gain the CRC64NVME that every
+// re-encrypting CopyObject adds. Deliberate, and the counterpart of the
+// preserved CRC32 that TestAPICopyObjectSSECKeyRotationKeepsCompressionState
+// pins for a checksum-bearing source.
+func TestAPICopyObjectSSECKeyRotationKeepsChecksumAbsence(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:          t,
+		objAPITest: testAPICopyObjectSSECKeyRotationKeepsChecksumAbsence,
+		endpoints:  []string{"CopyObject", "PutObject", "GetObject"},
+	})
+}
+
+func testAPICopyObjectSSECKeyRotationKeepsChecksumAbsence(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, credentials auth.Credentials, t *testing.T,
+) {
+	previousTLS := globalIsTLS
+	globalIsTLS = true
+	defer func() { globalIsTLS = previousTLS }()
+
+	data := bytes.Repeat([]byte("rotate-without-a-checksum-"), 32*1024)
+	object := "copy-checksum/rotate-keeps-checksum-absence.bin"
+	oldKey := bytes.Repeat([]byte{0x53}, 32)
+	newKey := bytes.Repeat([]byte{0x64}, 32)
+
+	// Assert the raw stored bytes rather than decryptChecksums, which also
+	// returns an empty map when it cannot unseal a checksum that is there.
+	storedChecksum := func() []byte {
+		t.Helper()
+		oi, err := obj.GetObjectInfo(t.Context(), bucketName, object, ObjectOptions{})
+		if err != nil {
+			t.Fatalf("GetObjectInfo(%s) failed: %v", object, err)
+		}
+		return oi.Checksum
+	}
+
+	putCopyChecksumSource(t, apiRouter, credentials, bucketName, object, data, copyChecksumSSECHeaders(oldKey))
+	if before := storedChecksum(); len(before) != 0 {
+		t.Fatalf("%s: invalid precondition, the source already carries a checksum: %x", instanceType, before)
+	}
+
+	rotate := copyChecksumSSECHeaders(newKey)
+	for name, value := range copyChecksumSSECCopySource(oldKey) {
+		rotate[name] = value
+	}
+	rec := copyChecksumRequest(t, apiRouter, credentials, bucketName, object, object, rotate)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: headerless rotation failed: %d %s", instanceType, rec.Code, rec.Body.String())
+	}
+	var copyResponse CopyObjectResponse
+	if err := xml.Unmarshal(rec.Body.Bytes(), &copyResponse); err != nil {
+		t.Fatalf("unable to decode CopyObjectResult: %v", err)
+	}
+	if copyResponse.ChecksumCRC32 != "" || copyResponse.ChecksumCRC32C != "" ||
+		copyResponse.ChecksumSHA1 != "" || copyResponse.ChecksumSHA256 != "" ||
+		copyResponse.ChecksumCRC64NVME != "" || copyResponse.ChecksumType != "" {
+		t.Fatalf("%s: headerless rotation reported a checksum it did not compute: %s",
+			instanceType, rec.Body.String())
+	}
+	if after := storedChecksum(); len(after) != 0 {
+		t.Fatalf("%s: headerless rotation attached a checksum: %x", instanceType, after)
+	}
+
+	req, err := newTestSignedRequestV4(http.MethodGet, getGetObjectURL("", bucketName, object),
+		0, nil, credentials.AccessKey, credentials.SecretKey, copyChecksumSSECHeaders(newKey))
+	if err != nil {
+		t.Fatalf("failed to build GetObject request: %v", err)
+	}
+	response := httptest.NewRecorder()
+	apiRouter.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), data) {
+		t.Fatalf("%s: post-rotation GetObject returned %d with %d bytes, want 200 with %d bytes: %s",
+			instanceType, response.Code, response.Body.Len(), len(data), response.Body.String())
+	}
+}
+
+// TestAPICopyObjectSSECKeyRotationReplicaKeepsFastPath pins that a replica-trusted
+// rotation keeps the in-place fast path even when it carries a checksum algorithm
+// header. Such a request reads its source without decrypting it, so a rewrite
+// would hash ciphertext and would skip the source-key check that a zero byte read
+// performs, and a replica has to keep the checksum its source assigned anyway.
+func TestAPICopyObjectSSECKeyRotationReplicaKeepsFastPath(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:          t,
+		objAPITest: testAPICopyObjectSSECKeyRotationReplicaKeepsFastPath,
+		endpoints:  []string{"CopyObject", "PutObject", "GetObject"},
+	})
+}
+
+func testAPICopyObjectSSECKeyRotationReplicaKeepsFastPath(obj ObjectLayer, instanceType, bucketName string,
+	apiRouter http.Handler, credentials auth.Credentials, t *testing.T,
+) {
+	previousTLS := globalIsTLS
+	globalIsTLS = true
+	defer func() { globalIsTLS = previousTLS }()
+
+	oldKey := bytes.Repeat([]byte{0x71}, 32)
+	newKey := bytes.Repeat([]byte{0x82}, 32)
+	wrongKey := bytes.Repeat([]byte{0x93}, 32)
+
+	rotateAsReplica := func(sourceKey []byte) map[string]string {
+		headers := copyChecksumSSECHeaders(newKey)
+		headers[xhttp.AmzChecksumAlgo] = hash.ChecksumSHA256.String()
+		for name, value := range copyChecksumSSECCopySource(sourceKey) {
+			headers[name] = value
+		}
+		headers[xhttp.MinIOSourceReplicationRequest] = "true"
+		headers[xhttp.AmzBucketReplicationStatus] = objectreplication.Replica.String()
+		return headers
+	}
+
+	data := bytes.Repeat([]byte("replica-rotation-keeps-its-checksum-"), 1024)
+	object := "copy-checksum/replica-rotate.bin"
+	putHeaders := copyChecksumSSECHeaders(oldKey)
+	putHeaders[xhttp.AmzChecksumCRC32] = mustChecksum(t, hash.ChecksumCRC32, data)
+	putCopyChecksumSource(t, apiRouter, credentials, bucketName, object, data, putHeaders)
+
+	rec := copyChecksumRequest(t, apiRouter, credentials, bucketName, object, object, rotateAsReplica(oldKey))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: replica rotation with an algorithm header failed: %d %s",
+			instanceType, rec.Code, rec.Body.String())
+	}
+	assertCopyChecksumResponse(t, rec, hash.ChecksumCRC32, data)
+
+	req, err := newTestSignedRequestV4(http.MethodGet, getGetObjectURL("", bucketName, object),
+		0, nil, credentials.AccessKey, credentials.SecretKey, copyChecksumSSECHeaders(newKey))
+	if err != nil {
+		t.Fatalf("failed to build GetObject request: %v", err)
+	}
+	response := httptest.NewRecorder()
+	apiRouter.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), data) {
+		t.Fatalf("%s: post-rotation GetObject returned %d with %d bytes, want 200 with %d bytes: %s",
+			instanceType, response.Code, response.Body.Len(), len(data), response.Body.String())
+	}
+
+	// A zero byte source is the case where the fast path is the only thing that
+	// still authenticates the rotated-out key.
+	empty := "copy-checksum/replica-rotate-empty.bin"
+	putCopyChecksumSource(t, apiRouter, credentials, bucketName, empty, nil, copyChecksumSSECHeaders(oldKey))
+	wrong := copyChecksumRequest(t, apiRouter, credentials, bucketName, empty, empty, rotateAsReplica(wrongKey))
+	if wrong.Code != http.StatusForbidden {
+		t.Fatalf("%s: replica rotation of an empty object with the wrong source key returned %d, want 403: %s",
+			instanceType, wrong.Code, wrong.Body.String())
 	}
 }
