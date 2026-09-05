@@ -1523,10 +1523,14 @@ var errorCodes = errorCodeMap{
 		Description:    "Your Host header is malformed.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	// The stored object cannot be served: a server-side data condition, not a
+	// successful partial read. Upstream maps it to http.StatusPartialContent
+	// (since ca6b4773e, 2017), which lets SDKs accept the XML error document
+	// as object content; SILO deliberately diverges and returns 500.
 	ErrObjectTampered: {
 		Code:           "XMinioObjectTampered",
 		Description:    errObjectTampered.Error(),
-		HTTPStatusCode: http.StatusPartialContent,
+		HTTPStatusCode: http.StatusInternalServerError,
 	},
 
 	ErrSiteReplicationInvalidRequest: {
