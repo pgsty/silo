@@ -710,20 +710,26 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	}
 
 	actualSize := data.ActualSize()
-	if actualSize < 0 {
-		_, encrypted := crypto.IsEncrypted(fi.Metadata)
-		compressed := fi.IsCompressed()
-		switch {
-		case compressed:
-			// ... nothing changes for compressed stream.
-			// if actualSize is -1 we have no known way to
-			// determine what is the actualSize.
-		case encrypted:
-			decSize, err := sio.DecryptedSize(uint64(n))
-			if err == nil {
-				actualSize = int64(decSize)
-			}
-		default:
+	_, encrypted := crypto.IsEncrypted(fi.Metadata)
+	compressed := fi.IsCompressed()
+	switch {
+	case compressed:
+		// ... nothing changes for compressed stream.
+		// if actualSize is -1 we have no known way to
+		// determine what is the actualSize.
+	case encrypted:
+		// The uploaded length of an encrypted part is always derivable from the
+		// bytes just written, and the caller's value cannot be trusted: trusted
+		// SSE-C replication and the data movement paths hand over the ciphertext
+		// length. Derive it with the arithmetic the read path applies to
+		// part.Size, so the stored value matches how the part is read back.
+		decSize, err := sio.DecryptedSize(uint64(n))
+		if err != nil {
+			return pi, toObjectErr(errObjectTampered, bucket, object, uploadID)
+		}
+		actualSize = int64(decSize)
+	default:
+		if actualSize < 0 {
 			actualSize = n
 		}
 	}

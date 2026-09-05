@@ -49,6 +49,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/sio"
 	"github.com/pgsty/silo-pkg/v3/trie"
 	"github.com/pgsty/silo-pkg/v3/wildcard"
 	"github.com/valyala/bytebufferpool"
@@ -675,19 +676,35 @@ func getPartFile(entriesTrie *trie.Trie, partNumber int, etag string) (partFile 
 	return partFile
 }
 
-func partNumberToRangeSpec(oi ObjectInfo, partNumber int) *HTTPRangeSpec {
+func partNumberToRangeSpec(oi ObjectInfo, partNumber int) (*HTTPRangeSpec, error) {
 	if oi.Size == 0 || len(oi.Parts) == 0 {
-		return nil
+		return nil, nil
 	}
+
+	// For an encrypted, uncompressed object derive each part's plaintext length
+	// from the stored ciphertext length instead of trusting ActualSize: parts
+	// written before this was normalised record the ciphertext length there.
+	// The range returned here is consumed in the plaintext domain, where
+	// GetDecryptedRange and DecryptedSize both use exactly this arithmetic.
+	_, isEncrypted := crypto.IsEncrypted(oi.UserDefined)
+	deriveFromSize := isEncrypted && !oi.IsCompressed()
 
 	var start int64
 	end := int64(-1)
 	for i := 0; i < len(oi.Parts) && i < partNumber; i++ {
+		partSize := oi.Parts[i].ActualSize
+		if deriveFromSize {
+			decrypted, err := sio.DecryptedSize(uint64(oi.Parts[i].Size))
+			if err != nil {
+				return nil, errObjectTampered
+			}
+			partSize = int64(decrypted)
+		}
 		start = end + 1
-		end = start + oi.Parts[i].ActualSize - 1
+		end = start + partSize - 1
 	}
 
-	return &HTTPRangeSpec{Start: start, End: end}
+	return &HTTPRangeSpec{Start: start, End: end}, nil
 }
 
 // Returns the compressed offset which should be skipped.
@@ -806,7 +823,10 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, h 
 	}
 
 	if rs == nil && opts.PartNumber > 0 {
-		rs = partNumberToRangeSpec(oi, opts.PartNumber)
+		rs, err = partNumberToRangeSpec(oi, opts.PartNumber)
+		if err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	_, isEncrypted := crypto.IsEncrypted(oi.UserDefined)
