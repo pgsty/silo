@@ -815,6 +815,16 @@ func testAPISSECMultipartReplicationTrust(obj ObjectLayer, instanceType, bucketN
 	if replCompleteRec.Code != http.StatusOK {
 		t.Fatalf("replica Complete status %d: %s", replCompleteRec.Code, replCompleteRec.Body.String())
 	}
+	replicaInfo, err := obj.GetObjectInfo(t.Context(), bucketName, object, ObjectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replicaInfo.Parts) != 1 {
+		t.Fatalf("replicated SSE-C multipart object has %d parts, want 1", len(replicaInfo.Parts))
+	}
+	if got, want := replicaInfo.Parts[0].ActualSize, int64(len(data)); got != want {
+		t.Fatalf("replicated SSE-C part actual size = %d, want plaintext size %d", got, want)
+	}
 
 	getReq, err := newTestSignedRequestV4(http.MethodGet, getGetObjectURL("", bucketName, object),
 		0, nil, credentials.AccessKey, credentials.SecretKey, sseHeaders)
@@ -828,6 +838,21 @@ func testAPISSECMultipartReplicationTrust(obj ObjectLayer, instanceType, bucketN
 	}
 	if !bytes.Equal(getRec.Body.Bytes(), data) {
 		t.Fatal("replicated SSE-C multipart object did not decrypt to source plaintext")
+	}
+
+	partGetReq, err := newTestSignedRequestV4(http.MethodGet,
+		getGetObjectURL("", bucketName, object)+"?partNumber=1", 0, nil,
+		credentials.AccessKey, credentials.SecretKey, sseHeaders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partGetRec := httptest.NewRecorder()
+	apiRouter.ServeHTTP(partGetRec, partGetReq)
+	if partGetRec.Code != http.StatusPartialContent {
+		t.Fatalf("replicated SSE-C part GET status %d, want %d: %s", partGetRec.Code, http.StatusPartialContent, partGetRec.Body.String())
+	}
+	if !bytes.Equal(partGetRec.Body.Bytes(), data) {
+		t.Fatal("replicated SSE-C part GET did not decrypt to source plaintext")
 	}
 }
 

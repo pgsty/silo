@@ -49,6 +49,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/sio"
 	"github.com/pgsty/silo-pkg/v3/trie"
 	"github.com/pgsty/silo-pkg/v3/wildcard"
 	"github.com/valyala/bytebufferpool"
@@ -675,19 +676,29 @@ func getPartFile(entriesTrie *trie.Trie, partNumber int, etag string) (partFile 
 	return partFile
 }
 
-func partNumberToRangeSpec(oi ObjectInfo, partNumber int) *HTTPRangeSpec {
+func partNumberToRangeSpec(oi ObjectInfo, partNumber int) (*HTTPRangeSpec, error) {
 	if oi.Size == 0 || len(oi.Parts) == 0 {
-		return nil
+		return nil, nil
 	}
 
+	_, encrypted := crypto.IsEncrypted(oi.UserDefined)
+	compressed := oi.IsCompressed()
 	var start int64
 	end := int64(-1)
 	for i := 0; i < len(oi.Parts) && i < partNumber; i++ {
 		start = end + 1
-		end = start + oi.Parts[i].ActualSize - 1
+		partSize := oi.Parts[i].ActualSize
+		if encrypted && !compressed {
+			decSize, err := sio.DecryptedSize(uint64(oi.Parts[i].Size))
+			if err != nil {
+				return nil, errObjectTampered
+			}
+			partSize = int64(decSize)
+		}
+		end = start + partSize - 1
 	}
 
-	return &HTTPRangeSpec{Start: start, End: end}
+	return &HTTPRangeSpec{Start: start, End: end}, nil
 }
 
 // Returns the compressed offset which should be skipped.
@@ -806,7 +817,10 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, h 
 	}
 
 	if rs == nil && opts.PartNumber > 0 {
-		rs = partNumberToRangeSpec(oi, opts.PartNumber)
+		rs, err = partNumberToRangeSpec(oi, opts.PartNumber)
+		if err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	_, isEncrypted := crypto.IsEncrypted(oi.UserDefined)

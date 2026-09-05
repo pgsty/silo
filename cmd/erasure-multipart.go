@@ -710,19 +710,20 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	}
 
 	actualSize := data.ActualSize()
-	if actualSize < 0 {
-		_, encrypted := crypto.IsEncrypted(fi.Metadata)
-		compressed := fi.IsCompressed()
+	_, encrypted := crypto.IsEncrypted(fi.Metadata)
+	compressed := fi.IsCompressed()
+	if encrypted && !compressed {
+		decSize, err := sio.DecryptedSize(uint64(n))
+		if err != nil {
+			return pi, errObjectTampered
+		}
+		actualSize = int64(decSize)
+	} else if actualSize < 0 {
 		switch {
 		case compressed:
 			// ... nothing changes for compressed stream.
 			// if actualSize is -1 we have no known way to
 			// determine what is the actualSize.
-		case encrypted:
-			decSize, err := sio.DecryptedSize(uint64(n))
-			if err == nil {
-				actualSize = int64(decSize)
-			}
 		default:
 			actualSize = n
 		}

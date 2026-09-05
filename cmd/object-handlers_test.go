@@ -979,7 +979,10 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
 		}
 
-		rs := partNumberToRangeSpec(oinfo, partNumber)
+		rs, err := partNumberToRangeSpec(oinfo, partNumber)
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d: Unexpected part range err: %v", object, oindex, err)
+		}
 		size, err := oinfo.GetActualSize()
 		if err != nil {
 			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)

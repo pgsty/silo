@@ -212,7 +212,10 @@ func setObjectHeaders(ctx context.Context, w http.ResponseWriter, objInfo Object
 	}
 
 	if rs == nil && opts.PartNumber > 0 {
-		rs = partNumberToRangeSpec(objInfo, opts.PartNumber)
+		rs, err = partNumberToRangeSpec(objInfo, opts.PartNumber)
+		if err != nil {
+			return err
+		}
 	}
 
 	// For providing ranged content

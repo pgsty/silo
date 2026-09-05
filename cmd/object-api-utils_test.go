@@ -36,6 +36,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/sio"
 	"github.com/pgsty/silo-pkg/v3/trie"
 )
 
@@ -658,6 +659,46 @@ func TestGetActualSize(t *testing.T) {
 			t.Errorf("Test %d - expected %d but received %d",
 				i+1, test.result, got)
 		}
+	}
+}
+
+func TestPartNumberToRangeSpecUsesDecryptedPartSizes(t *testing.T) {
+	const plaintextPartSize = int64(5 * 1024 * 1024)
+
+	encryptedSize := func(size int64) int64 {
+		encrypted, err := sio.EncryptedSize(uint64(size))
+		if err != nil {
+			t.Fatalf("failed to calculate encrypted size: %v", err)
+		}
+		return int64(encrypted)
+	}
+
+	info := ObjectInfo{
+		Size: plaintextPartSize * 2,
+		UserDefined: map[string]string{
+			crypto.MetaAlgorithm: crypto.InsecureSealAlgorithm,
+			crypto.MetaMultipart: "1",
+		},
+		Parts: []ObjectPartInfo{
+			{Size: encryptedSize(plaintextPartSize), ActualSize: encryptedSize(plaintextPartSize)},
+			{Size: encryptedSize(plaintextPartSize), ActualSize: encryptedSize(plaintextPartSize)},
+		},
+	}
+
+	rs, err := partNumberToRangeSpec(info, 2)
+	if err != nil {
+		t.Fatalf("partNumberToRangeSpec returned an unexpected error: %v", err)
+	}
+	if got, want := rs.Start, plaintextPartSize; got != want {
+		t.Fatalf("part range start = %d, want %d", got, want)
+	}
+	if got, want := rs.End, plaintextPartSize*2-1; got != want {
+		t.Fatalf("part range end = %d, want %d", got, want)
+	}
+
+	info.Parts[0].Size = 1
+	if _, err := partNumberToRangeSpec(info, 1); err != errObjectTampered {
+		t.Fatalf("invalid encrypted part error = %v, want %v", err, errObjectTampered)
 	}
 }
 
