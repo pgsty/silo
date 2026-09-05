@@ -829,6 +829,25 @@ func testAPISSECMultipartReplicationTrust(obj ObjectLayer, instanceType, bucketN
 	if !bytes.Equal(getRec.Body.Bytes(), data) {
 		t.Fatal("replicated SSE-C multipart object did not decrypt to source plaintext")
 	}
+
+	// A replicated SSE-C part is written as raw ciphertext, so its stored
+	// ActualSize is the ciphertext length. GetObjectAttributes must still
+	// report the part's plaintext length, which for this single-part object
+	// is the whole object size.
+	attributes := attributesPartsFetch(t, apiRouter, credentials, bucketName, object, sseHeaders)
+	if len(attributes.ObjectParts.Parts) != 1 {
+		t.Fatalf("replica attributes part count %d, want 1", len(attributes.ObjectParts.Parts))
+	}
+	if got := attributes.ObjectParts.Parts[0].Size; got != int64(len(data)) {
+		t.Errorf("replica attributes part 1 size=%d, want plaintext size %d", got, len(data))
+	}
+	if attributes.ObjectSize != int64(len(data)) {
+		t.Errorf("replica attributes ObjectSize=%d, want %d", attributes.ObjectSize, len(data))
+	}
+	if attributes.ObjectParts.Parts[0].Size != attributes.ObjectSize {
+		t.Errorf("replica attributes part 1 size=%d does not match ObjectSize=%d",
+			attributes.ObjectParts.Parts[0].Size, attributes.ObjectSize)
+	}
 }
 
 // TestAPIStreamingTrailerWithUntrustedReplicationHeaders verifies that a

@@ -18,9 +18,11 @@
 package cmd
 
 import (
+	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	xhttp "github.com/minio/minio/internal/http"
@@ -72,6 +74,112 @@ func TestGetAndValidateAttributesOpts(t *testing.T) {
 
 			if !reflect.DeepEqual(opts.ObjectAttributes, testCase.wantObjectAttrs) {
 				t.Errorf("want opts %v, got %v", testCase.wantObjectAttrs, opts.ObjectAttributes)
+			}
+		})
+	}
+}
+
+// TestGetAndValidateAttributesOptsPartsRange asserts that GetObjectAttributes
+// range checks the ObjectParts pagination headers the way ListObjectParts
+// does: a negative value is rejected with the same API error, an absent or
+// zero x-amz-max-parts means the default page size, and in-range values are
+// passed through unchanged.
+func TestGetAndValidateAttributesOptsPartsRange(t *testing.T) {
+	globalBucketVersioningSys = &BucketVersioningSys{}
+	bucket := minioMetaBucket
+	ctx := t.Context()
+
+	testCases := []struct {
+		name         string
+		maxParts     string
+		marker       string
+		wantValid    bool
+		wantErr      APIErrorCode
+		wantArgument string
+		wantValue    string
+		wantMaxParts int
+		wantMarker   int
+	}{
+		{
+			name:         "defaults",
+			wantValid:    true,
+			wantMaxParts: maxPartsList,
+		},
+		{
+			name:         "zero max-parts means the default page size",
+			maxParts:     "0",
+			wantValid:    true,
+			wantMaxParts: maxPartsList,
+		},
+		{
+			name:         "in range values pass through",
+			maxParts:     "10",
+			marker:       "3",
+			wantValid:    true,
+			wantMaxParts: 10,
+			wantMarker:   3,
+		},
+		{
+			name:         "negative max-parts is rejected",
+			maxParts:     "-1",
+			wantValid:    false,
+			wantErr:      ErrInvalidMaxParts,
+			wantArgument: strings.ToLower(xhttp.AmzMaxParts),
+			wantValue:    "-1",
+		},
+		{
+			name:         "negative part-number-marker is rejected",
+			marker:       "-1",
+			wantValid:    false,
+			wantErr:      ErrInvalidPartNumberMarker,
+			wantArgument: strings.ToLower(xhttp.AmzPartNumberMarker),
+			wantValue:    "-1",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/testbucket/testobject?attributes", nil)
+			req.Header.Set(xhttp.AmzObjectAttributes, "ObjectParts")
+			if testCase.maxParts != "" {
+				req.Header.Set(xhttp.AmzMaxParts, testCase.maxParts)
+			}
+			if testCase.marker != "" {
+				req.Header.Set(xhttp.AmzPartNumberMarker, testCase.marker)
+			}
+
+			opts, valid := getAndValidateAttributesOpts(ctx, rec, req, bucket, "testobject")
+			if valid != testCase.wantValid {
+				t.Fatalf("want valid %v, got %v (%s)", testCase.wantValid, valid, rec.Body.String())
+			}
+
+			if testCase.wantValid {
+				if opts.MaxParts != testCase.wantMaxParts {
+					t.Errorf("want MaxParts %d, got %d", testCase.wantMaxParts, opts.MaxParts)
+				}
+				if opts.PartNumberMarker != testCase.wantMarker {
+					t.Errorf("want PartNumberMarker %d, got %d", testCase.wantMarker, opts.PartNumberMarker)
+				}
+				return
+			}
+
+			wantErr := errorCodes.ToAPIErr(testCase.wantErr)
+			if rec.Code != wantErr.HTTPStatusCode {
+				t.Errorf("want HTTP status %d, got %d", wantErr.HTTPStatusCode, rec.Code)
+			}
+			var errResp objectAttributesErrorResponse
+			if err := xml.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+				t.Fatalf("decode error response: %v (%s)", err, rec.Body.String())
+			}
+			if errResp.Code != wantErr.Code || errResp.Message != wantErr.Description {
+				t.Errorf("want error %s/%q, got %s/%q", wantErr.Code, wantErr.Description, errResp.Code, errResp.Message)
+			}
+			if errResp.ArgumentName == nil || *errResp.ArgumentName != testCase.wantArgument {
+				t.Errorf("want ArgumentName %q, got %v", testCase.wantArgument, errResp.ArgumentName)
+			}
+			if errResp.ArgumentValue == nil || *errResp.ArgumentValue != testCase.wantValue {
+				t.Errorf("want ArgumentValue %q, got %v", testCase.wantValue, errResp.ArgumentValue)
 			}
 		})
 	}

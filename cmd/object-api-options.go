@@ -184,6 +184,16 @@ func getAndValidateAttributesOpts(ctx context.Context, w http.ResponseWriter, r 
 		return opts, valid
 	}
 
+	// Reject out-of-range page sizes as ListObjectParts does, instead of
+	// answering an invalid request with an empty parts listing.
+	if opts.MaxParts < 0 {
+		apiErr = errorCodes.ToAPIErr(ErrInvalidMaxParts)
+		argumentName = strings.ToLower(xhttp.AmzMaxParts)
+		argumentValue = r.Header.Get(xhttp.AmzMaxParts)
+		valid = false
+		return opts, valid
+	}
+
 	if opts.MaxParts == 0 {
 		opts.MaxParts = maxPartsList
 	}
@@ -192,6 +202,14 @@ func getAndValidateAttributesOpts(ctx context.Context, w http.ResponseWriter, r 
 	if err != nil {
 		apiErr = toAPIError(ctx, err)
 		argumentName = strings.ToLower(xhttp.AmzPartNumberMarker)
+		valid = false
+		return opts, valid
+	}
+
+	if opts.PartNumberMarker < 0 {
+		apiErr = errorCodes.ToAPIErr(ErrInvalidPartNumberMarker)
+		argumentName = strings.ToLower(xhttp.AmzPartNumberMarker)
+		argumentValue = r.Header.Get(xhttp.AmzPartNumberMarker)
 		valid = false
 		return opts, valid
 	}

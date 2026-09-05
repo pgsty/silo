@@ -62,6 +62,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
 	"github.com/minio/mux"
+	"github.com/minio/sio"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
@@ -687,6 +688,20 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	objInfo.decryptPartsChecksums(r.Header)
 
 	if _, ok := opts.ObjectAttributes[xhttp.ObjectParts]; ok {
+		// Report each part's uploaded plaintext byte length. Parts are stored
+		// transformed, compressed and/or encrypted, so the stored size is not
+		// what AWS defines ObjectPart.Size to be.
+		_, isEncrypted := crypto.IsEncrypted(objInfo.UserDefined)
+		isCompressed := objInfo.IsCompressed()
+		// Only a part of an encrypted multipart object is a stream of its
+		// own. A legacy encrypted object without that marker is one
+		// continuous stream that the erasure writer split into storage
+		// fragments, so no fragment has a plaintext length to report and
+		// each keeps its stored size, as ObjectInfo.DecryptedSize and
+		// DecryptBlocksRequestR also treat it.
+		hasEncryptedParts := isEncrypted &&
+			(crypto.IsMultiPart(objInfo.UserDefined) || len(objInfo.Parts) == 1)
+
 		OA.ObjectParts = new(objectAttributesParts)
 		OA.ObjectParts.PartNumberMarker = opts.PartNumberMarker
 
@@ -701,7 +716,36 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 				}
 
 				if len(OA.ObjectParts.Parts) == opts.MaxParts {
+					// This page is full and at least one more part
+					// is still pending, so the listing is truncated.
+					OA.ObjectParts.IsTruncated = true
 					break
+				}
+
+				partSize := objInfo.Parts[i].Size
+				switch {
+				case isCompressed:
+					// ActualSize is recorded by the same code that compresses,
+					// so it is always present for a compressed part.
+					if objInfo.Parts[i].ActualSize >= 0 {
+						partSize = objInfo.Parts[i].ActualSize
+					}
+				case hasEncryptedParts:
+					// ActualSize cannot be trusted for encrypted parts: a
+					// replicated SSE-C part records the ciphertext length, and
+					// parts written before actualSize existed record 0. Derive
+					// the plaintext length from the ciphertext instead, exactly
+					// as ObjectInfo.DecryptedSize does. A part whose stored
+					// length is not a valid encrypted stream has no logical
+					// length to report, and DecryptObjectInfo above only
+					// validates the object as a whole in that case, because
+					// ObjectInfo.isMultipart gives up on the first bad part.
+					decrypted, err := sio.DecryptedSize(uint64(partSize))
+					if err != nil {
+						writeErrorResponse(ctx, w, toAPIError(ctx, errObjectTampered), r.URL)
+						return
+					}
+					partSize = int64(decrypted)
 				}
 
 				OA.ObjectParts.NextPartNumberMarker = v.Number
@@ -712,13 +756,16 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 					ChecksumCRC32C:    objInfo.Parts[i].Checksums["CRC32C"],
 					ChecksumCRC64NVME: objInfo.Parts[i].Checksums["CRC64NVME"],
 					PartNumber:        objInfo.Parts[i].Number,
-					Size:              objInfo.Parts[i].Size,
+					Size:              partSize,
 				})
 			}
 		}
 
-		if OA.ObjectParts.NextPartNumberMarker != partsLength {
-			OA.ObjectParts.IsTruncated = true
+		// Part numbers may be sparse, so they cannot be compared against
+		// the part count. NextPartNumberMarker only carries a continuation
+		// token for a truncated listing, as in ListObjectParts.
+		if !OA.ObjectParts.IsTruncated {
+			OA.ObjectParts.NextPartNumberMarker = 0
 		}
 	}
 
