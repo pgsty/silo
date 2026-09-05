@@ -610,7 +610,10 @@ func excludeForCompression(header http.Header, object string, cfg compress.Confi
 		return true
 	}
 
-	if crypto.Requested(header) && !cfg.AllowEncrypted {
+	// SSE-C replication sends raw ciphertext without compression metadata.
+	// Exclude new SSE-C data from compression; other modes follow allow_encryption.
+	if crypto.SSEC.IsRequested(header) ||
+		(crypto.Requested(header) && !cfg.AllowEncrypted) {
 		return true
 	}
 

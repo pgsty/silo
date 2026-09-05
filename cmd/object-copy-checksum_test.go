@@ -363,7 +363,10 @@ func testAPICopyObjectServerSideChecksumEncryption(obj ObjectLayer, instanceType
 			compressed bool
 		}{
 			{name: "encrypted-only", extension: ".bin"},
-			{name: "compressed-encrypted", extension: ".txt", compressed: true},
+			// SSE-C is excluded from compression whatever allow_encryption says,
+			// so a compressible destination extension changes nothing here. The
+			// SSE-S3 sibling above keeps the compressed-encrypted coverage.
+			{name: "compressible-extension", extension: ".txt"},
 		} {
 			t.Run(variant.name, func(t *testing.T) {
 				destination := "copy-checksum/sse-c-" + variant.name + variant.extension

@@ -62,13 +62,14 @@ echo "Hello world" >/tmp/data/plainfile
 echo "Hello from encrypted world" >/tmp/data/encrypted
 touch /tmp/data/defpartsize
 shred -s 500M /tmp/data/defpartsize
-touch /tmp/data/mpartobj.txt
-shred -s 500M /tmp/data/mpartobj.txt
+# Compressible, and large enough for a multipart upload, so the object would be
+# stored compressed if SSE-C were not excluded from compression.
+yes "silo compression and sse-c replication payload" | head -c 100000000 >/tmp/data/mpartobj.txt
 echo "done"
 
 # Enable compression for site silo1
-./mc admin config set silo1 compression enable=on extensions=".txt" --insecure
-./mc admin config set silo1 compression allow_encryption=off --insecure
+./mc admin config set silo1 compression enable=on extensions=".txt" --insecure || exit_1
+./mc admin config set silo1 compression allow_encryption=on --insecure || exit_1
 
 # Create bucket in source cluster
 echo "Create bucket in source Silo instance"
@@ -80,13 +81,13 @@ echo "Loading objects to source Silo instance"
 ./mc cp /tmp/data/encrypted silo1/test-bucket/encrypted --enc-c "silo1/test-bucket/encrypted=${TEST_MINIO_ENC_KEY}" --insecure
 ./mc cp /tmp/data/defpartsize silo1/test-bucket/defpartsize --enc-c "silo1/test-bucket/defpartsize=${TEST_MINIO_ENC_KEY}" --insecure
 
-# Below should fail as compression and SSEC used at the same time
-# DISABLED: We must check the response header to see if compression was actually applied
-#RESULT=$({ ./mc put /tmp/data/mpartobj.txt silo1/test-bucket/mpartobj.txt --enc-c "silo1/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure; } 2>&1)
-#if [[ ${RESULT} != *"Server side encryption specified with SSE-C with compression not allowed"* ]]; then
-#	echo "BUG: Loading an SSE-C object to site with compression should fail. Succeeded though."
-#	exit_1
-#fi
+# A compressible .txt object written with SSE-C while allow_encryption=on. SSE-C
+# is excluded from compression whatever allow_encryption says, because
+# replication ships SSE-C objects as raw ciphertext and the wire cannot carry the
+# compression metadata. Were the object stored compressed, the replica would hold
+# the compressed bytes with no compression marker and decrypt to a raw S2 stream,
+# which the size and content checks below detect.
+./mc cp /tmp/data/mpartobj.txt silo1/test-bucket/mpartobj.txt --enc-c "silo1/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure
 
 # Add replication site
 ./mc admin replicate add silo1 silo2 --insecure
@@ -111,6 +112,11 @@ if [ "${count3}" -ne 1 ]; then
 	echo "BUG: object silo1/test-bucket/defpartsize not found"
 	exit_1
 fi
+count4=$(./mc ls silo1/test-bucket/mpartobj.txt --insecure | wc -l)
+if [ "${count4}" -ne 1 ]; then
+	echo "BUG: object silo1/test-bucket/mpartobj.txt not found"
+	exit_1
+fi
 sleep 120
 
 # List the objects from replicated site
@@ -131,6 +137,11 @@ if [ "${repcount3}" -ne 1 ]; then
 	echo "BUG: object test-bucket/defpartsize not replicated"
 	exit_1
 fi
+repcount4=$(./mc ls silo2/test-bucket/mpartobj.txt --insecure | wc -l)
+if [ "${repcount4}" -ne 1 ]; then
+	echo "BUG: object test-bucket/mpartobj.txt not replicated"
+	exit_1
+fi
 
 # Stat the SSEC objects from source site
 echo "Stat silo1/test-bucket/encrypted"
@@ -145,6 +156,25 @@ stat_out2=$(./mc stat --no-list silo1/test-bucket/defpartsize --enc-c "silo1/tes
 src_obj2_etag=$(echo "${stat_out2}" | jq '.etag')
 src_obj2_size=$(echo "${stat_out2}" | jq '.size')
 src_obj2_md5=$(echo "${stat_out2}" | jq '.metadata."X-Amz-Server-Side-Encryption-Customer-Key-Md5"')
+echo "Stat silo1/test-bucket/mpartobj.txt"
+./mc stat --no-list silo1/test-bucket/mpartobj.txt --enc-c "silo1/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure --json
+# The compression marker reaches the client only as the X-Minio-Compressed
+# response header, which the SDK filters out of `mc stat --json`, so read the
+# raw HTTP trace instead. The sentinel check keeps the assertion from passing
+# vacuously if the trace format ever changes.
+stat_trace=$(./mc --debug stat --no-list silo1/test-bucket/mpartobj.txt --enc-c "silo1/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure 2>&1) || exit_1
+if ! grep -qi "X-Amz-Request-Id" <<<"${stat_trace}"; then
+	echo "BUG: 'mc --debug stat' printed no response headers, so the compression check below proves nothing"
+	exit_1
+fi
+if grep -qi "X-Minio-Compressed" <<<"${stat_trace}"; then
+	echo "BUG: SSE-C object 'silo1/test-bucket/mpartobj.txt' was stored compressed despite the SSE-C compression exclusion"
+	exit_1
+fi
+stat_out3=$(./mc stat --no-list silo1/test-bucket/mpartobj.txt --enc-c "silo1/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure --json)
+src_obj3_etag=$(echo "${stat_out3}" | jq '.etag')
+src_obj3_size=$(echo "${stat_out3}" | jq '.size')
+src_obj3_md5=$(echo "${stat_out3}" | jq '.metadata."X-Amz-Server-Side-Encryption-Customer-Key-Md5"')
 
 # Stat the SSEC objects from replicated site
 echo "Stat silo2/test-bucket/encrypted"
@@ -159,6 +189,12 @@ stat_out2_rep=$(./mc stat --no-list silo2/test-bucket/defpartsize --enc-c "silo2
 rep_obj2_etag=$(echo "${stat_out2_rep}" | jq '.etag')
 rep_obj2_size=$(echo "${stat_out2_rep}" | jq '.size')
 rep_obj2_md5=$(echo "${stat_out2_rep}" | jq '.metadata."X-Amz-Server-Side-Encryption-Customer-Key-Md5"')
+echo "Stat silo2/test-bucket/mpartobj.txt"
+./mc stat --no-list silo2/test-bucket/mpartobj.txt --enc-c "silo2/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure --json
+stat_out3_rep=$(./mc stat --no-list silo2/test-bucket/mpartobj.txt --enc-c "silo2/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure --json)
+rep_obj3_etag=$(echo "${stat_out3_rep}" | jq '.etag')
+rep_obj3_size=$(echo "${stat_out3_rep}" | jq '.size')
+rep_obj3_md5=$(echo "${stat_out3_rep}" | jq '.metadata."X-Amz-Server-Side-Encryption-Customer-Key-Md5"')
 
 # Check the etag and size of replicated SSEC objects
 if [ "${rep_obj1_etag}" != "${src_obj1_etag}" ]; then
@@ -177,10 +213,23 @@ if [ "${rep_obj2_size}" != "${src_obj2_size}" ]; then
 	echo "BUG: Size: '${rep_obj2_size}' of replicated object: 'silo2/test-bucket/defpartsize' doesn't match with source value: '${src_obj2_size}'"
 	exit_1
 fi
+if [ "${rep_obj3_etag}" != "${src_obj3_etag}" ]; then
+	echo "BUG: Etag: '${rep_obj3_etag}' of replicated object: 'silo2/test-bucket/mpartobj.txt' doesn't match with source value: '${src_obj3_etag}'"
+	exit_1
+fi
+if [ "${rep_obj3_size}" != "${src_obj3_size}" ]; then
+	echo "BUG: Size: '${rep_obj3_size}' of replicated object: 'silo2/test-bucket/mpartobj.txt' doesn't match with source value: '${src_obj3_size}'"
+	exit_1
+fi
 
 # Check content of replicated SSEC objects
 ./mc cat silo2/test-bucket/encrypted --enc-c "silo2/test-bucket/encrypted=${TEST_MINIO_ENC_KEY}" --insecure
 ./mc cat silo2/test-bucket/defpartsize --enc-c "silo2/test-bucket/defpartsize=${TEST_MINIO_ENC_KEY}" --insecure >/dev/null || exit_1
+./mc cat silo2/test-bucket/mpartobj.txt --enc-c "silo2/test-bucket/mpartobj.txt=${TEST_MINIO_ENC_KEY}" --insecure >/tmp/data/mpartobj.replica || exit_1
+if ! cmp -s /tmp/data/mpartobj.txt /tmp/data/mpartobj.replica; then
+	echo "BUG: replicated object 'silo2/test-bucket/mpartobj.txt' does not match the source; a compressed SSE-C object decrypts to a raw S2 stream on the replica"
+	exit_1
+fi
 
 # Check the MD5 checksums of encrypted objects from source and target
 if [ "${src_obj1_md5}" != "${rep_obj1_md5}" ]; then
@@ -189,6 +238,10 @@ if [ "${src_obj1_md5}" != "${rep_obj1_md5}" ]; then
 fi
 if [ "${src_obj2_md5}" != "${rep_obj2_md5}" ]; then
 	echo "BUG: MD5 checksum of object 'silo2/test-bucket/defpartsize' doesn't match with source. Expected: '${src_obj2_md5}', Found: '${rep_obj2_md5}'"
+	exit_1
+fi
+if [ "${src_obj3_md5}" != "${rep_obj3_md5}" ]; then
+	echo "BUG: MD5 checksum of object 'silo2/test-bucket/mpartobj.txt' doesn't match with source. Expected: '${src_obj3_md5}', Found: '${rep_obj3_md5}'"
 	exit_1
 fi
 

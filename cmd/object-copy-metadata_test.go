@@ -404,16 +404,16 @@ func testAPICopyObjectSSECKeyRotationNullVersion(obj ObjectLayer, instanceType, 
 		apiRouter, credentials, false, t)
 }
 
-func TestAPICopyObjectSSECKeyRotationNullVersionCompressesRewrite(t *testing.T) {
+func TestAPICopyObjectSSECKeyRotationNullVersionSkipsCompression(t *testing.T) {
 	defer DetectTestLeak(t)()
 	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
 		t:          t,
-		objAPITest: testAPICopyObjectSSECKeyRotationNullVersionCompressesRewrite,
+		objAPITest: testAPICopyObjectSSECKeyRotationNullVersionSkipsCompression,
 		endpoints:  []string{"CopyObject", "PutObject", "GetObject"},
 	})
 }
 
-func testAPICopyObjectSSECKeyRotationNullVersionCompressesRewrite(obj ObjectLayer, instanceType, bucketName string,
+func testAPICopyObjectSSECKeyRotationNullVersionSkipsCompression(obj ObjectLayer, instanceType, bucketName string,
 	apiRouter http.Handler, credentials auth.Credentials, t *testing.T,
 ) {
 	testAPICopyObjectSSECKeyRotationNullVersionWithCompression(obj, instanceType, bucketName,
@@ -496,7 +496,11 @@ func testAPICopyObjectSSECKeyRotationNullVersionWithCompression(obj ObjectLayer,
 	for key, value := range getHeaders {
 		decryptHeaders.Set(key, value)
 	}
-	after := assertCopyChecksum(t, obj, bucketName, object, hash.ChecksumCRC32, data, compressAtCopy, decryptHeaders)
+	// This SSE-C rewrite stays uncompressed even with compression enabled at copy
+	// time. The plaintext sibling
+	// TestAPICopyObjectMetadataOnlyNullVersionCompressesRewrite keeps the
+	// coverage that a compressed rewrite records matching metadata.
+	after := assertCopyChecksum(t, obj, bucketName, object, hash.ChecksumCRC32, data, false, decryptHeaders)
 	if after.VersionID == "" {
 		t.Fatalf("%s: rotation into a versioned bucket did not create a new version", instanceType)
 	}

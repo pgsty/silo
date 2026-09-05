@@ -86,6 +86,13 @@ To enable compression+encryption use:
 
 Or alternatively through the environment variable `MINIO_COMPRESSION_ALLOW_ENCRYPTION=on`.
 
+SSE-C objects are excluded from compression even with `allow_encryption=on`.
+Replication ships an SSE-C object as raw ciphertext, because the server never holds the
+customer key, and the compression metadata is not carried over the wire. A compressed
+SSE-C object would therefore replicate to a replica that decrypts to a compressed stream.
+`allow_encryption` still applies to SSE-S3 and SSE-KMS, where the server owns the key and
+decompresses before replicating.
+
 ### 4. Excluded Types
 
 - Already compressed objects are not fit for compression since they do not have compressible patterns.
