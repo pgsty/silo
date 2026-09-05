@@ -779,6 +779,15 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 	meta := make(map[string]string)
 	isSSEC := crypto.SSEC.IsEncrypted(objInfo.UserDefined)
 
+	// An SSE-C object is replicated as raw ciphertext, and the replication
+	// headers carry no compression state. Sending a compressed SSE-C object
+	// would land a replica that decrypts to an S2 stream instead of the
+	// object, so fail loudly instead of writing a wrong replica.
+	if isSSEC && objInfo.IsCompressed() {
+		return putOpts, false, fmt.Errorf("replication of a compressed SSE-C object is not supported: %s/%s(%s)",
+			objInfo.Bucket, objInfo.Name, objInfo.VersionID)
+	}
+
 	for k, v := range objInfo.UserDefined {
 		_, isValidSSEHeader := validSSEReplicationHeaders[k]
 		// In case of SSE-C objects copy the allowed internal headers as well
@@ -1299,6 +1308,8 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 
 	putOpts, isMP, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 	if err != nil {
+		rinfo.Err = err
+		rinfo.ReplicationStatus = replication.Failed
 		replLogIf(ctx, fmt.Errorf("failure setting options for replication bucket:%s err:%w", bucket, err))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
@@ -1586,6 +1597,8 @@ applyAction:
 	} else {
 		putOpts, isMP, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 		if err != nil {
+			rinfo.Err = err
+			rinfo.ReplicationStatus = replication.Failed
 			replLogIf(ctx, fmt.Errorf("failed to set replicate options for object %s/%s(%s) (target %s) err:%w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), err))
 			sendEvent(eventArgs{
 				EventName:  event.ObjectReplicationNotTracked,

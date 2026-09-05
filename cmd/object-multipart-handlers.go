@@ -180,11 +180,17 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		ctx, r = applyReplicationTrust(ctx, r, trustedReplication, replicaTrusted)
 	}
 
-	// Check if bucket encryption is enabled
-	sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
-	sseConfig.Apply(r.Header, sse.ApplyOptions{
-		AutoEncrypt: globalAutoEncryption,
-	})
+	// A validated raw SSE-C replica upload carries source ciphertext in every
+	// part; the destination must not add its own encryption or compression.
+	rawSSECReplica := isRawSSECReplica(r.Header, replicaTrusted)
+
+	if !rawSSECReplica {
+		// Check if bucket encryption is enabled
+		sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
+		sseConfig.Apply(r.Header, sse.ApplyOptions{
+			AutoEncrypt: globalAutoEncryption,
+		})
+	}
 
 	// Validate the storage class header if present. Query values retain the
 	// existing compatibility path, including its historical validation behavior.
@@ -213,19 +219,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 			return
 		}
 
-		ssecRepHeaders := []string{
-			"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
-			"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
-			"X-Minio-Replication-Server-Side-Encryption-Iv",
-		}
-		ssecRep := false
-		for _, header := range ssecRepHeaders {
-			if val := r.Header.Get(header); val != "" {
-				ssecRep = true
-				break
-			}
-		}
-		if !ssecRep || !replicaTrusted {
+		if !rawSSECReplica {
 			if err = setEncryptionMetadata(r, bucket, object, encMetadata); err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -289,7 +283,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 	// Ensure that metadata does not contain sensitive information
 	crypto.RemoveSensitiveEntries(metadata)
 
-	if isCompressible(r.Header, object) {
+	if !rawSSECReplica && isCompressible(r.Header, object) {
 		// Storing the compression metadata.
 		metadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
 	}

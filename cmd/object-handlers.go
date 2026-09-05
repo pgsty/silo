@@ -2087,11 +2087,18 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		delete(metadata, xhttp.AmzBucketReplicationStatus)
 	}
 
-	// Check if bucket encryption is enabled
-	sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
-	sseConfig.Apply(r.Header, sse.ApplyOptions{
-		AutoEncrypt: globalAutoEncryption,
-	})
+	// A validated raw SSE-C replica carries the source ciphertext and the
+	// source seal. Its bytes must be stored verbatim: default encryption would
+	// overwrite the SSE-C IV and compression would invalidate the ciphertext.
+	rawSSECReplica := isRawSSECReplica(r.Header, replicaTrusted)
+
+	if !rawSSECReplica {
+		// Check if bucket encryption is enabled
+		sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
+		sseConfig.Apply(r.Header, sse.ApplyOptions{
+			AutoEncrypt: globalAutoEncryption,
+		})
+	}
 
 	var reader io.Reader
 	reader = rd
@@ -2105,7 +2112,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 
 	actualSize := size
 	var idxCb func() []byte
-	if isCompressible(r.Header, object) && size > minCompressibleSize {
+	if !rawSSECReplica && isCompressible(r.Header, object) && size > minCompressibleSize {
 		// Storing the compression metadata.
 		metadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
 		metadata[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(size, 10)
@@ -2200,7 +2207,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		metadata[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
 	}
 	var objectEncryptionKey crypto.ObjectKey
-	if crypto.Requested(r.Header) {
+	// rawSSECReplica also gates the branch itself, not just the default-SSE
+	// header that would normally reach it: a trusted peer that sends an
+	// explicit public SSE header alongside a source seal must not re-encrypt.
+	if !rawSSECReplica && crypto.Requested(r.Header) {
 		if crypto.SSECopy.IsRequested(r.Header) {
 			writeErrorResponse(ctx, w, toAPIError(ctx, errInvalidEncryptionParameters), r.URL)
 			return

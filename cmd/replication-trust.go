@@ -111,6 +111,31 @@ var replicationRequestHeaders = []string{
 	xhttp.AmzBucketReplicationStatus,
 }
 
+// ssecReplicaSealHeaders are the internal headers a source site attaches to a
+// raw SSE-C replica write. Their presence means the body is source ciphertext
+// that the destination can neither decrypt nor re-frame.
+var ssecReplicaSealHeaders = []string{
+	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
+	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
+	"X-Minio-Replication-Server-Side-Encryption-Iv",
+}
+
+// isRawSSECReplica reports whether a request is a replica write carrying a
+// source SSE-C seal. replicaTrusted must be the value evaluateReplicationTrust
+// returned for this request: the headers alone are client controlled and are
+// never a trust signal on their own.
+func isRawSSECReplica(h http.Header, replicaTrusted bool) bool {
+	if !replicaTrusted {
+		return false
+	}
+	for _, name := range ssecReplicaSealHeaders {
+		if h.Get(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func stripReplicationRequestHeaders(h http.Header) {
 	for _, name := range replicationRequestHeaders {
 		h.Del(name)
