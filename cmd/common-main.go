@@ -257,10 +257,30 @@ func buildOpenIDConsoleConfig() consoleoauth2.OpenIDPCfg {
 	return m
 }
 
-func initConsoleServer() (*consoleapi.Server, error) {
-	// unset all console_ environment variables.
+// resetConsoleEnvironment preserves the embedded Console's supported resource
+// settings verbatim. Server derives all other Console settings itself.
+func resetConsoleEnvironment() {
 	for _, cenv := range env.List(consolePrefix) {
+		switch cenv {
+		case consoleapi.ConsoleWSMaxConnections,
+			consoleapi.ConsoleWSMaxConnectionsPerClient,
+			consoleapi.ConsoleWSMaxAnonymousConnections,
+			consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient:
+			continue
+		}
 		os.Unsetenv(cenv)
+	}
+}
+
+func initConsoleServer() (*consoleapi.Server, error) {
+	resetConsoleEnvironment()
+	// Validate explicitly: ConfigureAPI logs errors, but embedded Console logs
+	// are normally silenced. Return configuration failures to Server startup.
+	if err := consoleapi.ConfigureEmbeddedSourceIPTrust(); err != nil {
+		return nil, err
+	}
+	if err := consoleapi.ConfigureWebSocketLimits(); err != nil {
+		return nil, err
 	}
 
 	// enable all console environment variables

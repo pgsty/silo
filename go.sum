@@ -547,8 +547,8 @@ github.com/pborman/getopt v0.0.0-20170112200414-7148bc3a4c30/go.mod h1:85jBQOZwp
 github.com/pelletier/go-toml v1.2.0/go.mod h1:5z9KED0ma1S8pY6P1sdut58dfprrGBbd/94hg7ilaic=
 github.com/pgsty/mc v0.0.0-20260903063637-a2ef95c035d9 h1:kJkqK0hJrmvdTOPiI98HoPmET0SHYI9+ytaTRzQdGAs=
 github.com/pgsty/mc v0.0.0-20260903063637-a2ef95c035d9/go.mod h1:+j12ENu7ggWIaBY4nakGABVmkjfJgogzijHIbaJFSOk=
-github.com/pgsty/silo-console v0.0.0-20260907122901-0ab4a0ee4f8e h1:X1RTZVC2KhL4aZOHS6z5zygVt6Gp6F5OQwWKYzUjvDc=
-github.com/pgsty/silo-console v0.0.0-20260907122901-0ab4a0ee4f8e/go.mod h1:lInRIXU5jctVcagYHkvDuFRUYm/eCOJ1VNt1tciTHso=
+github.com/pgsty/silo-console v0.0.0-20260908011343-b39a84ada5e8 h1:B270uCa2FLThDqTIJ+TzKksOWAfjmik5mcugwZFVn4s=
+github.com/pgsty/silo-console v0.0.0-20260908011343-b39a84ada5e8/go.mod h1:lInRIXU5jctVcagYHkvDuFRUYm/eCOJ1VNt1tciTHso=
 github.com/pgsty/silo-pkg/v3 v3.13.2 h1:Clw11c/J54Tx6pijNCWtXiC7e0fwP/f5Tgeb6fsXg2w=
 github.com/pgsty/silo-pkg/v3 v3.13.2/go.mod h1:0GmaDA0ArQ8bkAI/obiSNTBQzdgBu6W0e0olDCbyXXo=
 github.com/philhofer/fwd v1.2.0 h1:e6DnBTl7vGY+Gz322/ASL4Gyp1FspeMvx1RNDoToZuM=
