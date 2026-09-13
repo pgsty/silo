@@ -1,5 +1,11 @@
 # Remaining release correctness work, 2026-09-11
 
+> This is a dated investigation, with the source and runtime boundaries recorded
+> below. It does not establish the current dependency pins or a later release.
+> See [the current changelog](../../CHANGELOG.md) and
+> [component matrix](https://silo.pgsty.com/compatibility/versions/).
+
+
 This records the three work items agreed after the branch/PR consolidation:
 OIDC #154, Linux restart/readback #116, and the related multi-pool defects
 #133/#144. The maintained target is SILO with the PGSTY Console, mcli and

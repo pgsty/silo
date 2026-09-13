@@ -35,6 +35,13 @@
 > [!NOTE]
 > 2026-08-06，本仓库由 `pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 更名为 `main`。以原 MinIO 形态维持的归档构件仍位于归档的 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支，以及截止 [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) 的历次发布中。
 
+## 当前发行版与主分支
+
+最新已发布的 Server 仍为 [20260903](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-09-03T13-18-01Z)。
+截至 2026-09-13，主分支已合入更新的安全、存储、Console 与共享包改动，但尚未发布新 Server。
+准确的已发布/源码边界见 [CHANGELOG.md](CHANGELOG.md) 与[组件版本矩阵](https://silo.pgsty.com/zh/compatibility/versions/)，
+其中包括 SN-2026-011 修复状态与密码权限迁移要求。
+
 ## 概述
 
 上游停止社区发行后，Silo 为开源 MinIO 服务端维护一条持续可用的版本线：构建、软件包、多架构镜像、安全修复与完整 Web 控制台。Pigsty 在生产环境中用它承载 PostgreSQL 备份存储。

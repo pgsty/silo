@@ -1,5 +1,11 @@
 # Password and user-management permissions
 
+> **Release boundary, 2026-09-13:** this guide describes Server main, paired with
+> silo-pkg v3.14.0 and Console source `417559bb2c97` or its accepted successor.
+> The latest published Server 20260903 and Console v2.4.0 do not contain this
+> split. The pkg v3.14.0 and mcli 20260913 releases alone do not change an old
+> Server's authorization. See [the component matrix](https://silo.pgsty.com/compatibility/versions/).
+
 **Breaking change: the password-permission split changes the meaning of
 existing IAM policies.** The same stored policy can authorize a request after
 this update that it denied before, or deny a request it previously authorized.

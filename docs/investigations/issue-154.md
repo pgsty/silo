@@ -1,5 +1,11 @@
 # SILO #154：OIDC discovery 连接重置调查
 
+> This is a dated investigation, with the source and runtime boundaries recorded
+> below. It does not establish the current dependency pins or a later release.
+> See [the current changelog](../../CHANGELOG.md) and
+> [component matrix](https://silo.pgsty.com/compatibility/versions/).
+
+
 前两轮调查时间：2026-09-09；公开 issue 最后核对于 07:53 UTC。第二轮补充同源码、同依赖、不同 Go 工具链的 Linux 完整 Server 对照和候选补丁认证链路验证。
 
 **后续更新：用户已授权扩展至整个 SILO 技术栈并修复。现已确认 Server 其他 TLS 路径也存在同类覆盖问题，并在产品工作区完成统一使用 Go 默认曲线的修复。当前实现、验证和交付状态见 [全栈调查](go127-stack.md)。下文保留前两轮的诊断与当时的 OIDC 局部候选；“未修改产品”和“不要扩大范围”等表述仅适用于当时的调查阶段，局部候选已被后续全路径修复取代。**
