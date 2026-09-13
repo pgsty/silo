@@ -25,7 +25,7 @@ imagePullSecrets: []
 ##
 mcImage:
   repository: pgsty/mc
-  tag: RELEASE.2026-09-03T07-13-05Z
+  tag: RELEASE.2026-09-13T00-00-00Z
   pullPolicy: IfNotPresent
 
 ## Silo mode, i.e. standalone or distributed.

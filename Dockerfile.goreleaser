@@ -1,4 +1,15 @@
-FROM golang:1.27.1-alpine AS build
+FROM golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS curl-build
+ARG TARGETARCH
+COPY dockerscripts/build-static-curl.sh /build/build-static-curl
+RUN /bin/sh /build/build-static-curl
+
+# Exercise the exact shipped curl without a dynamic loader or shared libraries.
+FROM scratch AS curl-runtime
+COPY --from=curl-build /go/bin/curl /curl
+COPY --from=curl-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/curl"]
+
+FROM golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build
 
 ARG TARGETARCH
 
@@ -6,9 +17,9 @@ ENV GOPATH=/go
 ENV CGO_ENABLED=0
 
 ARG MC_REPO=pgsty/mc
-ARG MC_VERSION=RELEASE.2026-09-03T07-13-05Z
-ARG MC_AMD64_SHA256=cd7fcd449bb6b52e2eb727431ba6975b1e5d90df011a75869020ea9ac9e2b2a8
-ARG MC_ARM64_SHA256=7962afc37c3e60e5758b19e819cb62d2f340ee655fad7b067e2ac9bc5716c2e8
+ARG MC_VERSION=RELEASE.2026-09-13T00-00-00Z
+ARG MC_AMD64_SHA256=9d2a92de9c7b887d9b944fe9ddce68d23f1b6df3415092e737594e56593f5e2b
+ARG MC_ARM64_SHA256=3d82e9ea6c601c4cb44fe5dd5f2ad1b7d7d64369378110f9ada9c524688a452a
 
 RUN apk add -U --no-cache \
     ca-certificates \
@@ -56,18 +67,14 @@ RUN apk add -U --no-cache \
     chmod +x /go/bin/mcli && \
     ln -sf mcli /go/bin/mc
 
-COPY dockerscripts/download-static-curl.sh /build/download-static-curl
-RUN chmod +x /build/download-static-curl && \
-    /build/download-static-curl
-
-FROM registry.access.redhat.com/ubi9/ubi:latest AS certs
+FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:206b65b8ee0f04b992818c9a51b29081b14974630d4850bc358097d0c44ea156 AS certs
 RUN dnf -y install ca-certificates && \
     update-ca-trust && \
     cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tmp/ca-certificates.crt && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:f332c99eb8f798a8486821c91937f10ad64ee83d7e739303be2df051040918f6
 
 LABEL org.opencontainers.image.title="Silo" \
       org.opencontainers.image.description="S3-Interface Libre Object Storage" \
@@ -88,7 +95,8 @@ ENV MINIO_ACCESS_KEY_FILE=access_key \
 COPY --from=certs /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY silo /usr/bin/silo
 COPY --from=build /go/bin/mcli /usr/bin/mcli
-COPY --from=build /go/bin/curl* /usr/bin/
+COPY --from=curl-build /go/bin/curl /usr/bin/curl
+COPY --from=curl-build /go/share/curl /licenses/curl
 COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
 COPY LICENSE /licenses/LICENSE
 COPY NOTICE /licenses/NOTICE

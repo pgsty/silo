@@ -36,7 +36,7 @@ for file in \
 	buildscripts/verify-helm-migration.sh \
 	Dockerfile.goreleaser \
 	Dockerfile.distroless \
-	dockerscripts/download-static-curl.sh \
+	dockerscripts/build-static-curl.sh \
 	dockerscripts/docker-entrypoint.sh \
 	helm/silo/Chart.yaml \
 	helm/silo/values.yaml \
@@ -101,7 +101,7 @@ require_text Dockerfile.goreleaser "Published checksum drift"
 require_text Dockerfile.distroless 'COPY --chmod=0755 silo /usr/bin/silo'
 require_text Dockerfile.distroless 'ENTRYPOINT ["/usr/bin/silo"]'
 require_text Dockerfile.distroless '"/usr/bin/silo", "healthcheck", "ready"'
-require_text dockerscripts/download-static-curl.sh "sha256sum -c"
+require_text dockerscripts/build-static-curl.sh "sha256sum -c"
 require_text helm/silo/Chart.yaml "name: silo"
 require_text helm/silo/values.yaml "repository: pgsty/silo"
 require_text helm/silo/templates/deployment.yaml "/usr/bin/docker-entrypoint.sh silo server"

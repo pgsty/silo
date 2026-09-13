@@ -140,7 +140,7 @@ jobs:
             mkdir -p "${context}/dockerscripts"
             tar -xzf "${archive}" -C "${context}" silo
             cp Dockerfile.goreleaser Dockerfile.distroless LICENSE NOTICE CREDITS "${context}/"
-            cp dockerscripts/docker-entrypoint.sh dockerscripts/download-static-curl.sh \
+            cp dockerscripts/docker-entrypoint.sh dockerscripts/build-static-curl.sh \
               "${context}/dockerscripts/"
           done
 
