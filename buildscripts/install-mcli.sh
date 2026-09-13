@@ -40,7 +40,7 @@ if [ -n "${MCLI_BIN:-}" ]; then
 	exit 0
 fi
 
-release=${MCLI_RELEASE:-RELEASE.2026-09-03T07-13-05Z}
+release=${MCLI_RELEASE:-RELEASE.2026-09-13T00-00-00Z}
 version_hyphen=${release#RELEASE.}
 package_version=$(printf '%s\n' "${version_hyphen}" | sed -E 's/^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/\1\2\3\4\5\6.0.0/')
 if [ "${package_version}" = "${version_hyphen}" ]; then

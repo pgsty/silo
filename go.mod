@@ -4,9 +4,9 @@ go 1.27.1
 
 // Console and MC retain their historical module paths for best-effort upstream
 // compatibility. Pin the maintained PGSTY implementations used by SILO.
-replace github.com/minio/console => github.com/pgsty/silo-console v0.0.0-20260911085047-638eefd7aece
+replace github.com/minio/console => github.com/pgsty/silo-console v0.0.0-20260913015128-417559bb2c97
 
-replace github.com/minio/mc => github.com/pgsty/mc v0.0.0-20260910093317-e6a60edf0952
+replace github.com/minio/mc => github.com/pgsty/mc v0.0.0-20260913012246-4f609a4da3bb
 
 // v22.7.0 does not compile on NetBSD because its unix implementation uses
 // CLOCK_MONOTONIC, which is unavailable there. Keep the last portable release
