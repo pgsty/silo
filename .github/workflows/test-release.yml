@@ -10,7 +10,7 @@ on:
       - "Dockerfile.distroless"
       - "cmd/healthcheck-main.go"
       - "cmd/main.go"
-      - "dockerscripts/download-static-curl.sh"
+      - "dockerscripts/build-static-curl.sh"
       - "dockerscripts/docker-entrypoint.sh"
       - "dockerscripts/docker-entrypoint_test.sh"
       - "silo.service"
@@ -41,6 +41,28 @@ permissions:
   contents: read
 
 jobs:
+  curl:
+    name: Static curl (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and exercise curl in an empty runtime
+        run: |
+          docker build --build-arg TARGETARCH=${{ matrix.arch }} \
+            --target curl-runtime -f Dockerfile.goreleaser -t silo-curl-test .
+          docker run --rm silo-curl-test --version | tee curl-version.txt
+          grep -F 'curl 8.22.0 ' curl-version.txt
+          grep -F 'HTTP2' curl-version.txt
+          docker run --rm silo-curl-test --fail --silent --show-error \
+            --connect-timeout 15 --max-time 60 https://curl.se/robots.txt
+
   validate:
     runs-on: ubuntu-latest
     steps:
@@ -490,7 +512,7 @@ jobs:
           bash -n buildscripts/package/lifecycle_test.sh
           buildscripts/package/lifecycle_test.sh
           bash -n dockerscripts/docker-entrypoint_test.sh
-          bash -n dockerscripts/download-static-curl.sh
+          bash -n dockerscripts/build-static-curl.sh
           dockerscripts/docker-entrypoint_test.sh
           go run ./buildscripts/rebrand-guard
           buildscripts/verify-rebrand.sh
