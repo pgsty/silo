@@ -12,6 +12,14 @@ The first Silo community release was cut from upstream history that already cont
 | :-- | :-- | :-- | :-- | :-- |
 | [CVE-2025-62506](https://github.com/advisories/GHSA-jjjj-jwhf-8rgr) | [minio/minio#21642](https://github.com/minio/minio/pull/21642), merged as [`c1a49490`](https://github.com/minio/minio/commit/c1a49490c78e9c3ebcad86ba0662319138ace190) | The same commit object is present as [`pgsty/silo@c1a49490`](https://github.com/pgsty/silo/commit/c1a49490c78e9c3ebcad86ba0662319138ace190) | The inherited [service-account](https://github.com/pgsty/silo/blob/c1a49490c78e9c3ebcad86ba0662319138ace190/cmd/admin-handlers-users_test.go#L211-L212) and [STS](https://github.com/pgsty/silo/blob/c1a49490c78e9c3ebcad86ba0662319138ace190/cmd/sts-handlers_test.go#L45-L46) regression groups run for root and non-root parents through `go test ./cmd` | Resets `DenyOnly` while evaluating a restricted session policy so service or STS accounts cannot mint an unrestricted child service account. Upstream first fixed this in [`RELEASE.2025-10-15T17-29-55Z`](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z); every Silo community release, beginning with [`RELEASE.2025-12-03T12-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2025-12-03T12-00-00Z), contains it. Operators migrating from an older upstream build should upgrade and audit service accounts created by restricted service or STS identities. |
 
+## Current release boundary (2026-09-13)
+
+The latest published Server is `RELEASE.2026-09-03T13-18-01Z`.
+SN-2026-011 is fixed on main but remains present in that release and all earlier
+public Server releases. A newer mcli, pkg or standalone Console does not patch
+an installed Server. See [CHANGELOG.md](../../CHANGELOG.md) and the
+[component matrix](https://silo.pgsty.com/compatibility/versions/) for source pins.
+
 ## Advisories since `RELEASE.2026-03-21T00-00-00Z`
 
 | ID | Fixed by | Affected area | Remote exploitability | Summary | Upgrade / workaround notes |

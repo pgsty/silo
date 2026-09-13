@@ -1,5 +1,11 @@
 # SILO stack: Go 1.27 compatibility audit
 
+> This is a dated investigation, with the source and runtime boundaries recorded
+> below. It does not establish the current dependency pins or a later release.
+> See [the current changelog](../../CHANGELOG.md) and
+> [component matrix](https://silo.pgsty.com/compatibility/versions/).
+
+
 2026-09-09. Scope: the maintained Server, silo-pkg, mcli, and Console. This extends
 the [OIDC #154 investigation](issue-154.md) to other paths using the same TLS
 configuration and to adjacent standard-library changes. It records local

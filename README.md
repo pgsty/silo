@@ -35,6 +35,14 @@
 > [!NOTE]
 > Renamed from `pgsty/minio` to `pgsty/silo`, default branch `master` → `main`, on 2026-08-06. Artifacts under the original MinIO identity stay published on the archived [`minio`](https://github.com/pgsty/silo/tree/minio) branch and in releases up to [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z).
 
+## Current release and main branch
+
+The latest published Server is [20260903](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-09-03T13-18-01Z).
+As of 2026-09-13, the main branch has newer security, storage, Console and
+shared-package changes that have not shipped in a Server release. See
+[CHANGELOG.md](CHANGELOG.md) and the [component version matrix](https://silo.pgsty.com/compatibility/versions/)
+for the exact release/source boundary, including SN-2026-011 and password-policy migration.
+
 ## Overview
 
 PGSTY SILO keeps one maintained release line of the open-source MinIO server alive after upstream ended community distribution: builds, packages, multi-arch images, security fixes, and the full web console. Pigsty runs it in production as its PostgreSQL backup repository.
