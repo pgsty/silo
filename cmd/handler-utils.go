@@ -246,16 +246,6 @@ func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (
 
 // extractMetadata extracts metadata from map values.
 func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
-	return extractMetadataFromMimeWithReplication(ctx, v, m, false)
-}
-
-// extractReplicationMetadataFromMime restores replication-only metadata after the
-// caller has validated that the request is a trusted replication write.
-func extractReplicationMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
-	return extractMetadataFromMimeWithReplication(ctx, v, m, true)
-}
-
-func extractMetadataFromMimeWithReplication(ctx context.Context, v textproto.MIMEHeader, m map[string]string, allowReplication bool) error {
 	if v == nil {
 		bugLogIf(ctx, errInvalidArgument)
 		return errInvalidArgument
@@ -267,18 +257,14 @@ func extractMetadataFromMimeWithReplication(ctx context.Context, v textproto.MIM
 		nv[http.CanonicalHeaderKey(k)] = kv
 	}
 
-	// Save all supported headers.
+	// Save ordinary object metadata. Replication-only headers are restored only
+	// after the request has been validated as a trusted replication write.
 	for _, supportedHeader := range supportedHeaders {
-		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
-		if ok {
-			if v, ok := replicationToInternalHeaders[supportedHeader]; ok {
-				if !allowReplication {
-					continue
-				}
-				m[v] = strings.Join(value, ",")
-			} else {
-				m[supportedHeader] = strings.Join(value, ",")
-			}
+		if _, ok := replicationToInternalHeaders[supportedHeader]; ok {
+			continue
+		}
+		if value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]; ok {
+			m[supportedHeader] = strings.Join(value, ",")
 		}
 	}
 
@@ -287,11 +273,35 @@ func extractMetadataFromMimeWithReplication(ctx context.Context, v textproto.MIM
 			if !stringsHasPrefixFold(key, prefix) {
 				continue
 			}
-			value, ok := nv[http.CanonicalHeaderKey(key)]
-			if ok {
+			if value, ok := nv[http.CanonicalHeaderKey(key)]; ok {
 				m[key] = strings.Join(value, ",")
 				break
 			}
+		}
+	}
+	return nil
+}
+
+// extractReplicationMetadataFromMime restores replication-only metadata after the
+// caller has validated that the request is a trusted replication write.
+func extractReplicationMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
+	if v == nil {
+		bugLogIf(ctx, errInvalidArgument)
+		return errInvalidArgument
+	}
+
+	nv := make(textproto.MIMEHeader, len(v))
+	for k, kv := range v {
+		// Canonicalize all headers, to remove any duplicates.
+		nv[http.CanonicalHeaderKey(k)] = kv
+	}
+
+	// Ordinary object metadata has already been extracted and normalized before
+	// replication trust is evaluated. Restoring it here would reintroduce raw
+	// transport headers such as Content-Encoding: aws-chunked.
+	for header, internalHeader := range replicationToInternalHeaders {
+		if value, ok := nv[http.CanonicalHeaderKey(header)]; ok {
+			m[internalHeader] = strings.Join(value, ",")
 		}
 	}
 	return nil

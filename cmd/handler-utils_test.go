@@ -254,6 +254,9 @@ func TestExtractMetadataFromRequestKeepsQueryCompatibility(t *testing.T) {
 
 func TestExtractReplicationMetadataHeaders(t *testing.T) {
 	header := http.Header{
+		"Content-Type":      []string{"application/wasm"},
+		"Content-Encoding":  []string{"aws-chunked"},
+		"X-Amz-Meta-Source": []string{"client"},
 		"X-Minio-Replication-Server-Side-Encryption-Sealed-Key":     []string{"sealed-key"},
 		"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm": []string{"DAREv2-HMAC-SHA256"},
 		"X-Minio-Replication-Server-Side-Encryption-Iv":             []string{"iv"},
@@ -262,12 +265,17 @@ func TestExtractReplicationMetadataHeaders(t *testing.T) {
 		ReplicationSsecChecksumHeader:                               []string{"checksum"},
 	}
 
-	metadata := make(map[string]string)
+	metadata := map[string]string{
+		"content-type":      "application/wasm",
+		"x-amz-meta-source": "client",
+	}
 	if err := extractReplicationMetadataFromMime(t.Context(), textproto.MIMEHeader(header), metadata); err != nil {
 		t.Fatalf("failed to extract replication metadata: %v", err)
 	}
 
 	expected := map[string]string{
+		"content-type":      "application/wasm",
+		"x-amz-meta-source": "client",
 		"X-Minio-Internal-Server-Side-Encryption-Sealed-Key":     "sealed-key",
 		"X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm": "DAREv2-HMAC-SHA256",
 		"X-Minio-Internal-Server-Side-Encryption-Iv":             "iv",
@@ -278,6 +286,9 @@ func TestExtractReplicationMetadataHeaders(t *testing.T) {
 
 	if !reflect.DeepEqual(metadata, expected) {
 		t.Fatalf("unexpected replication metadata: expected %#v, got %#v", expected, metadata)
+	}
+	if _, ok := metadata["content-encoding"]; ok {
+		t.Fatalf("replication metadata restored transport content-encoding: %#v", metadata)
 	}
 }
 
