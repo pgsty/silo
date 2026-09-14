@@ -43,6 +43,7 @@ func TestReplicateDeleteMarkerTargetSemantics(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
 		purge      bool
+		legacy     bool
 		deleteCode int
 		wantDelete bool
 		wantFailed bool
@@ -52,6 +53,11 @@ func TestReplicateDeleteMarkerTargetSemantics(t *testing.T) {
 		{name: "purge forbidden", purge: true, deleteCode: 403, wantDelete: true, wantFailed: true},
 		{name: "purge method rejected", purge: true, deleteCode: 405, wantDelete: true, wantFailed: true},
 		{name: "purge unavailable", purge: true, deleteCode: 503, wantDelete: true, wantFailed: true},
+		// A purge that rides the delete-marker path (version-tracked purge
+		// state on the marker) must neither be short-circuited by the
+		// marker's creation status nor record its outcome in that status.
+		{name: "marker-path purge removes an existing marker", legacy: true, deleteCode: 204, wantDelete: true},
+		{name: "marker-path purge forbidden", legacy: true, deleteCode: 403, wantDelete: true, wantFailed: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var deletes atomic.Int32
@@ -80,7 +86,13 @@ func TestReplicateDeleteMarkerTargetSemantics(t *testing.T) {
 			deletion := DeletedObjectReplicationInfo{Bucket: "source", DeletedObject: DeletedObject{
 				ObjectName: "marker", DeleteMarker: true, DeleteMarkerVersionID: mustGetUUID(),
 			}}
-			if tt.purge {
+			switch {
+			case tt.legacy:
+				// The marker itself was already replicated (creation status
+				// COMPLETED); only its purge is still pending.
+				deletion.ReplicationState.Targets = map[string]replication.StatusType{"arn1": replication.Completed}
+				deletion.ReplicationState.PurgeTargets = map[string]VersionPurgeStatusType{"arn1": replication.VersionPurgePending}
+			case tt.purge:
 				deletion.VersionID = deletion.DeleteMarkerVersionID
 				deletion.DeleteMarkerVersionID = ""
 				deletion.ReplicationState.PurgeTargets = map[string]VersionPurgeStatusType{"arn1": replication.VersionPurgePending}
@@ -89,13 +101,16 @@ func TestReplicateDeleteMarkerTargetSemantics(t *testing.T) {
 			if (deletes.Load() != 0) != tt.wantDelete {
 				t.Fatalf("remote DELETE count = %d, want delete %v", deletes.Load(), tt.wantDelete)
 			}
-			if tt.purge {
+			if tt.purge || tt.legacy {
 				want := replication.VersionPurgeComplete
 				if tt.wantFailed {
 					want = replication.VersionPurgeFailed
 				}
 				if result.VersionPurgeStatus != want || (result.Err != nil) != tt.wantFailed {
 					t.Errorf("purge result = %+v, want %s", result, want)
+				}
+				if tt.legacy && result.ReplicationStatus != replication.Completed {
+					t.Errorf("marker-path purge clobbered the creation status: %+v", result)
 				}
 			} else if result.ReplicationStatus != replication.Completed {
 				t.Errorf("existing marker result = %+v, want Completed", result)
@@ -208,25 +223,30 @@ func testReplicateDeleteMarkerPurge(obj ObjectLayer, instanceType, bucket string
 		t.Errorf("purge scheduled as marker creation: version=%q marker=%q", deletion.VersionID, deletion.DeleteMarkerVersionID)
 	}
 	if legacy {
-		// Reproduce the old producer's state and let the existing scanner/heal
-		// path recover it. Upgrades must also finish purges already left pending.
+		// Reproduce the legacy producer's shape: the purge rides the
+		// delete-marker path (VersionID empty, marker version in
+		// DeleteMarkerVersionID) with pending purge state on the marker.
+		// The replication path must classify it from the purge state and
+		// finish the source cleanup in this attempt, instead of leaving the
+		// source PENDING for a later heal.
 		deletion.VersionID, deletion.DeleteMarkerVersionID = "", version
-		replicateDelete(ctx, deletion, obj)
-		oi, _ := obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: version, Versioned: true})
-		if oi.VersionPurgeStatus != replication.VersionPurgePending {
-			t.Fatalf("legacy source purge = %s, want PENDING", oi.VersionPurgeStatus)
+		result := replicateDelete(ctx, deletion, obj)
+		if result.VersionPurgeStatus() != replication.VersionPurgeComplete {
+			t.Errorf("legacy marker purge result = %s, want COMPLETE", result.VersionPurgeStatus())
 		}
-		targets, err := globalBucketTargetSys.ListBucketTargets(ctx, bucket)
-		if err != nil {
-			t.Fatal(err)
+		for _, b := range []string{bucket, remoteBucket} {
+			oi, err := obj.GetObjectInfo(ctx, b, name, ObjectOptions{VersionID: version, Versioned: true})
+			if !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
+				t.Errorf("legacy purge left the marker in %s: %+v, err=%v", b, oi, err)
+			}
 		}
-		queueReplicationHeal(ctx, bucket, oi, replicationConfig{Config: &cfg, remotes: targets}, 0)
+		// Converged: nothing further may be scheduled for healing.
 		select {
 		case op := <-worker:
-			deletion = op.(DeletedObjectReplicationInfo)
-		case <-time.After(time.Second):
-			t.Fatal("legacy pending purge was not scheduled for healing")
+			t.Fatalf("unexpected heal scheduled after legacy purge converged: %v", op)
+		case <-time.After(500 * time.Millisecond):
 		}
+		return
 	}
 	result := replicateDelete(context.Background(), deletion, obj)
 	if result.VersionPurgeStatus() != replication.VersionPurgeComplete {

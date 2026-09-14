@@ -615,13 +615,20 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 	rinfo.OpType = dobj.OpType
 	rinfo.endpoint = tgt.EndpointURL().Host
 	rinfo.secure = tgt.EndpointURL().Scheme == "https"
+	// a delete marker version purge is tracked via VersionPurgeStatus and
+	// must not be short-circuited by, nor overwrite, the delete marker's
+	// creation replication status below.
+	isDMPurge := dobj.VersionID == "" && dobj.DeleteMarkerVersionID != "" && !rinfo.VersionPurgeStatus.Empty()
+	if isDMPurge {
+		rinfo.ReplicationStatus = rinfo.PrevReplicationStatus
+	}
 	defer func() {
 		if rinfo.ReplicationStatus == replication.Completed && tgt.ResetID != "" && dobj.OpType == replication.ExistingObjectReplicationType {
 			rinfo.ResyncTimestamp = fmt.Sprintf("%s;%s", UTCNow().Format(http.TimeFormat), tgt.ResetID)
 		}
 	}()
 
-	if dobj.VersionID == "" && rinfo.PrevReplicationStatus == replication.Completed && dobj.OpType != replication.ExistingObjectReplicationType {
+	if !isDMPurge && dobj.VersionID == "" && rinfo.PrevReplicationStatus == replication.Completed && dobj.OpType != replication.ExistingObjectReplicationType {
 		rinfo.ReplicationStatus = rinfo.PrevReplicationStatus
 		return rinfo
 	}
@@ -642,10 +649,10 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 			Host:      globalLocalNodeName,
 			EventName: event.ObjectReplicationNotTracked,
 		})
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Failed
-		} else {
+		if dobj.VersionID != "" || isDMPurge {
 			rinfo.VersionPurgeStatus = replication.VersionPurgeFailed
+		} else {
+			rinfo.ReplicationStatus = replication.Failed
 		}
 		return rinfo
 	}
@@ -699,20 +706,20 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 	})
 	if rmErr != nil {
 		rinfo.Err = rmErr
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Failed
-		} else {
+		if dobj.VersionID != "" || isDMPurge {
 			rinfo.VersionPurgeStatus = replication.VersionPurgeFailed
+		} else {
+			rinfo.ReplicationStatus = replication.Failed
 		}
 		replLogIf(ctx, fmt.Errorf("unable to replicate delete marker to %s: %s/%s(%s): %w", tgt.EndpointURL(), tgt.Bucket, dobj.ObjectName, versionID, rmErr))
 		if rmErr != nil && minio.IsNetworkOrHostDown(rmErr, true) && !globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
 			globalBucketTargetSys.markOffline(tgt.EndpointURL())
 		}
 	} else {
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Completed
-		} else {
+		if dobj.VersionID != "" || isDMPurge {
 			rinfo.VersionPurgeStatus = replication.VersionPurgeComplete
+		} else {
+			rinfo.ReplicationStatus = replication.Completed
 		}
 	}
 	return rinfo
@@ -4072,7 +4079,13 @@ func (p *ReplicationPool) queueMRFHeal() error {
 				VersionID: vID,
 			})
 			cancel()
-			if err != nil {
+			// delete marker versions are always returned with a
+			// MethodNotAllowed error, along with valid ObjectInfo, they
+			// still need healing via the delete replication path.
+			if err != nil && !isErrMethodNotAllowed(err) {
+				continue
+			}
+			if oi.Name == "" {
 				continue
 			}
 
