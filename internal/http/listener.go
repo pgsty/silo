@@ -70,7 +70,12 @@ func (listener *httpListener) Accept() (conn net.Conn, err error) {
 		if result.err != nil {
 			return nil, result.err
 		}
-		return deadlineconn.New(result.conn).WithReadDeadline(listener.opts.IdleTimeout).WithWriteDeadline(listener.opts.IdleTimeout), result.err
+		// The read side must stay on native deadlines: an activity-based
+		// read deadline would extend the absolute ReadHeaderTimeout set by
+		// net/http on every partial read, letting slow-header clients keep
+		// connections open indefinitely (slowloris). Request bodies are
+		// bounded per-read by idleTimeoutBody in the server instead.
+		return deadlineconn.New(result.conn).WithWriteDeadline(listener.opts.IdleTimeout), result.err
 	case <-listener.ctxDoneCh:
 	}
 	return nil, syscall.EINVAL

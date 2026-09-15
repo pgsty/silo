@@ -905,7 +905,11 @@ func serverMain(ctx *cli.Context) {
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).
 			UseIdleTimeout(globalServerCtxt.IdleTimeout).
-			UseReadTimeout(globalServerCtxt.IdleTimeout).
+			// WriteTimeout only resets the activity-based write deadline
+			// that deadlineconn enforces per response write. ReadTimeout is
+			// left at zero: with native read deadlines honored again it would
+			// cap the whole request including large uploads; request bodies
+			// are bounded per-read by xhttp instead.
 			UseWriteTimeout(globalServerCtxt.IdleTimeout).
 			UseReadHeaderTimeout(globalServerCtxt.ReadHeaderTimeout).
 			UseBaseContext(GlobalContext).

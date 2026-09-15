@@ -445,6 +445,7 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 	ctxt.SendBufSize = ctx.Int("send-buf-size")
 	ctxt.RecvBufSize = ctx.Int("recv-buf-size")
 	ctxt.IdleTimeout = ctx.Duration("idle-timeout")
+	ctxt.ReadHeaderTimeout = ctx.Duration("read-header-timeout")
 	ctxt.UserTimeout = ctx.Duration("conn-user-timeout")
 
 	if conf := ctx.String("config"); len(conf) > 0 {

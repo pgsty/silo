@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -113,6 +114,19 @@ func (srv *Server) Init(listenCtx context.Context, listenErrCallback func(listen
 
 		atomic.AddInt32(&srv.requestCount, 1)
 		defer atomic.AddInt32(&srv.requestCount, -1)
+
+		// Bound request bodies by read activity: refresh the connection
+		// read deadline ahead of every body read so a stalled upload is
+		// cut off while a slow but progressing one is never terminated.
+		// This replaces the connection-level read idle timeout that had
+		// to be dropped to keep ReadHeaderTimeout absolute (slowloris).
+		if idle := srv.IdleTimeout; idle > 0 && r.Body != nil && r.Body != http.NoBody {
+			r.Body = &idleTimeoutBody{
+				rc:   http.NewResponseController(w),
+				body: r.Body,
+				idle: idle,
+			}
+		}
 
 		// Handle request using passed handler.
 		handler.ServeHTTP(w, r)
@@ -215,6 +229,28 @@ func (srv *Server) UseCustomLogger(l *log.Logger) *Server {
 func (srv *Server) UseTCPOptions(opts TCPOptions) *Server {
 	srv.TCPOptions = opts
 	return srv
+}
+
+// idleTimeoutBody wraps a request body and refreshes the connection read
+// deadline ahead of every read, giving bodies an activity-based timeout:
+// reads that stall longer than idle fail with a timeout error while reads
+// that keep making progress extend the deadline indefinitely.
+type idleTimeoutBody struct {
+	rc   *http.ResponseController
+	body io.ReadCloser
+	idle time.Duration
+}
+
+func (b *idleTimeoutBody) Read(p []byte) (n int, err error) {
+	// Best effort: on connections where deadline control is unavailable
+	// (e.g. hijacked) the call is a no-op and reads stay unbounded, as
+	// they were before.
+	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle))
+	return b.body.Read(p)
+}
+
+func (b *idleTimeoutBody) Close() error {
+	return b.body.Close()
 }
 
 // NewServer - creates new HTTP server using given arguments.
