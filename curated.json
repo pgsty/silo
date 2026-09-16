@@ -1,6 +1,6 @@
 {
-  "updated": "2026-09-16T03:59:24+00:00",
-  "revision": "approved-preview-2026-09-16",
+  "updated": "2026-09-16T08:13:18+00:00",
+  "revision": "04b4ebae56448e42ffcc721c6f4dcd5669995f20",
   "repositories": [
     "pgsty/silo",
     "pgsty/silo-console",
@@ -174,7 +174,7 @@
       "handle": "jiri-pejchal",
       "group": "reports",
       "featured": true,
-      "what": "Reported the RabbitMQ client vulnerability and requested controls for Console object sharing",
+      "what": "Reported the RabbitMQ client vulnerability and the Console share proxy's exposure of internal metrics",
       "firstContribution": "2026-09-10"
     },
     {
@@ -358,6 +358,13 @@
       "featured": false,
       "what": "Reported inconsistent documentation for two-drive EC:1 support",
       "firstContribution": "2026-09-15"
+    },
+    {
+      "handle": "aschyolkin",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported a data race in CPU metrics collection",
+      "firstContribution": "2026-09-16"
     }
   ]
 }
