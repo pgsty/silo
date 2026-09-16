@@ -1,0 +1,363 @@
+{
+  "updated": "2026-09-16T03:59:24+00:00",
+  "revision": "approved-preview-2026-09-16",
+  "repositories": [
+    "pgsty/silo",
+    "pgsty/silo-console",
+    "pgsty/mc",
+    "pgsty/silo-pkg",
+    "pgsty/silo-go",
+    "pgsty/kes",
+    "pgsty/silo.pgsty.com",
+    "pgsty/minio-docs"
+  ],
+  "bots": [
+    "Copilot",
+    "dependabot[bot]"
+  ],
+  "people": [
+    {
+      "handle": "Vonng",
+      "group": "code",
+      "featured": true,
+      "what": "Maintains SILO, Console, mcli, shared packages, releases, and documentation",
+      "firstContribution": "2026-04-14"
+    },
+    {
+      "handle": "ZouhairCharef",
+      "group": "code",
+      "featured": true,
+      "what": "Patched CVE-2026-34986 in go-jose",
+      "firstContribution": "2026-04-06"
+    },
+    {
+      "handle": "mfredenhagen",
+      "group": "code",
+      "featured": true,
+      "what": "Patched CVE-2026-39883 in OpenTelemetry",
+      "firstContribution": "2026-04-10"
+    },
+    {
+      "handle": "pinginfo",
+      "group": "code",
+      "featured": true,
+      "what": "Repaired bucket notification streaming",
+      "firstContribution": "2026-05-02"
+    },
+    {
+      "handle": "ycjlin",
+      "group": "code",
+      "featured": true,
+      "what": "Fixed missing-bucket ListObjects semantics",
+      "firstContribution": "2026-06-28"
+    },
+    {
+      "handle": "waterkip",
+      "group": "code",
+      "featured": true,
+      "what": "Repointed documentation links to the SILO portal",
+      "firstContribution": "2026-07-16"
+    },
+    {
+      "handle": "Dansyuqri",
+      "group": "code",
+      "featured": true,
+      "what": "Added ChecksumType to multipart completion responses",
+      "firstContribution": "2026-08-09"
+    },
+    {
+      "handle": "mrjavadseydi",
+      "group": "code",
+      "featured": true,
+      "what": "Fixed bucket quota metrics; contributed access-frequency ILM and S3-compatible multipart listing proposals",
+      "firstContribution": "2026-08-15"
+    },
+    {
+      "handle": "h5vx",
+      "group": "code",
+      "featured": true,
+      "what": "Implemented per-bucket CORS configuration and enforcement",
+      "firstContribution": "2026-08-25"
+    },
+    {
+      "handle": "nikitapogromsky",
+      "group": "code",
+      "featured": true,
+      "what": "Fixed duplicate logger targets that broke Metrics V3 collection",
+      "firstContribution": "2026-09-07"
+    },
+    {
+      "handle": "Aeirx",
+      "group": "code",
+      "featured": true,
+      "what": "Preserved Object Lock legal-hold headers in federated CopyObject",
+      "firstContribution": "2026-09-09"
+    },
+    {
+      "handle": "magicxor",
+      "group": "proposed",
+      "featured": true,
+      "what": "Reported and proposed conditional DELETE support for If-Match",
+      "firstContribution": "2026-03-21"
+    },
+    {
+      "handle": "davinkevin",
+      "group": "proposed",
+      "featured": true,
+      "what": "Proposed the distroless container image and dependency automation",
+      "firstContribution": "2026-04-10"
+    },
+    {
+      "handle": "metaneutrons",
+      "group": "proposed",
+      "featured": true,
+      "what": "Reported and proposed explicit-version delete authorization",
+      "firstContribution": "2026-08-15"
+    },
+    {
+      "handle": "mikemikimike",
+      "group": "proposed",
+      "featured": true,
+      "what": "Contributed the replicated SSE-C plaintext part-size fix",
+      "firstContribution": "2026-09-05"
+    },
+    {
+      "handle": "julienlau",
+      "group": "proposed",
+      "featured": true,
+      "what": "Reported MRF queue and delete-marker retry defects; contributed repair proposals, tests, and documentation",
+      "firstContribution": "2026-09-07"
+    },
+    {
+      "handle": "chodorenko",
+      "group": "proposed",
+      "featured": true,
+      "what": "Reported and contributed the fix for aws-chunked leaking into replica metadata",
+      "firstContribution": "2026-09-14"
+    },
+    {
+      "handle": "sulin37392",
+      "group": "proposed",
+      "featured": false,
+      "what": "Proposed dependency updates",
+      "firstContribution": "2026-03-17"
+    },
+    {
+      "handle": "lem21h",
+      "group": "proposed",
+      "featured": false,
+      "what": "Proposed robustness and goroutine improvements",
+      "firstContribution": "2026-06-24"
+    },
+    {
+      "handle": "vampywiz17",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported LDAP TLS and Console login regressions",
+      "firstContribution": "2026-03-23"
+    },
+    {
+      "handle": "cbornet",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported multipart and streaming checksum defects and missing-bucket semantics",
+      "firstContribution": "2026-04-24"
+    },
+    {
+      "handle": "orenyomtov",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported the unsigned-header CopyObject cross-object read (SN-2026-011)",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "jiri-pejchal",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported the RabbitMQ client vulnerability and requested controls for Console object sharing",
+      "firstContribution": "2026-09-10"
+    },
+    {
+      "handle": "AEGEGE",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported the slow-HTTP denial-of-service vulnerability",
+      "firstContribution": "2026-09-14"
+    },
+    {
+      "handle": "mosesdd",
+      "group": "reports",
+      "featured": false,
+      "what": "Requested a maintained Helm chart",
+      "firstContribution": "2026-03-03"
+    },
+    {
+      "handle": "Xavier-777",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported Console lifecycle management and file preview gaps",
+      "firstContribution": "2026-03-04"
+    },
+    {
+      "handle": "jiadzh",
+      "group": "reports",
+      "featured": false,
+      "what": "Requested Windows build guidance",
+      "firstContribution": "2026-03-05"
+    },
+    {
+      "handle": "AntonOfTheWoods",
+      "group": "reports",
+      "featured": false,
+      "what": "Asked for clarity on Helm chart and operator options",
+      "firstContribution": "2026-03-10"
+    },
+    {
+      "handle": "TLINDEN",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported the missing client in release tarballs",
+      "firstContribution": "2026-03-10"
+    },
+    {
+      "handle": "zylpsrs",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported missing Console tiering and site replication",
+      "firstContribution": "2026-03-12"
+    },
+    {
+      "handle": "nsanitate",
+      "group": "reports",
+      "featured": false,
+      "what": "Proposed CNCF Sandbox governance",
+      "firstContribution": "2026-03-13"
+    },
+    {
+      "handle": "makinikm",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported the missing client in the container image",
+      "firstContribution": "2026-03-20"
+    },
+    {
+      "handle": "spaceg00se-r",
+      "group": "reports",
+      "featured": false,
+      "what": "Requested cpuv1 support and reported a workflow token failure",
+      "firstContribution": "2026-03-21"
+    },
+    {
+      "handle": "heroes1412",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported the unusable profiling option",
+      "firstContribution": "2026-03-22"
+    },
+    {
+      "handle": "chalukyaj",
+      "group": "reports",
+      "featured": false,
+      "what": "Proposed making the SILO Operator easier to discover",
+      "firstContribution": "2026-04-19"
+    },
+    {
+      "handle": "jvasile",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported missing user, group, and defaults in Debian packages",
+      "firstContribution": "2026-04-27"
+    },
+    {
+      "handle": "Kesavaambati",
+      "group": "reports",
+      "featured": false,
+      "what": "Asked about community support and image maintenance",
+      "firstContribution": "2026-05-21"
+    },
+    {
+      "handle": "redfoxfox",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported Chinese documentation availability",
+      "firstContribution": "2026-07-06"
+    },
+    {
+      "handle": "kuldeep-link11",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported NATS JWT credentials and target reload issues",
+      "firstContribution": "2026-07-08"
+    },
+    {
+      "handle": "meesudzu",
+      "group": "reports",
+      "featured": false,
+      "what": "Requested the migration guide from upstream MinIO",
+      "firstContribution": "2026-07-21"
+    },
+    {
+      "handle": "pmezhuev",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported missing RPM package signatures",
+      "firstContribution": "2026-07-21"
+    },
+    {
+      "handle": "kh0mka",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported inter-node I/O timeouts and OIDC configuration-fetch failures",
+      "firstContribution": "2026-08-03"
+    },
+    {
+      "handle": "bagutzu",
+      "group": "reports",
+      "featured": false,
+      "what": "Requested KES-compatible external KMS and OpenBao support",
+      "firstContribution": "2026-08-17"
+    },
+    {
+      "handle": "liuhaodongliu990-cmyk",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported indeterminate progress for prefix downloads",
+      "firstContribution": "2026-08-21"
+    },
+    {
+      "handle": "DestroyLee",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported the missing documentation navigation",
+      "firstContribution": "2026-08-26"
+    },
+    {
+      "handle": "sargarass",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported ListMultipartUploads prefix and pagination semantics",
+      "firstContribution": "2026-08-28"
+    },
+    {
+      "handle": "mumu-lab",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported bucket quota metrics reading a deprecated field",
+      "firstContribution": "2026-09-03"
+    },
+    {
+      "handle": "haiming236",
+      "group": "reports",
+      "featured": false,
+      "what": "Proposed a built-in image processing pipeline",
+      "firstContribution": "2026-09-08"
+    },
+    {
+      "handle": "tiredenzo",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported inconsistent documentation for two-drive EC:1 support",
+      "firstContribution": "2026-09-15"
+    }
+  ]
+}
