@@ -22,6 +22,22 @@ import (
 	"testing"
 )
 
+func TestTargetIDSetIsEmpty(t *testing.T) {
+	testCases := []struct {
+		set      TargetIDSet
+		expected bool
+	}{
+		{NewTargetIDSet(), true},
+		{NewTargetIDSet(TargetID{"1", "webhook"}), false},
+	}
+
+	for i, testCase := range testCases {
+		if got := testCase.set.IsEmpty(); got != testCase.expected {
+			t.Fatalf("test %v: expected: %v, got: %v", i+1, testCase.expected, got)
+		}
+	}
+}
+
 func TestTargetIDSetClone(t *testing.T) {
 	testCases := []struct {
 		set           TargetIDSet
