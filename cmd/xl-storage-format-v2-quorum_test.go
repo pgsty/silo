@@ -272,3 +272,171 @@ func BenchmarkResolveSingleNullQuorumPage(b *testing.B) {
 		})
 	}
 }
+
+// mixedParityNullVersion builds a complete null version like quorumNullVersion
+// but with the given parity regime, as produced by writes to a degraded set.
+func mixedParityNullVersion(t testing.TB, generation int64, data, parity int) xlMetaV2ShallowVersion {
+	t.Helper()
+	fi := newFileInfo("fixed/object", data, parity)
+	fi.Erasure.Index = 1
+	fi.DataDir = "11111111-1111-1111-1111-111111111111"
+	fi.ModTime = time.Unix(generation, 0).UTC()
+	fi.Size = 8192
+	fi.Parts = []ObjectPartInfo{{Number: 1, Size: fi.Size, ActualSize: fi.Size}}
+	fi.Metadata = map[string]string{"etag": fmt.Sprintf("%032d", generation)}
+	var xl xlMetaV2
+	if err := xl.AddVersion(fi); err != nil {
+		t.Fatal(err)
+	}
+	return xl.versions[0]
+}
+
+// A rolling restart makes writes use a reduced parity regime while a node is
+// down (8 data + 8 parity on a 16-drive set) and the full regime otherwise
+// (12 data + 4 parity). A key overwritten in both regimes is then split across
+// two parity regimes, and the newest generation was written with write quorum
+// (9 of the 12 asked drives). The merge must select the quorate generation
+// regardless of the other generation's erasure parameters or the drive order.
+// Captured from a failing ListObjects request in issue #218.
+func TestMergeXLV2QuorateGenerationAcrossParityRegimes(t *testing.T) {
+	newer := mixedParityNullVersion(t, 200, 8, 8)
+	older := mixedParityNullVersion(t, 100, 12, 4)
+	if newer.header.EcM == older.header.EcM {
+		t.Fatalf("test expects two parity regimes, both have EcM %d", newer.header.EcM)
+	}
+	input := make([][]xlMetaV2ShallowVersion, 0, 12)
+	for range 9 {
+		input = append(input, []xlMetaV2ShallowVersion{newer})
+	}
+	for range 3 {
+		input = append(input, []xlMetaV2ShallowVersion{older})
+	}
+	want := []xlMetaV2ShallowVersion{newer}
+	for order, versions := range quorumVersionOrders(input) {
+		for _, requested := range []int{0, 1} {
+			got := mergeXLV2Versions(6, false, requested, versions...)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("order=%d requested=%d: got %#v, want the quorate newest version", order, requested, got)
+			}
+		}
+		if got := mergeXLV2Versions(6, true, 1, versions...); !reflect.DeepEqual(got, want) {
+			t.Fatalf("order=%d strict: got %#v, want the exact quorate header group", order, got)
+		}
+	}
+
+	// The reverse shape is not readable: the older 12+4 generation has only 9
+	// of its required 12 data blocks, while the newer generation is a minority.
+	input = make([][]xlMetaV2ShallowVersion, 0, 12)
+	for range 9 {
+		input = append(input, []xlMetaV2ShallowVersion{older})
+	}
+	for range 3 {
+		input = append(input, []xlMetaV2ShallowVersion{newer})
+	}
+	for order, versions := range quorumVersionOrders(input) {
+		got := mergeXLV2Versions(6, false, 1, versions...)
+		if len(got) != 0 {
+			t.Fatalf("order=%d: got %#v, want no generation below its read quorum", order, got)
+		}
+	}
+
+	// The older generation can be selected once all 12 required shards are
+	// available, even with a newer failed-write minority.
+	input = make([][]xlMetaV2ShallowVersion, 0, 16)
+	for range 12 {
+		input = append(input, []xlMetaV2ShallowVersion{older})
+	}
+	for range 4 {
+		input = append(input, []xlMetaV2ShallowVersion{newer})
+	}
+	want = []xlMetaV2ShallowVersion{older}
+	for order, versions := range quorumVersionOrders(input) {
+		got := mergeXLV2Versions(8, false, 1, versions...)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("order=%d: got %#v, want the write-quorate older version", order, got)
+		}
+	}
+
+	// A generation that lost one shard after a successful 8+8 write remains
+	// readable with its 8 data blocks and must not disappear from LIST.
+	input = make([][]xlMetaV2ShallowVersion, 0, 12)
+	for range 8 {
+		input = append(input, []xlMetaV2ShallowVersion{newer})
+	}
+	for range 4 {
+		input = append(input, []xlMetaV2ShallowVersion{older})
+	}
+	want = []xlMetaV2ShallowVersion{newer}
+	for order, versions := range quorumVersionOrders(input) {
+		if got := mergeXLV2Versions(6, false, 1, versions...); !reflect.DeepEqual(got, want) {
+			t.Fatalf("order=%d: got %#v, want the readable newer generation", order, got)
+		}
+	}
+
+	// Below quorum nothing may be emitted, across parity regimes as well.
+	input = make([][]xlMetaV2ShallowVersion, 0, 8)
+	for range 5 {
+		input = append(input, []xlMetaV2ShallowVersion{newer})
+	}
+	for range 3 {
+		input = append(input, []xlMetaV2ShallowVersion{older})
+	}
+	for order, versions := range quorumVersionOrders(input) {
+		if got := mergeXLV2Versions(6, false, 1, versions...); len(got) != 0 {
+			t.Fatalf("order=%d: got %#v, want no version below quorum", order, got)
+		}
+	}
+}
+
+func TestPickLatestQuorumFilesInfoAcrossParityRegimes(t *testing.T) {
+	newer := mixedParityNullVersion(t, 200, 8, 8)
+	older := mixedParityNullVersion(t, 100, 12, 4)
+	raw := make([]RawFileInfo, 16)
+	errs := make([]error, 16)
+	for i := range raw {
+		var version xlMetaV2ShallowVersion
+		switch {
+		case i < 8:
+			version = newer
+		case i < 12:
+			version = older
+		default:
+			errs[i] = errDiskNotFound
+			continue
+		}
+		xl := xlMetaV2{versions: []xlMetaV2ShallowVersion{version}}
+		var err error
+		raw[i].Buf, err = xl.AppendTo(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	metadata, errs := pickLatestQuorumFilesInfo(t.Context(), raw, errs, "bucket", "fixed/object", true, false)
+	readQuorum, _, err := objectQuorumFromMeta(t.Context(), metadata, errs, 4)
+	if err != nil || readQuorum != 8 {
+		t.Fatalf("read quorum: got %d, %v; want 8, nil", readQuorum, err)
+	}
+	fi, err := findFileInfoInQuorum(t.Context(), metadata, time.Unix(200, 0).UTC(), "", readQuorum)
+	if err != nil || !fi.ModTime.Equal(time.Unix(200, 0)) {
+		t.Fatalf("readable cross-parity generation was not resolved: %+v, %v", fi, err)
+	}
+}
+
+func TestMergeXLV2MixedParityHistoriesUnchanged(t *testing.T) {
+	newer := mixedParityNullVersion(t, 200, 8, 8)
+	older := mixedParityNullVersion(t, 100, 12, 4)
+	history := mixedParityNullVersion(t, 50, 12, 4)
+	history.header.VersionID = [16]byte{1}
+
+	input := make([][]xlMetaV2ShallowVersion, 0, 12)
+	for range 9 {
+		input = append(input, []xlMetaV2ShallowVersion{newer, history})
+	}
+	for range 3 {
+		input = append(input, []xlMetaV2ShallowVersion{older, history})
+	}
+	if got, want := mergeXLV2Versions(6, false, 1, input...), []xlMetaV2ShallowVersion{history}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("mixed-version behavior changed: got %#v, want %#v", got, want)
+	}
+}
