@@ -1944,7 +1944,7 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 	// Keep the original stream shapes: pruning must not make a versioned object
 	// eligible for the single null-version recount below.
 	originalVersions := versions
-	var checkedSingleNull, singleNull bool
+	var checkedSingleNull, singleNull, crossParity bool
 	// Shallow copy input
 	versions = append(make([][]xlMetaV2ShallowVersion, 0, len(versions)), versions...)
 
@@ -2019,19 +2019,23 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 					// Version IDs match, but otherwise unable to resolve.
 					// We are either strict, or don't have enough information to match.
 					// Switch to a pure counting algo.
-					latest, latestCount = countXLV2Versions(tops, ver.header, latest, strict)
+					latest, latestCount = countXLV2Versions(tops, ver.header, latest, strict, false)
 					break
 				}
 			}
+			if !checkedSingleNull {
+				singleNull, crossParity = singleNullVersionStreams(originalVersions, strict)
+				checkedSingleNull = true
+			}
+			if crossParity {
+				// Recount exact groups against their own read quorum.
+				latestCount = 0
+			}
 			if latestCount < quorum {
-				if !checkedSingleNull {
-					singleNull = singleNullVersionStreams(originalVersions)
-					checkedSingleNull = true
-				}
 				if singleNull {
 					// A newer minority at the end can hide an older quorum from
 					// the selection loop. Recount before discarding the null ID.
-					if candidate, count := countXLV2Versions(tops, latest.header, latest, strict); count >= quorum {
+					if candidate, count := countXLV2Versions(tops, latest.header, latest, strict, crossParity); count >= quorum {
 						latest, latestCount = candidate, count
 					}
 				}
@@ -2098,39 +2102,46 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 
 // singleNullVersionStreams excludes histories and other version types from the
 // additional recount. Check the original inputs, before any stream is pruned.
-func singleNullVersionStreams(versions [][]xlMetaV2ShallowVersion) bool {
+// Non-strict resolution may recount modern streams written under different
+// parity regimes for the same erasure set. Strict resolution still requires
+// identical erasure parameters.
+func singleNullVersionStreams(versions [][]xlMetaV2ShallowVersion, strict bool) (eligible, crossParity bool) {
 	var ec xlMetaV2VersionHeader
-	var haveEC bool
+	var haveHeader bool
 	for _, stream := range versions {
 		if len(stream) == 0 {
 			continue
 		}
 		if len(stream) != 1 {
-			return false
+			return false, false
 		}
 		h := stream[0].header
 		if h.VersionID != [16]byte{} || h.Type != ObjectType || h.FreeVersion() {
-			return false
+			return false, false
 		}
-		if haveEC && (h.EcN != ec.EcN || h.EcM != ec.EcM) {
-			return false
+		if haveHeader && (h.EcN != ec.EcN || h.EcM != ec.EcM) {
+			if strict || !h.hasEC() || !ec.hasEC() || h.EcN+h.EcM != ec.EcN+ec.EcM {
+				return false, false
+			}
+			crossParity = true
 		}
-		ec, haveEC = h, true
+		ec, haveHeader = h, true
 	}
-	return haveEC
+	return haveHeader, crossParity
 }
 
 // countXLV2Versions selects the most frequent compatible header for reference's
 // VersionID, retaining the existing sort tiebreak and last matching entry.
-func countXLV2Versions(tops []xlMetaV2ShallowVersion, reference xlMetaV2VersionHeader, latest xlMetaV2ShallowVersion, strict bool) (xlMetaV2ShallowVersion, int) {
+// crossParity allows modern headers from the same erasure set to form separate
+// groups, but only a readable group can be selected.
+func countXLV2Versions(tops []xlMetaV2ShallowVersion, reference xlMetaV2VersionHeader, latest xlMetaV2ShallowVersion, strict, crossParity bool) (xlMetaV2ShallowVersion, int) {
 	x := make(map[xlMetaV2VersionHeader]int, len(tops))
 	for _, a := range tops {
 		if a.header.VersionID != reference.VersionID {
 			continue
 		}
 		if !strict {
-			// we must match EC, when we are not strict.
-			if !a.header.matchesEC(reference) {
+			if !crossParity && !a.header.matchesEC(reference) {
 				continue
 			}
 			a.header.Signature = [4]byte{}
@@ -2139,6 +2150,9 @@ func countXLV2Versions(tops []xlMetaV2ShallowVersion, reference xlMetaV2VersionH
 	}
 	var latestCount int
 	for k, v := range x {
+		if crossParity && v < int(k.EcM) {
+			continue
+		}
 		if v < latestCount {
 			continue
 		}
