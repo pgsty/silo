@@ -730,11 +730,12 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 		minDisks:       listingQuorum,
 		reportNotFound: false,
 		agreed:         fn,
-		partial: func(entries metaCacheEntries, _ []error) {
+		partial: func(entries metaCacheEntries, _ []error) error {
 			entry, ok := entries.resolve(&resolver)
 			if ok {
 				fn(*entry)
 			}
+			return nil
 		},
 		finished: nil,
 	})

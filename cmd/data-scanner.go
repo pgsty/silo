@@ -744,10 +744,10 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 					}
 				},
 				// Some disks have data for this.
-				partial: func(entries metaCacheEntries, errs []error) {
+				partial: func(entries metaCacheEntries, errs []error) error {
 					if !f.shouldHeal() {
 						cancel()
-						return
+						return nil
 					}
 					entry, ok := entries.resolve(&resolver)
 					if !ok {
@@ -772,7 +772,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 					}
 
 					if entry.isDir() {
-						return
+						return nil
 					}
 
 					// We got an entry which we should be able to heal.
@@ -787,7 +787,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 							scannerLogIf(ctx, err)
 						}
 						foundObjs = foundObjs || err == nil
-						return
+						return nil
 					}
 
 					custom["versions"] = fmt.Sprint(len(fiv.Versions))
@@ -814,6 +814,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 					}
 					custom["success_versions"] = fmt.Sprint(successVersions)
 					custom["failed_versions"] = fmt.Sprint(failVersions)
+					return nil
 				},
 				// Too many disks failed.
 				finished: func(errs []error) {

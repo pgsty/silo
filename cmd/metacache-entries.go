@@ -461,6 +461,16 @@ func (m metaCacheEntries) firstFound() (first *metaCacheEntry, n int) {
 	return first, n
 }
 
+// firstObject returns the first entry that contains object metadata.
+func (m metaCacheEntries) firstObject() *metaCacheEntry {
+	for i := range m {
+		if m[i].isObject() {
+			return &m[i]
+		}
+	}
+	return nil
+}
+
 // names will return all names in order.
 // Since this allocates it should not be used in critical functions.
 func (m metaCacheEntries) names() []string {
