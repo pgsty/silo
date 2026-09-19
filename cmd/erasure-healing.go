@@ -86,7 +86,7 @@ func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string,
 				cancel()
 			}
 		},
-		partial: func(entries metaCacheEntries, _ []error) {
+		partial: func(entries metaCacheEntries, _ []error) error {
 			entry, ok := entries.resolve(&resolver)
 			if !ok {
 				// check if we can get one entry at least
@@ -94,12 +94,12 @@ func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string,
 				entry, _ = entries.firstFound()
 			}
 			if !recursive && prefix != entry.name {
-				return
+				return nil
 			}
 			if err := healEntry(bucket, *entry, scanMode); err != nil {
 				cancel()
-				return
 			}
+			return nil
 		},
 		finished: nil,
 	}

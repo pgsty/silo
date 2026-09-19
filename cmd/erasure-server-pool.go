@@ -2642,11 +2642,15 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 					minDisks:       listingQuorum,
 					reportNotFound: false,
 					agreed:         send,
-					partial: func(entries metaCacheEntries, _ []error) {
-						entry, ok := entries.resolve(&resolver)
-						if ok {
+					partial: func(entries metaCacheEntries, _ []error) error {
+						entry, err := set.resolveListEntry(ctx, bucket, entries, &resolver)
+						if err != nil {
+							return err
+						}
+						if entry != nil {
 							send(*entry)
 						}
+						return nil
 					},
 					finished: nil,
 				}

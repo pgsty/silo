@@ -700,6 +700,72 @@ func getQuorumDisks(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDi
 	return newDisks
 }
 
+// resolveListEntry resolves walk snapshots and, for latest-only listings,
+// falls back to the regular object read path when those snapshots disagree.
+//
+// Cost: one locked getObjectFileInfo per unresolved entry. Only disagreeing
+// entries pay it -- 123 of ~162k entries in the issue #218 rolling-restart run
+// -- but each is a namespace lock round trip, so a listing taken during a
+// restart of a large bucket can pay it per page. Batch the fallback reads if
+// listing latency during restarts becomes the complaint.
+func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, entries metaCacheEntries, resolver *metadataResolutionParams) (*metaCacheEntry, error) {
+	entry, ok := entries.resolve(resolver)
+	if ok {
+		return entry, nil
+	}
+	entry = entries.firstObject()
+	if entry == nil {
+		return nil, nil
+	}
+	readQuorumErr := func() error {
+		return InsufficientReadQuorum{
+			Bucket: bucket,
+			Object: entry.name,
+			Err:    errErasureReadQuorum,
+			Type:   RQInconsistentMeta,
+		}
+	}
+	if resolver.requestedVersions != 1 {
+		return nil, readQuorumErr()
+	}
+
+	// Read under the object read lock, exactly as the GET path does. A
+	// lock-free read of an object being overwritten stably reports a live
+	// object as absent, so an unlocked fallback only trades one silent
+	// omission for another.
+	lock := er.NewNSLock(bucket, entry.name)
+	lkctx, err := lock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.RUnlock(lkctx)
+
+	fi, _, _, err := er.getObjectFileInfo(lkctx.Context(), bucket, entry.name, ObjectOptions{}, false)
+	if err != nil {
+		// Absence is reported only when the locked read proves it. Anything
+		// else is undecidable and fails the request instead of dropping the
+		// key from a successful listing.
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if fi.Deleted {
+		return nil, nil
+	}
+
+	xl := &xlMetaV2{}
+	if err = xl.AddVersion(fi); err != nil {
+		return nil, readQuorumErr()
+	}
+	resolved := &metaCacheEntry{name: entry.name, cached: xl, reusable: true}
+	resolved.metadata, err = xl.AppendTo(metaDataPoolGet())
+	if err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
 // Will return io.EOF if continuing would not yield more results.
 func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) (err error) {
 	defer xioutil.SafeClose(results)
@@ -776,15 +842,19 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 			case results <- entry:
 			}
 		},
-		partial: func(entries metaCacheEntries, errs []error) {
+		partial: func(entries metaCacheEntries, _ []error) error {
 			// Results Disagree :-(
-			entry, ok := entries.resolve(&resolver)
-			if ok {
+			entry, err := er.resolveListEntry(ctx, o.Bucket, entries, &resolver)
+			if err != nil {
+				return err
+			}
+			if entry != nil {
 				select {
 				case <-ctxDone:
 				case results <- *entry:
 				}
 			}
+			return nil
 		},
 	})
 }
@@ -980,7 +1050,7 @@ type listPathRawOptions struct {
 	// partial will be called when there is disagreement between disks.
 	// if disk did not return any result, but also haven't errored
 	// the entry will be empty and errs will
-	partial func(entries metaCacheEntries, errs []error)
+	partial func(entries metaCacheEntries, errs []error) error
 
 	// finished will be called when all streams have finished and
 	// more than one disk returned an error.
@@ -1191,7 +1261,9 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			continue
 		}
 		if opts.partial != nil {
-			opts.partial(topEntries, errs)
+			if err := opts.partial(topEntries, errs); err != nil {
+				return err
+			}
 		}
 		// Skip the inputs we used.
 		for i, r := range readers {

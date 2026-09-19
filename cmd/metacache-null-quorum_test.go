@@ -52,6 +52,14 @@ type nullQuorumWalkDisk struct {
 	index    int
 }
 
+type failedMetadataWalkDisk struct {
+	StorageAPI
+}
+
+func (d *failedMetadataWalkDisk) WalkDir(context.Context, WalkDirOptions, io.Writer) error {
+	return errDiskNotFound
+}
+
 func (d *nullQuorumWalkDisk) WalkDir(ctx context.Context, opts WalkDirOptions, out io.Writer) error {
 	if opts.Bucket != d.schedule.bucket {
 		return d.StorageAPI.WalkDir(ctx, opts, out)
@@ -224,6 +232,162 @@ func TestListObjectsSingleNullQuorumHTTP(t *testing.T) {
 	t.Logf("completed PUT readback: GET=%d bytes=%d HEAD=%d length=%s", get.Code, get.Body.Len(), head.Code, head.Header().Get("Content-Length"))
 	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), newBody) || head.Code != http.StatusOK || head.Header().Get("Content-Length") != "8192" {
 		t.Fatalf("completed PUT was not readable: GET=%d HEAD=%d", get.Code, head.Code)
+	}
+}
+
+func TestListObjectsFallsBackToReadableMetadata(t *testing.T) {
+	z, bucket, router := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "object"
+	oldBody := bytes.Repeat([]byte{'a'}, 8192)
+	newBody := bytes.Repeat([]byte{'b'}, 8192)
+	oldTime := time.Now().UTC().Add(-time.Hour)
+
+	if _, err := z.PutObject(t.Context(), bucket, object, mustGetPutObjReader(t, bytes.NewReader(oldBody), int64(len(oldBody)), "", ""), ObjectOptions{MTime: oldTime}); err != nil {
+		t.Fatal(err)
+	}
+	oldMeta := make([][]byte, len(disks))
+	for i, disk := range disks {
+		oldMeta[i] = mustReadNullQuorumMeta(t, disk, bucket, object)
+	}
+	if _, err := z.PutObject(t.Context(), bucket, object, mustGetPutObjReader(t, bytes.NewReader(newBody), int64(len(newBody)), "", ""), ObjectOptions{MTime: oldTime.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The eight readable walk streams are split 3/5 across two generations;
+	// the other eight streams fail. Neither generation is proven readable by
+	// the listing inputs, so returning HTTP 200 would silently omit the key.
+	for i := range 3 {
+		if err := disks[i].WriteAll(t.Context(), bucket, object+"/"+xlStorageFormatFile, oldMeta[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wrapped := make([]StorageAPI, len(disks))
+	for i, disk := range disks {
+		wrapped[i] = disk
+		if i >= 8 {
+			wrapped[i] = &failedMetadataWalkDisk{StorageAPI: disk}
+		}
+	}
+	set.getDisks = func() []StorageAPI { return wrapped }
+
+	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectsV2URL("", bucket, "", "1000", "", "", ""))
+	var list ListObjectsV2Response
+	if rec.Code != http.StatusOK || xml.Unmarshal(rec.Body.Bytes(), &list) != nil {
+		t.Fatalf("LIST failed to resolve readable metadata: %d %s", rec.Code, rec.Body.String())
+	}
+	if list.KeyCount != 1 || len(list.Contents) != 1 || list.Contents[0].Key != object {
+		t.Fatalf("LIST omitted the readable key: %+v", list)
+	}
+
+	// The object itself still has a read quorum outside the failed walk
+	// streams, demonstrating why the LIST must report uncertainty, not absence.
+	get := nullQuorumRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object))
+	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), newBody) {
+		t.Fatalf("GET lost the readable generation: %d %q", get.Code, get.Body.String())
+	}
+}
+
+// The fallback must read under the object read lock. A lock-free read of an
+// object being overwritten stably reports a live object as absent, which is
+// the omission this repair exists to remove. Hold the write lock and assert
+// the listing waits for it rather than resolving straight through.
+func TestListFallbackTakesObjectReadLock(t *testing.T) {
+	z, bucket, router := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "object"
+	oldBody, newBody := bytes.Repeat([]byte{'a'}, 8192), bytes.Repeat([]byte{'b'}, 8192)
+	oldTime := time.Now().UTC().Add(-time.Hour)
+
+	if _, err := z.PutObject(t.Context(), bucket, object, mustGetPutObjReader(t, bytes.NewReader(oldBody), int64(len(oldBody)), "", ""), ObjectOptions{MTime: oldTime}); err != nil {
+		t.Fatal(err)
+	}
+	oldMeta := make([][]byte, len(disks))
+	for i, disk := range disks {
+		oldMeta[i] = mustReadNullQuorumMeta(t, disk, bucket, object)
+	}
+	if _, err := z.PutObject(t.Context(), bucket, object, mustGetPutObjReader(t, bytes.NewReader(newBody), int64(len(newBody)), "", ""), ObjectOptions{MTime: oldTime.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	// Split the readable walk streams so the entry cannot be resolved from
+	// the snapshots and the fallback has to run.
+	for i := range 3 {
+		if err := disks[i].WriteAll(t.Context(), bucket, object+"/"+xlStorageFormatFile, oldMeta[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wrapped := make([]StorageAPI, len(disks))
+	for i, disk := range disks {
+		wrapped[i] = disk
+		if i >= 8 {
+			wrapped[i] = &failedMetadataWalkDisk{StorageAPI: disk}
+		}
+	}
+	set.getDisks = func() []StorageAPI { return wrapped }
+
+	lock := set.NewNSLock(bucket, object)
+	lkctx, err := lock.GetLock(t.Context(), globalOperationTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hold = 300 * time.Millisecond
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(hold)
+		lock.Unlock(lkctx)
+		close(released)
+	}()
+
+	start := time.Now()
+	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectsV2URL("", bucket, "", "1000", "", "", ""))
+	elapsed := time.Since(start)
+	<-released
+
+	if elapsed < hold {
+		t.Fatalf("listing fallback did not wait for the object lock: %v < %v", elapsed, hold)
+	}
+	var list ListObjectsV2Response
+	if rec.Code != http.StatusOK || xml.Unmarshal(rec.Body.Bytes(), &list) != nil {
+		t.Fatalf("LIST failed after the lock was released: %d %s", rec.Code, rec.Body.String())
+	}
+	if list.KeyCount != 1 || len(list.Contents) != 1 || list.Contents[0].Key != object {
+		t.Fatalf("LIST omitted the readable key: %+v", list)
+	}
+}
+
+// A truncated xl.meta is what a concurrent overwrite looks like on one drive,
+// and the walker skips that entry. Skipping is safe and deliberate: the key is
+// only omitted when no generation reaches quorum, which listPath now resolves
+// against the read path. Pin that, so the walker is not "hardened" into
+// failing a whole listing over a minority of unreadable drives.
+func TestListObjectsSurvivesTruncatedMetadataMinority(t *testing.T) {
+	z, bucket, router := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "object"
+	body := bytes.Repeat([]byte{'a'}, 8192)
+
+	if _, err := z.PutObject(t.Context(), bucket, object, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Truncate xl.meta on a minority of drives, as an overwrite in flight does.
+	for i := range 4 {
+		meta := mustReadNullQuorumMeta(t, disks[i], bucket, object)
+		if err := disks[i].WriteAll(t.Context(), bucket, object+"/"+xlStorageFormatFile, meta[:len(meta)/2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectsV2URL("", bucket, "", "1000", "", "", ""))
+	var list ListObjectsV2Response
+	if rec.Code != http.StatusOK || xml.Unmarshal(rec.Body.Bytes(), &list) != nil {
+		t.Fatalf("a truncated minority failed the listing: %d %s", rec.Code, rec.Body.String())
+	}
+	if list.KeyCount != 1 || len(list.Contents) != 1 || list.Contents[0].Key != object {
+		t.Fatalf("a truncated minority omitted the key: %+v", list)
 	}
 }
 
