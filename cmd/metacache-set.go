@@ -708,13 +708,33 @@ func getQuorumDisks(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDi
 // -- but each is a namespace lock round trip, so a listing taken during a
 // restart of a large bucket can pay it per page. Batch the fallback reads if
 // listing latency during restarts becomes the complaint.
-func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, entries metaCacheEntries, resolver *metadataResolutionParams) (*metaCacheEntry, error) {
+func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, entries metaCacheEntries, errs []error, resolver *metadataResolutionParams) (*metaCacheEntry, error) {
 	entry, ok := entries.resolve(resolver)
 	if ok {
 		return entry, nil
 	}
-	entry = entries.firstObject()
-	if entry == nil {
+	if resolver.requestedVersions != 1 {
+		return nil, nil
+	}
+	valid := 0
+	for i := range entries {
+		if !entries[i].isObject() {
+			continue
+		}
+		if _, err := entries[i].xlmeta(); err != nil {
+			continue
+		}
+		valid++
+		if entry == nil {
+			entry = &entries[i]
+		}
+	}
+	for _, err := range errs {
+		if err != nil {
+			valid++
+		}
+	}
+	if entry == nil || valid < resolver.objQuorum {
 		return nil, nil
 	}
 	readQuorumErr := func() error {
@@ -725,28 +745,26 @@ func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, e
 			Type:   RQInconsistentMeta,
 		}
 	}
-	if resolver.requestedVersions != 1 {
-		return nil, readQuorumErr()
-	}
-
 	// Read under the object read lock, exactly as the GET path does. A
 	// lock-free read of an object being overwritten stably reports a live
 	// object as absent, so an unlocked fallback only trades one silent
 	// omission for another.
-	lock := er.NewNSLock(bucket, entry.name)
-	lkctx, err := lock.GetRLock(ctx, globalOperationTimeout)
+	object := encodeDirObject(entry.name)
+	lock := er.NewNSLock(bucket, object)
+	lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	lkctx, err := lock.GetRLock(lockCtx, globalOperationTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer lock.RUnlock(lkctx)
 
-	fi, _, _, err := er.getObjectFileInfo(lkctx.Context(), bucket, entry.name, ObjectOptions{}, false)
+	fi, _, _, err := er.getObjectFileInfo(lkctx.Context(), bucket, object, ObjectOptions{}, false)
 	if err != nil {
-		// Absence is reported only when the locked read proves it. Anything
-		// else is undecidable and fails the request instead of dropping the
-		// key from a successful listing.
+		// getObjectFileInfo maps inconsistent metadata to not-found, so the
+		// walk evidence means not-found is still undecidable here.
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-			return nil, nil
+			return nil, readQuorumErr()
 		}
 		return nil, err
 	}
@@ -842,9 +860,9 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 			case results <- entry:
 			}
 		},
-		partial: func(entries metaCacheEntries, _ []error) error {
+		partial: func(entries metaCacheEntries, errs []error) error {
 			// Results Disagree :-(
-			entry, err := er.resolveListEntry(ctx, o.Bucket, entries, &resolver)
+			entry, err := er.resolveListEntry(ctx, o.Bucket, entries, errs, &resolver)
 			if err != nil {
 				return err
 			}

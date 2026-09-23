@@ -60,6 +60,29 @@ func (d *failedMetadataWalkDisk) WalkDir(context.Context, WalkDirOptions, io.Wri
 	return errDiskNotFound
 }
 
+// offlineNullQuorumDisk models a drive of a node that is away.
+type offlineNullQuorumDisk struct {
+	StorageAPI
+}
+
+func (d *offlineNullQuorumDisk) IsOnline() bool { return false }
+
+func (d *offlineNullQuorumDisk) DiskInfo(context.Context, DiskInfoOptions) (DiskInfo, error) {
+	return DiskInfo{}, errDiskNotFound
+}
+
+func (d *offlineNullQuorumDisk) WalkDir(context.Context, WalkDirOptions, io.Writer) error {
+	return errDiskNotFound
+}
+
+func (d *offlineNullQuorumDisk) ReadXL(context.Context, string, string, bool) (RawFileInfo, error) {
+	return RawFileInfo{}, errDiskNotFound
+}
+
+func (d *offlineNullQuorumDisk) ReadVersion(context.Context, string, string, string, string, ReadOptions) (FileInfo, error) {
+	return FileInfo{}, errDiskNotFound
+}
+
 func (d *nullQuorumWalkDisk) WalkDir(ctx context.Context, opts WalkDirOptions, out io.Writer) error {
 	if opts.Bucket != d.schedule.bucket {
 		return d.StorageAPI.WalkDir(ctx, opts, out)
@@ -125,6 +148,30 @@ func nullQuorumRequest(t *testing.T, router http.Handler, method, target string)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req.WithContext(t.Context()))
 	return rec
+}
+
+func nullQuorumPut(t *testing.T, z *erasureServerPools, bucket, object string, body []byte, opts ObjectOptions) {
+	t.Helper()
+	if _, err := z.PutObject(t.Context(), bucket, object, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), opts); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func nullQuorumListV2Keys(t *testing.T, router http.Handler, bucket string) (int, []string) {
+	t.Helper()
+	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectsV2URL("", bucket, "", "1000", "", "", ""))
+	if rec.Code != http.StatusOK {
+		return rec.Code, nil
+	}
+	var list ListObjectsV2Response
+	if err := xml.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	keys := make([]string, 0, len(list.Contents))
+	for _, object := range list.Contents {
+		keys = append(keys, object.Key)
+	}
+	return rec.Code, keys
 }
 
 func TestListObjectsSingleNullQuorumHTTP(t *testing.T) {
@@ -388,6 +435,195 @@ func TestListObjectsSurvivesTruncatedMetadataMinority(t *testing.T) {
 	}
 	if list.KeyCount != 1 || len(list.Contents) != 1 || list.Contents[0].Key != object {
 		t.Fatalf("a truncated minority omitted the key: %+v", list)
+	}
+}
+
+func TestListStaleMinorityIgnored(t *testing.T) {
+	z, bucket, router := nullQuorumBackend(t)
+	disks := z.serverPools[0].sets[0].getDisks()
+	body := bytes.Repeat([]byte{'a'}, 8192)
+	nullQuorumPut(t, z, bucket, "gone", body, ObjectOptions{})
+	nullQuorumPut(t, z, bucket, "keep", body, ObjectOptions{})
+	for _, disk := range disks[4:] {
+		if err := disk.Delete(t.Context(), bucket, "gone", DeleteOptions{Recursive: true, Immediate: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if code, keys := nullQuorumListV2Keys(t, router, bucket); code != http.StatusOK || !slices.Equal(keys, []string{"keep"}) {
+		t.Errorf("ListObjectsV2: got %d %v; want 200 [keep]", code, keys)
+	}
+	results := make(chan itemOrErr[ObjectInfo], 16)
+	if err := z.Walk(t.Context(), bucket, "", results, WalkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for result := range results {
+		if result.Err != nil {
+			t.Fatal(result.Err)
+		}
+		names = append(names, result.Item.Name)
+	}
+	if !slices.Equal(names, []string{"keep"}) {
+		t.Errorf("Walk: got %v; want [keep]", names)
+	}
+
+	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectVersionsURL("", bucket, "", "1000", ""))
+	var list struct {
+		Versions []struct {
+			Key string `xml:"Key"`
+		} `xml:"Version"`
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("ListObjectVersions: got %d; want 200", rec.Code)
+	} else if err := xml.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	} else if len(list.Versions) != 1 || list.Versions[0].Key != "keep" {
+		t.Errorf("ListObjectVersions: got %+v; want [keep]", list.Versions)
+	}
+
+	if _, err := z.DeleteObject(t.Context(), bucket, "keep", ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.DeleteBucket(t.Context(), bucket, DeleteBucketOptions{}); err != nil {
+		t.Errorf("DeleteBucket with only a stale minority: %v", err)
+	}
+}
+
+func TestIAMListingIgnoresStaleMinority(t *testing.T) {
+	z, _, _ := nullQuorumBackend(t)
+	body := []byte(`{"version":1}`)
+	alive := iamConfigUsersPrefix + "alive/identity.json"
+	ghost := iamConfigUsersPrefix + "ghost/identity.json"
+	nullQuorumPut(t, z, minioMetaBucket, alive, body, ObjectOptions{})
+	nullQuorumPut(t, z, minioMetaBucket, ghost, body, ObjectOptions{})
+	for _, disk := range z.serverPools[0].getHashedSet(ghost).getDisks()[4:] {
+		if err := disk.Delete(t.Context(), minioMetaBucket, ghost, DeleteOptions{Recursive: true, Immediate: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	items, err := newIAMObjectStore(z, MinIOUsersSysType).listAllIAMConfigItems(t.Context())
+	if err != nil {
+		t.Fatalf("IAM listing failed on a stale minority (retriable=%v): %v", configRetriableErrors(err), err)
+	}
+	if got := items["users/"]; !slices.Equal(got, []string{"alive/identity.json"}) {
+		t.Errorf("IAM users: got %v; want [alive/identity.json]", got)
+	}
+}
+
+func TestListSplitDirectoryObject(t *testing.T) {
+	z, bucket, router := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "dir/"
+	encoded := encodeDirObject(object)
+	mtime := time.Now().UTC().Add(-time.Hour)
+
+	nullQuorumPut(t, z, bucket, object, nil, ObjectOptions{MTime: mtime})
+	old := make([][]byte, 3)
+	for i := range old {
+		old[i] = mustReadNullQuorumMeta(t, disks[i], bucket, encoded)
+	}
+	nullQuorumPut(t, z, bucket, object, nil, ObjectOptions{MTime: mtime.Add(time.Minute)})
+	for i := range old {
+		if err := disks[i].WriteAll(t.Context(), bucket, encoded+"/"+xlStorageFormatFile, old[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	walkers := slices.Clone(disks)
+	for i := 8; i < len(walkers); i++ {
+		walkers[i] = &failedMetadataWalkDisk{StorageAPI: disks[i]}
+	}
+	set.getDisks = func() []StorageAPI { return walkers }
+	if code, keys := nullQuorumListV2Keys(t, router, bucket); code != http.StatusOK || !slices.Equal(keys, []string{object}) {
+		t.Errorf("ListObjectsV2: got %d %v; want 200 [%s]", code, keys, object)
+	}
+}
+
+func TestListFallbackDoesNotTrustNotFound(t *testing.T) {
+	z, bucket, _ := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "object"
+	body := bytes.Repeat([]byte{'a'}, 8192)
+	mtime := time.Now().UTC().Add(-time.Hour)
+
+	nullQuorumPut(t, z, bucket, object, body, ObjectOptions{MTime: mtime})
+	old := make([][]byte, len(disks))
+	for i := range disks {
+		old[i] = mustReadNullQuorumMeta(t, disks[i], bucket, object)
+	}
+	nullQuorumPut(t, z, bucket, object, body, ObjectOptions{MTime: mtime.Add(time.Minute)})
+	newer := make([][]byte, len(disks))
+	for i := range disks {
+		newer[i] = mustReadNullQuorumMeta(t, disks[i], bucket, object)
+		if err := disks[i].Delete(t.Context(), bucket, object, DeleteOptions{Recursive: true, Immediate: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries := make(metaCacheEntries, len(disks))
+	errs := make([]error, len(disks))
+	for i := range 3 {
+		entries[i] = metaCacheEntry{name: object, metadata: old[i]}
+	}
+	for i := 3; i < 8; i++ {
+		entries[i] = metaCacheEntry{name: object, metadata: newer[i]}
+	}
+	for i := 8; i < len(errs); i++ {
+		errs[i] = errDiskNotFound
+	}
+	resolver := metadataResolutionParams{dirQuorum: 8, objQuorum: 8, bucket: bucket, requestedVersions: 1}
+	entry, err := set.resolveListEntry(t.Context(), bucket, entries, errs, &resolver)
+	if entry != nil || !isErrReadQuorum(err) {
+		t.Fatalf("ambiguous not-found: got entry=%v err=%v; want read quorum error", entry, err)
+	}
+}
+
+// G0 was written 8+8 while a node was away. G1 was later written 12+4 but
+// missed drive 0, which still holds G0. Then a node holding four G1 drives
+// goes away: eleven G1 and one G0 remain online. G1 exists but lacks one of
+// its twelve data shards until the node returns, so HEAD must not report 404
+// and LIST must still show the key.
+func TestListCrossParityMinorityStaysVisible(t *testing.T) {
+	z, bucket, router := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "object"
+	mtime := time.Now().UTC().Add(-time.Hour)
+
+	nullQuorumPut(t, z, bucket, object, bytes.Repeat([]byte{'a'}, 256<<10), ObjectOptions{MTime: mtime, MaxParity: true})
+	g0 := mustReadNullQuorumMeta(t, disks[0], bucket, object)
+	var x xlMetaV2
+	if err := x.LoadOrConvert(g0); err != nil {
+		t.Fatal(err)
+	}
+	if h := x.versions[0].header; h.EcM != 8 || h.EcN != 8 {
+		t.Fatalf("G0 is %d+%d, want 8+8", h.EcM, h.EcN)
+	}
+	g1Body := bytes.Repeat([]byte{'b'}, 256<<10)
+	nullQuorumPut(t, z, bucket, object, g1Body, ObjectOptions{MTime: mtime.Add(time.Minute)})
+	if err := disks[0].WriteAll(t.Context(), bucket, object+"/"+xlStorageFormatFile, g0); err != nil {
+		t.Fatal(err)
+	}
+
+	online := slices.Clone(disks)
+	for i := 12; i < len(online); i++ {
+		online[i] = &offlineNullQuorumDisk{StorageAPI: disks[i]}
+	}
+	set.getDisks = func() []StorageAPI { return online }
+	if code := nullQuorumRequest(t, router, http.MethodHead, getHeadObjectURL("", bucket, object)).Code; code == http.StatusNotFound {
+		t.Errorf("HEAD with a node away: 404 for an existing object")
+	}
+	if code, keys := nullQuorumListV2Keys(t, router, bucket); code != http.StatusOK || !slices.Equal(keys, []string{object}) {
+		t.Errorf("ListObjectsV2 with a node away: got %d %v; want 200 [%s]", code, keys, object)
+	}
+
+	set.getDisks = func() []StorageAPI { return disks }
+	if get := nullQuorumRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object)); get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), g1Body) {
+		t.Fatalf("GET after the node returns: %d", get.Code)
 	}
 }
 
