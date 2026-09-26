@@ -18,6 +18,7 @@ permissions:
   id-token: write
   attestations: write
   artifact-metadata: write
+  packages: write
 
 concurrency:
   group: docker-release
@@ -200,6 +201,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -347,6 +355,41 @@ jobs:
             exit 1
           fi
           echo "SILO_DISTROLESS_DIGEST=${DISTROLESS_RELEASE_DIGEST}" >> "${GITHUB_ENV}"
+
+      # Mirror the published multi-architecture manifests to GHCR.
+      # `imagetools create` copies the existing manifests and blobs
+      # registry-to-registry, so the GHCR tags resolve to the exact same
+      # digests as Docker Hub -- no rebuild, no drift. Architecture-suffixed
+      # staging tags stay Docker-Hub-only; only the four promoted tags are
+      # mirrored. Attestations keep their index.docker.io subject names;
+      # verification against the mirrored digests still works by passing the
+      # Docker Hub subject registry explicitly.
+      - name: Mirror multi-architecture manifests to GHCR
+        run: |
+          set -euo pipefail
+          for tag in "${RELEASE_TAG}" "latest" "${RELEASE_TAG}-distroless" "distroless"; do
+            echo "Mirroring pgsty/silo:${tag} -> ghcr.io/${GITHUB_REPOSITORY,,}:${tag}"
+            docker buildx imagetools create \
+              --tag "ghcr.io/${GITHUB_REPOSITORY,,}:${tag}" \
+              "pgsty/silo:${tag}"
+          done
+          # The mirrored manifests must resolve to the same digests that were
+          # just verified on Docker Hub; anything else means the mirror lane
+          # silently diverged.
+          for pair in \
+            "${SILO_IMAGE_DIGEST} ${RELEASE_TAG}" \
+            "${SILO_IMAGE_DIGEST} latest" \
+            "${SILO_DISTROLESS_DIGEST} ${RELEASE_TAG}-distroless" \
+            "${SILO_DISTROLESS_DIGEST} distroless"; do
+            set -- ${pair}
+            want_digest="${1}"
+            tag="${2}"
+            got_digest="$(docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:${tag}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            if [ "${got_digest}" != "${want_digest}" ]; then
+              echo "ghcr.io ${tag} resolved to ${got_digest}, want ${want_digest}" >&2
+              exit 1
+            fi
+          done
 
       - name: Generate architecture image SBOMs
         env:
