@@ -700,6 +700,90 @@ func getQuorumDisks(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDi
 	return newDisks
 }
 
+// resolveListEntry resolves walk snapshots and, for latest-only listings,
+// falls back to the regular object read path when those snapshots disagree.
+//
+// Cost: one locked getObjectFileInfo per unresolved entry. Only disagreeing
+// entries pay it -- 123 of ~162k entries in the issue #218 rolling-restart run
+// -- but each is a namespace lock round trip, so a listing taken during a
+// restart of a large bucket can pay it per page. Batch the fallback reads if
+// listing latency during restarts becomes the complaint.
+func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, entries metaCacheEntries, errs []error, resolver *metadataResolutionParams) (*metaCacheEntry, error) {
+	entry, ok := entries.resolve(resolver)
+	if ok {
+		return entry, nil
+	}
+	if resolver.requestedVersions != 1 {
+		return nil, nil
+	}
+	valid := 0
+	for i := range entries {
+		if !entries[i].isObject() {
+			continue
+		}
+		if _, err := entries[i].xlmeta(); err != nil {
+			continue
+		}
+		valid++
+		if entry == nil {
+			entry = &entries[i]
+		}
+	}
+	for _, err := range errs {
+		if err != nil {
+			valid++
+		}
+	}
+	if entry == nil || valid < resolver.objQuorum {
+		return nil, nil
+	}
+	readQuorumErr := func() error {
+		return InsufficientReadQuorum{
+			Bucket: bucket,
+			Object: entry.name,
+			Err:    errErasureReadQuorum,
+			Type:   RQInconsistentMeta,
+		}
+	}
+	// Read under the object read lock, exactly as the GET path does. A
+	// lock-free read of an object being overwritten stably reports a live
+	// object as absent, so an unlocked fallback only trades one silent
+	// omission for another.
+	object := encodeDirObject(entry.name)
+	lock := er.NewNSLock(bucket, object)
+	lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	lkctx, err := lock.GetRLock(lockCtx, globalOperationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.RUnlock(lkctx)
+
+	fi, _, _, err := er.getObjectFileInfo(lkctx.Context(), bucket, object, ObjectOptions{}, false)
+	if err != nil {
+		// getObjectFileInfo maps inconsistent metadata to not-found, so the
+		// walk evidence means not-found is still undecidable here.
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			return nil, readQuorumErr()
+		}
+		return nil, err
+	}
+	if fi.Deleted {
+		return nil, nil
+	}
+
+	xl := &xlMetaV2{}
+	if err = xl.AddVersion(fi); err != nil {
+		return nil, readQuorumErr()
+	}
+	resolved := &metaCacheEntry{name: entry.name, cached: xl, reusable: true}
+	resolved.metadata, err = xl.AppendTo(metaDataPoolGet())
+	if err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
 // Will return io.EOF if continuing would not yield more results.
 func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) (err error) {
 	defer xioutil.SafeClose(results)
@@ -776,15 +860,19 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 			case results <- entry:
 			}
 		},
-		partial: func(entries metaCacheEntries, errs []error) {
+		partial: func(entries metaCacheEntries, errs []error) error {
 			// Results Disagree :-(
-			entry, ok := entries.resolve(&resolver)
-			if ok {
+			entry, err := er.resolveListEntry(ctx, o.Bucket, entries, errs, &resolver)
+			if err != nil {
+				return err
+			}
+			if entry != nil {
 				select {
 				case <-ctxDone:
 				case results <- *entry:
 				}
 			}
+			return nil
 		},
 	})
 }
@@ -980,7 +1068,7 @@ type listPathRawOptions struct {
 	// partial will be called when there is disagreement between disks.
 	// if disk did not return any result, but also haven't errored
 	// the entry will be empty and errs will
-	partial func(entries metaCacheEntries, errs []error)
+	partial func(entries metaCacheEntries, errs []error) error
 
 	// finished will be called when all streams have finished and
 	// more than one disk returned an error.
@@ -1191,7 +1279,9 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			continue
 		}
 		if opts.partial != nil {
-			opts.partial(topEntries, errs)
+			if err := opts.partial(topEntries, errs); err != nil {
+				return err
+			}
 		}
 		// Skip the inputs we used.
 		for i, r := range readers {
