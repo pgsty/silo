@@ -74,8 +74,11 @@ func (e SizeMismatch) Error() string {
 
 // ChecksumMismatch - when content checksum does not match with what was sent from client.
 type ChecksumMismatch struct {
-	Want string
-	Got  string
+	// Algorithm carries the requested checksum type (e.g. "CRC32") so API
+	// error rendering can name it, matching S3's wording.
+	Algorithm string
+	Want      string
+	Got       string
 }
 
 func (e ChecksumMismatch) Error() string {

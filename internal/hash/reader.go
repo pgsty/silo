@@ -302,13 +302,14 @@ func (r *Reader) Read(p []byte) (int, error) {
 				r.contentHash.Encoded = r.trailer.Get(r.contentHash.Type.Key())
 				r.contentHash.Raw, err = base64.StdEncoding.DecodeString(r.contentHash.Encoded)
 				if err != nil || len(r.contentHash.Raw) == 0 {
-					return 0, ChecksumMismatch{Got: r.contentHash.Encoded}
+					return 0, ChecksumMismatch{Algorithm: r.contentHash.Type.String(), Got: r.contentHash.Encoded}
 				}
 			}
 			if sum := r.contentHasher.Sum(nil); !bytes.Equal(r.contentHash.Raw, sum) {
 				err := ChecksumMismatch{
-					Want: r.contentHash.Encoded,
-					Got:  base64.StdEncoding.EncodeToString(sum),
+					Algorithm: r.contentHash.Type.String(),
+					Want:      r.contentHash.Encoded,
+					Got:       base64.StdEncoding.EncodeToString(sum),
 				}
 				return n, err
 			}

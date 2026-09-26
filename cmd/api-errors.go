@@ -2505,6 +2505,14 @@ func toAPIError(ctx context.Context, err error) APIError {
 	case errors.Is(err, errMissingPartChecksum):
 		apiErr.Description = strings.TrimPrefix(err.Error(), errMissingPartChecksum.Error()+": ")
 	}
+	// PutObject/UploadPart checksum mismatches name the algorithm in the
+	// message, matching S3 (e.g. "The CRC32 you specified did not match the
+	// calculated checksum."). Falls through to the generic table description
+	// when the algorithm is unknown.
+	var checksumMismatch hash.ChecksumMismatch
+	if errors.As(err, &checksumMismatch) && checksumMismatch.Algorithm != "" {
+		apiErr.Description = fmt.Sprintf("The %s you specified did not match the calculated checksum.", checksumMismatch.Algorithm)
+	}
 	switch apiErr.Code {
 	case "NotImplemented":
 		apiErr = APIError{
