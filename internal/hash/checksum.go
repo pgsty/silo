@@ -584,15 +584,17 @@ func (c Checksum) Matches(content []byte, parts int) error {
 	sum := hasher.Sum(nil)
 	if c.WantParts > 0 && c.WantParts != parts {
 		return ChecksumMismatch{
-			Want: fmt.Sprintf("%s-%d", c.Encoded, c.WantParts),
-			Got:  fmt.Sprintf("%s-%d", base64.StdEncoding.EncodeToString(sum), parts),
+			Algorithm: c.Type.String(),
+			Want:      fmt.Sprintf("%s-%d", c.Encoded, c.WantParts),
+			Got:       fmt.Sprintf("%s-%d", base64.StdEncoding.EncodeToString(sum), parts),
 		}
 	}
 
 	if !bytes.Equal(sum, c.Raw) {
 		return ChecksumMismatch{
-			Want: c.Encoded,
-			Got:  base64.StdEncoding.EncodeToString(sum),
+			Algorithm: c.Type.String(),
+			Want:      c.Encoded,
+			Got:       base64.StdEncoding.EncodeToString(sum),
 		}
 	}
 	return nil

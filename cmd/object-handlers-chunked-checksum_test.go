@@ -62,12 +62,13 @@ func testAPIPutObjectChunkedChecksum(obj ObjectLayer, instanceType, bucketName s
 	// A well-formed 4-byte value that does not match the content.
 	wrongCRC := base64.StdEncoding.EncodeToString([]byte{0x01, 0x02, 0x03, 0x04})
 
-	apiCode := func(rec *httptest.ResponseRecorder) string {
+	apiErrOf := func(rec *httptest.ResponseRecorder) APIErrorResponse {
 		var apiErr APIErrorResponse
 		b, _ := io.ReadAll(rec.Body)
 		_ = xml.Unmarshal(b, &apiErr)
-		return apiErr.Code
+		return apiErr
 	}
+	apiCode := func(rec *httptest.ResponseRecorder) string { return apiErrOf(rec).Code }
 
 	// newChunkedJavaForm builds a non-trailer signed chunked PutObject request that
 	// mirrors the AWS Java SDK v2 wire form: the checksum value sits in the header
@@ -131,8 +132,12 @@ func testAPIPutObjectChunkedChecksum(obj ObjectLayer, instanceType, bucketName s
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: chunked+wrong CRC32: expected 400, got %d", instanceType, rec.Code)
 		}
-		if code := apiCode(rec); code != "XAmzContentChecksumMismatch" {
-			t.Fatalf("%s: chunked+wrong CRC32: want XAmzContentChecksumMismatch, got %q", instanceType, code)
+		gotErr := apiErrOf(rec)
+		if gotErr.Code != "XAmzContentChecksumMismatch" {
+			t.Fatalf("%s: chunked+wrong CRC32: want XAmzContentChecksumMismatch, got %q", instanceType, gotErr.Code)
+		}
+		if gotErr.Message != "The CRC32 you specified did not match the calculated checksum." {
+			t.Fatalf("%s: chunked+wrong CRC32: message = %q, want S3 algorithm-specific wording", instanceType, gotErr.Message)
 		}
 	}
 }
