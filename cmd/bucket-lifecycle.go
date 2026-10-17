@@ -37,6 +37,7 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -631,6 +632,19 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		return err
 	}
 
+	// ILM-created delete markers and version purges must replicate like
+	// API-created ones: evaluate the delete replication decision while
+	// deleting so the version carries replication state, and queue
+	// replication below.
+	opts.SetEvalMetadataFn(func(goi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
+		return checkReplicateDelete(ctx, oi.Bucket, ObjectToDelete{
+			ObjectV: ObjectV{
+				ObjectName: goi.Name,
+				VersionID:  opts.VersionID,
+			},
+		}, *goi, opts, gerr), nil
+	})
+
 	// Delete remote object from warm-tier
 	err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
 	if err == nil {
@@ -642,8 +656,32 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	}
 
 	// Now, delete object from hot-tier namespace
-	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
+	delInfo, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
+	if err != nil {
 		return err
+	}
+
+	// Queue replication of the ILM-created delete marker or version purge,
+	// mirroring what the DELETE handler does for API-originated deletes.
+	if delInfo.ReplicationStatus == replication.Pending || delInfo.VersionPurgeStatus == replication.VersionPurgePending {
+		dmVersionID, versionID := "", ""
+		if delInfo.DeleteMarker && delInfo.VersionPurgeStatus.Empty() {
+			dmVersionID = delInfo.VersionID
+		} else {
+			versionID = delInfo.VersionID
+		}
+		scheduleReplicationDelete(ctx, DeletedObjectReplicationInfo{
+			DeletedObject: DeletedObject{
+				ObjectName:            delInfo.Name,
+				VersionID:             versionID,
+				DeleteMarkerVersionID: dmVersionID,
+				DeleteMarkerMTime:     DeleteMarkerMTime{delInfo.ModTime},
+				DeleteMarker:          delInfo.DeleteMarker,
+				ReplicationState:      delInfo.ReplicationState(),
+			},
+			Bucket:    oi.Bucket,
+			EventType: ReplicateILMDelete,
+		}, objectAPI)
 	}
 
 	// Send audit for the lifecycle delete operation
