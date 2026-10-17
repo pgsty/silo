@@ -2369,7 +2369,12 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 	if err == nil || isErrBucketNotFound(err) {
 		// If site replication is configured, hold on to deleted bucket state until sites sync
 		if opts.SRDeleteOp == MarkDelete {
-			z.s3Peer.MakeBucket(context.Background(), pathJoin(minioMetaBucket, bucketMetaPrefix, deletedBucketsPrefix, bucket), MakeBucketOptions{})
+			tombstone := pathJoin(minioMetaBucket, bucketMetaPrefix, deletedBucketsPrefix, bucket)
+			// Re-deleting an already deleted bucket must record a fresh
+			// deletion time; MakeVol would silently keep the stale tombstone
+			// and make the recorded deletion look older than it is.
+			z.s3Peer.DeleteBucket(context.Background(), tombstone, DeleteBucketOptions{})
+			z.s3Peer.MakeBucket(context.Background(), tombstone, MakeBucketOptions{})
 		}
 	}
 
