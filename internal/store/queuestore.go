@@ -70,6 +70,16 @@ func NewQueueStore[I any](directory string, limit uint64, ext string) *QueueStor
 	}
 }
 
+// SetLimit updates the queue capacity without discarding pending items.
+func (store *QueueStore[_]) SetLimit(limit uint64) {
+	if limit == 0 {
+		limit = defaultLimit
+	}
+	store.Lock()
+	defer store.Unlock()
+	store.entryLimit = limit
+}
+
 // Open - Creates the directory if not present.
 func (store *QueueStore[_]) Open() error {
 	store.Lock()

@@ -276,7 +276,135 @@ func FetchEnabledTargets(ctx context.Context, cfg config.Config, transport *http
 			}
 		}
 	}
+	for _, t := range targetList.Targets() {
+		if webhook, ok := t.(*target.WebhookTarget); ok {
+			webhook.Start()
+		}
+	}
 	return targetList, nil
+}
+
+// TestWebhookTargets validates only changed targets and rejects queue moves before
+// the admin API persists settings. Unchanged targets retain their running resources.
+func TestWebhookTargets(ctx context.Context, cfg config.Config, list *event.TargetList, transport *http.Transport) error {
+	if err := checkValidNotificationKeysForSubSys(config.NotifyWebhookSubSys, cfg[config.NotifyWebhookSubSys]); err != nil {
+		return err
+	}
+	args, err := GetNotifyWebhook(cfg[config.NotifyWebhookSubSys], transport)
+	if err != nil {
+		return err
+	}
+	current := list.TargetMap()
+	for id, arg := range args {
+		tid := event.TargetID{ID: id, Name: "webhook"}
+		liveTarget, exists := current[tid]
+		live, ok := liveTarget.(*target.WebhookTarget)
+		if exists && !ok {
+			return fmt.Errorf("target %v already exists", tid)
+		}
+		if ok {
+			if live.Args().Equal(arg) {
+				continue
+			}
+			if err := live.CheckUpdate(arg); err != nil {
+				return err
+			}
+		}
+		t, err := target.NewWebhookTarget(ctx, id, arg, logOnceIf, transport)
+		if err != nil {
+			return err
+		}
+		_, err = t.IsActive()
+		t.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UpdateWebhookTargets prepares changed IDs before committing. Preparation and
+// registration errors leave the previous settings and targets intact.
+// The caller serializes reloads and shutdown; in-flight POSTs retain their client.
+func UpdateWebhookTargets(ctx context.Context, cfg config.Config, list *event.TargetList, transport *http.Transport) error {
+	if err := checkValidNotificationKeysForSubSys(config.NotifyWebhookSubSys, cfg[config.NotifyWebhookSubSys]); err != nil {
+		return err
+	}
+	args, err := GetNotifyWebhook(cfg[config.NotifyWebhookSubSys], transport)
+	if err != nil {
+		return err
+	}
+	current := list.TargetMap()
+	type update struct {
+		live *target.WebhookTarget
+		args target.WebhookArgs
+	}
+	var updates []update
+	var added []*target.WebhookTarget
+	committed := false
+	defer func() {
+		if !committed {
+			for _, t := range added {
+				t.Close()
+			}
+		}
+	}()
+	for id, arg := range args {
+		tid := event.TargetID{ID: id, Name: "webhook"}
+		live, exists := current[tid]
+		webhook, ok := live.(*target.WebhookTarget)
+		if exists && !ok {
+			return fmt.Errorf("target %v already exists", tid)
+		}
+		if ok {
+			if webhook.Args().Equal(arg) {
+				continue
+			}
+			if err := webhook.CheckUpdate(arg); err != nil {
+				return err
+			}
+		}
+		if arg.ClientCert != "" && arg.ClientKey != "" {
+			if _, err := tls.LoadX509KeyPair(arg.ClientCert, arg.ClientKey); err != nil {
+				return err
+			}
+		}
+		if ok {
+			updates = append(updates, update{live: webhook, args: arg})
+			continue
+		}
+		t, err := target.NewWebhookTarget(ctx, id, arg, logOnceIf, transport)
+		if err != nil {
+			return err
+		}
+		added = append(added, t)
+	}
+	// Add checks the whole batch before installing anything. No fallible work
+	// remains after registration, including updates to existing targets.
+	registrations := make([]event.Target, len(added))
+	for i, t := range added {
+		registrations[i] = t
+	}
+	if err := list.Add(registrations...); err != nil {
+		return err
+	}
+	committed = true
+	for _, update := range updates {
+		update.live.Update(update.args, transport)
+	}
+	for _, t := range added {
+		t.Start()
+	}
+	removed := event.NewTargetIDSet()
+	for id, t := range current {
+		if _, ok := t.(*target.WebhookTarget); ok {
+			if _, enabled := args[id.ID]; !enabled {
+				removed[id] = struct{}{}
+			}
+		}
+	}
+	list.Remove(removed)
+	return nil
 }
 
 // DefaultNotificationKVS - default notification list of kvs.

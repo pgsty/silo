@@ -418,6 +418,16 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 	}
 
 	if config.NotifySubSystems.Contains(subSys) {
+		if subSys == config.NotifyWebhookSubSys && globalEventNotifier != nil {
+			// Validate stored values with env disabled, then check the effective
+			// settings against running targets. An env queue override is not a move.
+			if _, err := notify.GetNotifyWebhook(s[subSys], NewHTTPTransport()); err != nil {
+				return err
+			}
+			env.SetEnvOn()
+			defer env.SetEnvOff()
+			return globalEventNotifier.testWebhookTargets(ctx, s)
+		}
 		if err := notify.TestSubSysNotificationTargets(ctx, s, subSys, NewHTTPTransport()); err != nil {
 			return err
 		}
@@ -527,7 +537,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	transport := NewHTTPTransport()
 
 	bootstrapTraceMsg("initialize the event notification targets")
-	globalNotifyTargetList, err = notify.FetchEnabledTargets(GlobalContext, s, transport)
+	err = globalEventNotifier.loadTargets(GlobalContext, s, transport)
 	if err != nil {
 		configLogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
@@ -553,6 +563,12 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 	var errs []error
 	setDriveCounts := objAPI.SetDriveCounts()
 	switch subSys {
+	case config.NotifyWebhookSubSys:
+		if globalEventNotifier != nil {
+			if err := globalEventNotifier.reloadWebhookTargets(s); err != nil {
+				return fmt.Errorf("Unable to update webhook notification targets: %w", err)
+			}
+		}
 	case config.APISubSys:
 		apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
 		if err != nil {
@@ -721,13 +737,13 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 // applyDynamicConfig will apply dynamic config values.
 // Dynamic systems should be in config.SubSystemsDynamic as well.
 func applyDynamicConfig(ctx context.Context, objAPI ObjectLayer, s config.Config) error {
+	var errs []error
 	for subSys := range config.SubSystemsDynamic {
-		err := applyDynamicConfigForSubSys(ctx, objAPI, s, subSys)
-		if err != nil {
-			return err
+		if err := applyDynamicConfigForSubSys(ctx, objAPI, s, subSys); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Help - return sub-system level help
