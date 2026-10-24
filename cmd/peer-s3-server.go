@@ -239,6 +239,16 @@ func getBucketInfoLocal(ctx context.Context, bucket string, opts BucketOptions) 
 				return err
 			}
 
+			if opts.Deleted {
+				// Report a tombstone that outlives the bucket volume, matching
+				// listBucketsLocal, so a deletion that raced a re-creation
+				// stays visible to site replication.
+				if dvi, derr := localDrives[index].StatVol(ctx, pathJoin(minioMetaBucket, bucketMetaPrefix, deletedBucketsPrefix, bucket)); derr == nil {
+					bucketsInfo[index] = BucketInfo{Name: bucket, Created: volInfo.Created, Deleted: dvi.Created}
+					return nil
+				}
+			}
+
 			bucketsInfo[index] = BucketInfo{Name: bucket, Created: volInfo.Created}
 			return nil
 		}, index)

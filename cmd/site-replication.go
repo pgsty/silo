@@ -827,6 +827,12 @@ func (c *SiteReplicationSys) MakeBucketHook(ctx context.Context, bucket string, 
 	if createdAt.IsZero() {
 		createdAt = opts.CreatedAt
 	}
+	if createdAt.IsZero() {
+		// A fresh creation must carry a usable lineage: peers reject makes
+		// with unknown lineage against a recorded deletion, and a zero
+		// timestamp would make them fabricate their own creation time.
+		createdAt = UTCNow()
+	}
 	optsMap["createdAt"] = createdAt.UTC().Format(time.RFC3339Nano)
 	opts.CreatedAt = createdAt
 
@@ -929,11 +935,29 @@ func enablePeerBucketVersioning(meta *BucketMetadata, lockEnabled bool) error {
 	return nil
 }
 
+// errSRStaleBucketCreate reports a bucket creation rejected because the local
+// site recorded a deletion more recent than the creation time the request
+// carries. Replaying or racing such a creation must not resurrect a deleted
+// bucket on any replicated site.
+var errSRStaleBucketCreate = errors.New("stale bucket creation: bucket was deleted after the creation time carried by the request")
+
 // PeerBucketMakeWithVersioningHandler - creates bucket and enables versioning.
 func (c *SiteReplicationSys) PeerBucketMakeWithVersioningHandler(ctx context.Context, bucket string, opts MakeBucketOptions) error {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
 		return errServerNotInitialized
+	}
+
+	// Refuse creations that would resurrect a bucket deleted more recently
+	// than the creation time they carry: replicated deletes leave a tombstone
+	// and stale makes (retries, races, heal snapshots) must lose to it. A
+	// genuinely newer re-creation wins and clears the obsolete tombstone.
+	if bi, gerr := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{Deleted: true, NoMetadata: true}); gerr == nil && !bi.Deleted.IsZero() {
+		if opts.CreatedAt.IsZero() || bi.Deleted.After(opts.CreatedAt) {
+			return wrapSRErr(c.annotateErr(makeBucketWithVersion, fmt.Errorf("%w: %s deleted at %s after %s",
+				errSRStaleBucketCreate, bucket, bi.Deleted.UTC().Format(time.RFC3339Nano), opts.CreatedAt.UTC().Format(time.RFC3339Nano))))
+		}
+		c.purgeDeletedBucket(ctx, objAPI, bucket)
 	}
 
 	err := objAPI.MakeBucket(ctx, bucket, opts)
