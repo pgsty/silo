@@ -84,6 +84,101 @@ func (target ExampleTarget) FlushQueueStore() error {
 	return nil
 }
 
+type blockingSaveTarget struct {
+	ExampleTarget
+	started chan struct{}
+	release chan struct{}
+	closed  chan struct{}
+}
+
+func (target *blockingSaveTarget) Save(Event) error {
+	close(target.started)
+	<-target.release
+	return nil
+}
+
+func (target *blockingSaveTarget) Close() error {
+	close(target.closed)
+	return nil
+}
+
+func TestTargetListSlowSaveDoesNotBlockRegistration(t *testing.T) {
+	list := NewTargetList(t.Context())
+	target := &blockingSaveTarget{
+		ExampleTarget: ExampleTarget{id: TargetID{ID: "live", Name: "webhook"}},
+		started:       make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{}),
+	}
+	defer close(target.release)
+	if err := list.Add(target); err != nil {
+		t.Fatal(err)
+	}
+	go list.Send(Event{}, NewTargetIDSet(target.ID()), true)
+	<-target.started
+	done := make(chan error, 1)
+	go func() { done <- list.Add(&ExampleTarget{id: TargetID{ID: "second", Name: "webhook"}}) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("registration blocked behind a network delivery")
+	}
+}
+
+type blockingCloseTarget struct {
+	ExampleTarget
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (target *blockingCloseTarget) Close() error {
+	close(target.started)
+	<-target.release
+	return nil
+}
+
+func TestTargetListRemoveClosesOutsideLock(t *testing.T) {
+	list := NewTargetList(t.Context())
+	release := make(chan struct{})
+	defer close(release)
+	a := &blockingCloseTarget{ExampleTarget: ExampleTarget{id: TargetID{ID: "a", Name: "webhook"}}, started: make(chan struct{}), release: release}
+	b := &blockingCloseTarget{ExampleTarget: ExampleTarget{id: TargetID{ID: "b", Name: "webhook"}}, started: make(chan struct{}), release: release}
+	if err := list.Add(a, b); err != nil {
+		t.Fatal(err)
+	}
+	go list.Remove(NewTargetIDSet(a.ID(), b.ID()))
+	for _, started := range []chan struct{}{a.started, b.started} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("target shutdown was serialized")
+		}
+	}
+	done := make(chan struct{})
+	go func() { list.Stats(); list.List(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("closing a target blocked listing and metrics")
+	}
+}
+
+func TestTargetListAddBatchIsAtomic(t *testing.T) {
+	list := NewTargetList(t.Context())
+	first := &ExampleTarget{id: TargetID{ID: "first", Name: "webhook"}}
+	if err := list.Add(first); err != nil {
+		t.Fatal(err)
+	}
+	second := &ExampleTarget{id: TargetID{ID: "second", Name: "webhook"}}
+	if err := list.Add(second, first); err == nil {
+		t.Fatal("duplicate target accepted")
+	}
+	if list.Exists(second.ID()) {
+		t.Fatal("failed batch registered some targets")
+	}
+}
+
 func TestTargetListAdd(t *testing.T) {
 	targetListCase1 := NewTargetList(t.Context())
 

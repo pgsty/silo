@@ -20,23 +20,30 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"runtime"
 	"strings"
 	"sync"
 
+	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/notify"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/pubsub"
+	"github.com/pgsty/silo-pkg/v3/env"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
 // EventNotifier - notifies external systems about events in MinIO.
 type EventNotifier struct {
 	sync.RWMutex
-	targetList     *event.TargetList
-	bucketRulesMap map[string]event.RulesMap
+	targetReloadMu     sync.Mutex
+	targetsInitialized bool
+	initialTargets     *event.TargetList
+	targetList         *event.TargetList
+	bucketRulesMap     map[string]event.RulesMap
 }
 
 // NewEventNotifier - creates new event notification object.
@@ -91,15 +98,63 @@ func (evnot *EventNotifier) Targets() []event.Target {
 
 // InitBucketTargets - initializes event notification system from notification.xml of all buckets.
 func (evnot *EventNotifier) InitBucketTargets(ctx context.Context, objAPI ObjectLayer) error {
+	evnot.targetReloadMu.Lock()
+	defer evnot.targetReloadMu.Unlock()
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
 
-	if err := evnot.targetList.Add(globalNotifyTargetList.Targets()...); err != nil {
+	if evnot.initialTargets == nil {
+		return errServerNotInitialized
+	}
+	if err := evnot.targetList.Add(evnot.initialTargets.Targets()...); err != nil {
 		return err
 	}
+	evnot.initialTargets = nil
 	evnot.targetList = evnot.targetList.Init(runtime.GOMAXPROCS(0)) // TODO: make this configurable (y4m4)
+	evnot.targetsInitialized = true
 	return nil
+}
+
+func (evnot *EventNotifier) loadTargets(ctx context.Context, cfg config.Config, transport *http.Transport) error {
+	defer env.LockSetEnv()()
+	evnot.targetReloadMu.Lock()
+	defer evnot.targetReloadMu.Unlock()
+	var err error
+	evnot.initialTargets, err = notify.FetchEnabledTargets(ctx, cfg, transport)
+	return err
+}
+
+func (evnot *EventNotifier) testWebhookTargets(ctx context.Context, cfg config.Config) error {
+	evnot.targetReloadMu.Lock()
+	defer evnot.targetReloadMu.Unlock()
+	list := evnot.targetList
+	if !evnot.targetsInitialized {
+		list = evnot.initialTargets
+	}
+	if list == nil {
+		return errServerNotInitialized
+	}
+	return notify.TestWebhookTargets(ctx, cfg, list, NewHTTPTransport())
+}
+
+func (evnot *EventNotifier) reloadWebhookTargets(cfg config.Config) error {
+	// Validation disables env merging globally. Wait until it restores the
+	// environment before resolving effective settings for a reload.
+	defer env.LockSetEnv()()
+	evnot.targetReloadMu.Lock()
+	defer evnot.targetReloadMu.Unlock()
+	list := evnot.targetList
+	if !evnot.targetsInitialized {
+		// Reload the bootstrap list too: admin requests can arrive before the
+		// notification workers start. InitBucketTargets installs this same list.
+		list = evnot.initialTargets
+	}
+	if list == nil {
+		return errServerNotInitialized
+	}
+	// Targets must outlive the peer RPC/request context used to apply config.
+	return notify.UpdateWebhookTargets(GlobalContext, cfg, list, NewHTTPTransport())
 }
 
 // AddRulesMap - adds rules map for bucket name.
@@ -127,14 +182,22 @@ func (evnot *EventNotifier) RemoveNotification(bucketName string) {
 
 // RemoveAllBucketTargets - closes and removes all notification targets.
 func (evnot *EventNotifier) RemoveAllBucketTargets() {
+	evnot.targetReloadMu.Lock()
+	defer evnot.targetReloadMu.Unlock()
 	evnot.Lock()
 	defer evnot.Unlock()
 
+	list := evnot.targetList
+	if !evnot.targetsInitialized && evnot.initialTargets != nil {
+		list = evnot.initialTargets
+	}
 	targetIDSet := event.NewTargetIDSet()
-	for k := range evnot.targetList.TargetMap() {
+	for k := range list.TargetMap() {
 		targetIDSet[k] = struct{}{}
 	}
-	evnot.targetList.Remove(targetIDSet)
+	list.Remove(targetIDSet)
+	evnot.targetsInitialized = false
+	evnot.initialTargets = nil
 }
 
 // Send - sends the event to all registered notification targets

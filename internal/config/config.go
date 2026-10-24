@@ -189,6 +189,7 @@ var SubSystemsDynamic = set.CreateStringSet(
 	LoggerWebhookSubSys,
 	AuditWebhookSubSys,
 	AuditKafkaSubSys,
+	NotifyWebhookSubSys,
 	StorageClassSubSys,
 	ILMSubSys,
 	BatchSubSys,
