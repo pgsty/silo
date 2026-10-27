@@ -25,16 +25,357 @@ import (
 	"go/token"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/event/target"
 )
+
+func TestWebhookReloadDoesNotWaitForPOST(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(strconv.FormatBool(queued), func(t *testing.T) {
+			started, release := make(chan struct{}, 1), make(chan struct{})
+			var once sync.Once
+			finish := func() { once.Do(func() { close(release) }) }
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/slow" {
+					started <- struct{}{}
+					select {
+					case <-release:
+					case <-r.Context().Done():
+					}
+				}
+			}))
+			defer server.Close()
+			defer finish()
+			queueDir := ""
+			if queued {
+				queueDir = t.TempDir()
+			}
+			cfg := webhookReloadConfig(server.URL+"/slow", queueDir)
+			list := event.NewTargetList(t.Context())
+			transport := http.DefaultTransport.(*http.Transport)
+			if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+				t.Fatal(err)
+			}
+			id := event.TargetID{ID: "live", Name: "webhook"}
+			defer func() { finish(); list.Remove(event.NewTargetIDSet(id)) }()
+			go list.Send(event.Event{EventName: event.ObjectCreatedPut}, event.NewTargetIDSet(id), true)
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("slow delivery did not start")
+			}
+			kvs := cfg[config.NotifyWebhookSubSys]["live"]
+			kvs.Set(target.WebhookEndpoint, server.URL+"/new")
+			done := make(chan error, 1)
+			go func() { done <- UpdateWebhookTargets(t.Context(), cfg, list, transport) }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Error("reload blocked behind an in-flight POST")
+			}
+		})
+	}
+}
+
+func TestWebhookStartupDefersCertificateErrors(t *testing.T) {
+	cfg := webhookReloadConfig("http://127.0.0.1:1", "")
+	kvs := cfg[config.NotifyWebhookSubSys]["live"]
+	cfg[config.NotifyWebhookSubSys]["other"] = kvs.Clone()
+	kvs.Set(target.WebhookClientCert, filepath.Join(t.TempDir(), "missing.crt"))
+	kvs.Set(target.WebhookClientKey, filepath.Join(t.TempDir(), "missing.key"))
+	list, err := FetchEnabledTargets(t.Context(), cfg, &http.Transport{TLSClientConfig: &tls.Config{}})
+	if err != nil {
+		t.Fatalf("one unreadable client certificate disabled all notification targets: %v", err)
+	}
+	defer list.Remove(event.NewTargetIDSet(list.List()...))
+	if len(list.List()) != 2 {
+		t.Fatal("unreadable client certificate prevented other targets from registering")
+	}
+}
+
+func TestWebhookReloadSkipsUnchangedQueue(t *testing.T) {
+	queueDir := filepath.Join(t.TempDir(), "queue")
+	cfg := webhookReloadConfig("http://127.0.0.1:1", queueDir)
+	list := event.NewTargetList(t.Context())
+	transport := http.DefaultTransport.(*http.Transport)
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatal(err)
+	}
+	defer list.Remove(event.NewTargetIDSet(list.List()...))
+	if err := os.Rename(queueDir, queueDir+"-saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queueDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatalf("unchanged webhook reopened its queue directory: %v", err)
+	}
+	if err := TestWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatalf("validation reopened an unchanged webhook queue: %v", err)
+	}
+}
+
+func TestWebhookReloadRejectsQueueDirectoryChange(t *testing.T) {
+	cfg := webhookReloadConfig("http://127.0.0.1:1", t.TempDir())
+	list := event.NewTargetList(t.Context())
+	transport := http.DefaultTransport.(*http.Transport)
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatal(err)
+	}
+	defer list.Remove(event.NewTargetIDSet(list.List()...))
+	live := list.Targets()[0]
+	if err := live.Save(event.Event{EventName: event.ObjectCreatedPut}); err != nil {
+		t.Fatal(err)
+	}
+	queue := live.Store()
+	kvs := cfg[config.NotifyWebhookSubSys]["live"]
+	kvs.Set(target.WebhookQueueDir, t.TempDir())
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err == nil {
+		t.Error("queue_dir change accepted with pending events in the old directory")
+	}
+	if live.Store() != queue || queue.Len() != 1 {
+		t.Error("reload abandoned the pending queue")
+	}
+}
+
+type conflictingWebhookTarget struct {
+	event.Target
+	id event.TargetID
+}
+
+func (t conflictingWebhookTarget) ID() event.TargetID { return t.id }
+
+func TestWebhookReloadRegistrationFailureKeepsPreviousConfig(t *testing.T) {
+	transport := http.DefaultTransport.(*http.Transport)
+	cfg := webhookReloadConfig("http://127.0.0.1:1", "")
+	kvs := cfg[config.NotifyWebhookSubSys]["live"]
+	kvs.Set(target.WebhookAuthToken, "first")
+	cfg[config.NotifyWebhookSubSys]["obsolete"] = kvs.Clone()
+	list := event.NewTargetList(t.Context())
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatal(err)
+	}
+	live := list.TargetMap()[event.TargetID{ID: "live", Name: "webhook"}].(*target.WebhookTarget)
+	conflict := conflictingWebhookTarget{Target: live, id: event.TargetID{ID: "extra", Name: "webhook"}}
+	if err := list.Add(conflict); err != nil {
+		t.Fatal(err)
+	}
+	defer list.Remove(event.NewTargetIDSet(list.List()...))
+	delete(cfg[config.NotifyWebhookSubSys], "obsolete")
+	kvs.Set(target.WebhookAuthToken, "second")
+	cfg[config.NotifyWebhookSubSys]["extra"] = kvs.Clone()
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err == nil {
+		t.Fatal("duplicate target accepted")
+	}
+	if live.Args().AuthToken != "first" {
+		t.Fatal("failed reload committed an in-place update")
+	}
+	if !list.Exists(event.TargetID{ID: "obsolete", Name: "webhook"}) {
+		t.Fatal("failed reload removed a previous target")
+	}
+}
+
+func TestWebhookCloseCancelsSlowPOST(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(strconv.FormatBool(queued), func(t *testing.T) {
+			started, release := make(chan struct{}, 1), make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				started <- struct{}{}
+				<-release
+			}))
+			defer server.Close()
+			defer close(release)
+			queueDir := ""
+			if queued {
+				queueDir = t.TempDir()
+			}
+			cfg := webhookReloadConfig(server.URL, queueDir)
+			list := event.NewTargetList(t.Context())
+			if err := UpdateWebhookTargets(t.Context(), cfg, list, http.DefaultTransport.(*http.Transport)); err != nil {
+				t.Fatal(err)
+			}
+			id := event.TargetID{ID: "live", Name: "webhook"}
+			go list.Send(event.Event{EventName: event.ObjectCreatedPut}, event.NewTargetIDSet(id), true)
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("slow delivery did not start")
+			}
+			done := make(chan struct{})
+			go func() { list.Remove(event.NewTargetIDSet(id)); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("shutdown waited for the slow POST timeout")
+			}
+		})
+	}
+}
+
+func webhookReloadConfig(endpoint, queueDir string) config.Config {
+	cfg := make(config.Config)
+	for subSys, defaults := range DefaultNotificationKVS {
+		cfg[subSys] = map[string]config.KVS{config.Default: defaults.Clone()}
+	}
+	kvs := DefaultWebhookKVS.Clone()
+	kvs.Set(config.Enable, config.EnableOn)
+	kvs.Set(target.WebhookEndpoint, endpoint)
+	kvs.Set(target.WebhookQueueDir, queueDir)
+	kvs.Set(target.WebhookQueueLimit, "2")
+	cfg[config.NotifyWebhookSubSys] = map[string]config.KVS{"live": kvs}
+	return cfg
+}
+
+func TestWebhookValidationDoesNotReplay(t *testing.T) {
+	received := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- struct{}{}
+	}))
+	defer server.Close()
+	transport := http.DefaultTransport.(*http.Transport)
+	cfg := webhookReloadConfig(server.URL, t.TempDir())
+	targets, err := fetchSubSysTargets(t.Context(), cfg, config.NotifyWebhookSubSys, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := targets[0].Save(event.Event{EventName: event.ObjectCreatedPut}); err != nil {
+		t.Fatal(err)
+	}
+	if err := targets[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := TestSubSysNotificationTargets(t.Context(), cfg, config.NotifyWebhookSubSys, transport); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-received:
+		t.Fatal("config validation replayed an event from the live queue")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestUpdateWebhookTargetsPreservesQueue(t *testing.T) {
+	inFlight := make(chan struct{}, 1)
+	received := make(chan string, 4)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	defer finish()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/old" {
+			inFlight <- struct{}{}
+			<-release
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		received <- r.URL.Path
+	}))
+	defer server.Close()
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{}
+	cfg := webhookReloadConfig(server.URL+"/old", t.TempDir())
+	list, err := FetchEnabledTargets(t.Context(), cfg, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := event.TargetID{ID: "live", Name: "webhook"}
+	defer func() {
+		finish()
+		list.Remove(event.NewTargetIDSet(id))
+	}()
+	live := list.TargetMap()[id]
+	queue := live.Store()
+	if err := live.Save(event.Event{EventName: event.ObjectCreatedPut}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inFlight:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued delivery did not start")
+	}
+	// An event queued after the replacement's queue snapshot must survive too.
+	kvs := cfg[config.NotifyWebhookSubSys]["live"]
+	kvs.Set(target.WebhookEndpoint, server.URL+"/new")
+	kvs.Set(target.WebhookQueueLimit, "3")
+	updated := make(chan error, 1)
+	go func() { updated <- UpdateWebhookTargets(t.Context(), cfg, list, transport) }()
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reload waited for an in-flight delivery")
+	}
+	if err := live.Save(event.Event{EventName: event.ObjectCreatedPut}); err != nil {
+		t.Fatal(err)
+	}
+	finish()
+	if list.TargetMap()[id] != live || live.Store() != queue {
+		t.Fatal("reload replaced the target identity or its live queue")
+	}
+	for range 2 {
+		select {
+		case path := <-received:
+			if path != "/new" {
+				t.Fatalf("event sent to %q after reload", path)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("pending event was lost during reload")
+		}
+	}
+	// Reapplying the same config must keep the working sender and queue.
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-received:
+		t.Fatal("reload duplicated a pending event")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestUpdateWebhookTargetsRejectsInvalidReplacement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	transport := http.DefaultTransport.(*http.Transport)
+	cfg := webhookReloadConfig(server.URL, "")
+	list := event.NewTargetList(t.Context())
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatal(err)
+	}
+	id := event.TargetID{ID: "live", Name: "webhook"}
+	defer list.Remove(event.NewTargetIDSet(id))
+	live := list.TargetMap()[id]
+	kvs := cfg[config.NotifyWebhookSubSys]["live"]
+	kvs.Set(target.WebhookClientCert, filepath.Join(t.TempDir(), "missing.crt"))
+	kvs.Set(target.WebhookClientKey, filepath.Join(t.TempDir(), "missing.key"))
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err == nil {
+		t.Fatal("invalid TLS files were accepted")
+	}
+	if list.TargetMap()[id] != live {
+		t.Fatal("invalid replacement changed the active target")
+	}
+	if err := live.Save(event.Event{EventName: event.ObjectCreatedPut}); err != nil {
+		t.Fatalf("invalid replacement interrupted the working webhook: %v", err)
+	}
+}
 
 // Test fixtures. Every value here is deliberately non-functional: the paths do
 // not exist and the credentials are placeholders, so a leaked fixture is inert.

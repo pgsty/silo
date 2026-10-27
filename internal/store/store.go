@@ -181,9 +181,13 @@ func sendItems(target Target, keyCh <-chan Key, doneCh <-chan struct{}, logger l
 }
 
 // StreamItems reads the keys from the store and replays the corresponding item to the target.
-func StreamItems[I any](store Store[I], target Target, doneCh <-chan struct{}, logger logger) {
+// The returned channel closes when the sender has stopped.
+func StreamItems[I any](store Store[I], target Target, doneCh <-chan struct{}, logger logger) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		keyCh := replayItems(store, doneCh, logger, target.Name())
 		sendItems(target, keyCh, doneCh, logger)
 	}()
+	return done
 }

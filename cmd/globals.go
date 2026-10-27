@@ -229,7 +229,6 @@ var (
 	globalNotificationSys *NotificationSys
 
 	globalEventNotifier    *EventNotifier
-	globalNotifyTargetList *event.TargetList
 	globalLambdaTargetList *levent.TargetList
 
 	globalBucketMetadataSys *BucketMetadataSys
