@@ -132,7 +132,7 @@ func TestPoolsMigrationCleanupRechecksSource(t *testing.T) {
 				_, err := z.serverPools[1].DeleteObject(t.Context(), bucket, oi.Name, ObjectOptions{VersionID: nullVersionID})
 				mustIAM(t, err)
 			}
-			err := z.removeMovedVersions(t.Context(), bucket, oi.Name, 0, snapshot)
+			err := z.removeMovedVersions(t.Context(), bucket, oi.Name, 0, snapshot, nil)
 			if change != "delete-uuid" && err == nil {
 				t.Fatal("cleanup accepted changed or uncertain state")
 			}

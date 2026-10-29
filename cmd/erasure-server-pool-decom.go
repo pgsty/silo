@@ -796,9 +796,11 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 	}
 
 	for setIdx, set := range pool.sets {
-		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
+		// filterLifecycle returns the action of an ILM deletion it queued
+		// for the version, which is then not moved, or NoneAction.
+		filterLifecycle := func(bucket, object string, fi FileInfo) lifecycle.Action {
 			if lc == nil {
-				return false
+				return lifecycle.NoneAction
 			}
 			versioned := vc != nil && vc.Versioned(object)
 			objInfo := fi.ToObjectInfo(bucket, object, versioned)
@@ -807,12 +809,18 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			switch {
 			case evt.Action.DeleteRestored(): // if restored copy has expired, delete it synchronously
 				applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
-				return false
+				return lifecycle.NoneAction
+			case evt.Action == lifecycle.DeleteAction && versioned:
+				// Expiring the latest version of a versioned bucket only puts
+				// a delete marker on top of it. The version itself survives as
+				// a noncurrent version and has to be moved like any other. The
+				// scanner applies the expiry once it lives in another pool.
+				return lifecycle.NoneAction
 			case evt.Action.Delete():
 				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Decom)
-				return true
+				return evt.Action
 			default:
-				return false
+				return lifecycle.NoneAction
 			}
 		}
 
@@ -833,11 +841,18 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			versionsSorter(fivs.Versions).reverse()
 
 			var decommissioned int
+			var expired []FileInfo
 			for _, version := range fivs.Versions {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionObject, idx, bi.Name, version.Name, version.VersionID)
 				// Apply lifecycle rules on the objects that are expired.
-				if filterLifecycle(bi.Name, version.Name, version) {
+				if action := filterLifecycle(bi.Name, version.Name, version); action.Delete() {
 					decommissioned++
+					if ilmDeletesVersionOnly(action) {
+						// Its source copy goes with those of the moved
+						// versions. A version that takes the whole object
+						// with it stays until the expiry deletes them all.
+						expired = append(expired, version)
+					}
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
@@ -981,7 +996,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// if all versions were decommissioned, then we can delete the object versions.
 			if decommissioned == len(fivs.Versions) {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionRemoveObject, idx, bi.Name, entry.name)
-				err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions)
+				err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions, expired)
 				stopFn(0, err)
 				auditLogDecom(ctx, "DecomDeleteObject", bi.Name, entry.name, "", err)
 				if err != nil {
@@ -1156,6 +1171,9 @@ func (z *erasureServerPools) checkAfterDecom(ctx context.Context, idx int) error
 				switch {
 				case evt.Action.DeleteRestored(): // if restored copy has expired,delete it synchronously
 					applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
+					return false
+				case evt.Action == lifecycle.DeleteAction && versioned:
+					// The version survives as noncurrent; it must have moved.
 					return false
 				case evt.Action.Delete():
 					globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Decom)
