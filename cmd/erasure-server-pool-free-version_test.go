@@ -254,3 +254,55 @@ func TestFreeVersionScannerLatestVersion(t *testing.T) {
 		t.Errorf("scanner queued %v for expiry, want %v", expired, want)
 	}
 }
+
+// ListObjectsV2 lists obj-01: its latest version is v2, not a delete marker.
+// obj-02 has no versions left.
+func TestFreeVersionListObjects(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	lo, err := f.z.ListObjectsV2(t.Context(), f.bucket, "", "", "", 100, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, oi := range lo.Objects {
+		got = append(got, oi.Name)
+	}
+	if want := []string{"obj-01"}; !slices.Equal(got, want) {
+		t.Errorf("ListObjectsV2: %v, want %v", got, want)
+	}
+}
+
+// The listing checks of the latest version skip the free version: obj-01 is
+// shown, obj-02 has nothing to show. Both the encoded metadata and the
+// decoded form, which the listing caches, are checked.
+func TestFreeVersionLatestDeleteMarker(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	for _, tc := range []struct {
+		object string
+		hidden bool
+	}{{"obj-01", false}, {"obj-02", true}} {
+		entry := metaCacheEntry{name: tc.object, metadata: f.xlMeta(0, tc.object)}
+		meta, _, err := isIndexedMetaV2(entry.metadata)
+		if err != nil || meta == nil {
+			t.Fatalf("%s: metadata is not indexed: %v", tc.object, err)
+		}
+		if got := meta.IsLatestDeleteMarker(); got != tc.hidden {
+			t.Errorf("%s: IsLatestDeleteMarker %v, want %v", tc.object, got, tc.hidden)
+		}
+		if got := meta.AllHidden(true); got != tc.hidden {
+			t.Errorf("%s: AllHidden(true) %v, want %v", tc.object, got, tc.hidden)
+		}
+		if got := meta.AllHidden(false); got != tc.hidden {
+			t.Errorf("%s: AllHidden(false) %v, want %v", tc.object, got, tc.hidden)
+		}
+		if got := entry.isLatestDeletemarker(); got != tc.hidden {
+			t.Errorf("%s: isLatestDeletemarker %v, want %v", tc.object, got, tc.hidden)
+		}
+		if _, err := entry.xlmeta(); err != nil {
+			t.Fatal(err)
+		}
+		if got := entry.isLatestDeletemarker(); got != tc.hidden {
+			t.Errorf("%s: isLatestDeletemarker of the decoded metadata %v, want %v", tc.object, got, tc.hidden)
+		}
+	}
+}

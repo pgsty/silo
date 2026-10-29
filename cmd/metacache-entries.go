@@ -177,14 +177,12 @@ func (e metaCacheEntry) isInDir(dir, separator string) bool {
 }
 
 // isLatestDeletemarker returns whether the latest version is a delete marker.
+// Free versions are not versions of the object and are skipped.
 // If metadata is NOT versioned false will always be returned.
 // If v2 and UNABLE to load metadata true will be returned.
 func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	if e.cached != nil {
-		if len(e.cached.versions) == 0 {
-			return true
-		}
-		return e.cached.versions[0].header.Type == DeleteType
+		return e.cached.isLatestDeleteMarker()
 	}
 	if !isXL2V1Format(e.metadata) {
 		return false
@@ -196,10 +194,10 @@ func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	}
 	// Fall back...
 	xlMeta, err := e.xlmeta()
-	if err != nil || len(xlMeta.versions) == 0 {
+	if err != nil {
 		return true
 	}
-	return xlMeta.versions[0].header.Type == DeleteType
+	return xlMeta.isLatestDeleteMarker()
 }
 
 // isAllFreeVersions returns if all objects are free versions.
