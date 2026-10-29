@@ -20,6 +20,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"testing"
@@ -73,21 +74,25 @@ func TestMergeXLV2LatestNullCrossParity(t *testing.T) {
 				}
 			}
 			input = append(input, make([][]xlMetaV2ShallowVersion, tt.empty)...)
-			for order, streams := range quorumVersionOrders(input) {
-				got := mergeXLV2Versions(tt.quorum, false, 1, streams...)
-				if tt.want < 0 {
-					if len(got) != 0 {
-						t.Fatalf("order %d: subquorum groups were combined: %v", order, got)
+			// Latest-only listing and listing all versions (decommission,
+			// rebalance) must select the same version.
+			for _, requested := range []int{1, 0} {
+				for order, streams := range quorumVersionOrders(input) {
+					got := mergeXLV2Versions(tt.quorum, false, requested, streams...)
+					if tt.want < 0 {
+						if len(got) != 0 {
+							t.Fatalf("requested %d, order %d: subquorum groups were combined: %v", requested, order, got)
+						}
+						continue
 					}
-					continue
-				}
-				if len(got) != 1 || got[0].header != versions[tt.want].header {
-					t.Fatalf("order %d: got %v, want group %d", order, got, tt.want)
-				}
-				xl := xlMetaV2{versions: got}
-				fi, err := xl.ToFileInfo("bucket", "object", "", false, true)
-				if err != nil || !fi.IsValid() || fi.Erasure.DataBlocks != int(versions[tt.want].header.EcM) {
-					t.Fatalf("order %d: selected metadata is invalid: %+v, %v", order, fi, err)
+					if len(got) != 1 || got[0].header != versions[tt.want].header {
+						t.Fatalf("requested %d, order %d: got %v, want group %d", requested, order, got, tt.want)
+					}
+					xl := xlMetaV2{versions: got}
+					fi, err := xl.ToFileInfo("bucket", "object", "", false, true)
+					if err != nil || !fi.IsValid() || fi.Erasure.DataBlocks != int(versions[tt.want].header.EcM) {
+						t.Fatalf("requested %d, order %d: selected metadata is invalid: %+v, %v", requested, order, fi, err)
+					}
 				}
 			}
 		})
@@ -97,15 +102,13 @@ func TestMergeXLV2LatestNullCrossParity(t *testing.T) {
 func TestMergeXLV2LatestNullCrossParityScope(t *testing.T) {
 	old := crossParityNullVersion(t, 100, 12, 4)
 	newer := crossParityNullVersion(t, 200, 8, 8)
-	for _, kind := range []string{"strict", "all-versions", "uuid", "delete", "free", "history", "legacy-modern-ec", "partial-ec"} {
+	for _, kind := range []string{"strict", "uuid", "delete", "free", "history", "legacy-modern-ec", "partial-ec"} {
 		t.Run(kind, func(t *testing.T) {
 			a, b := old, newer
-			strict, requested := false, 1
+			strict := false
 			switch kind {
 			case "strict":
 				strict = true
-			case "all-versions":
-				requested = 0
 			case "uuid":
 				a.header.VersionID, b.header.VersionID = [16]byte{1}, [16]byte{1}
 			case "delete":
@@ -140,8 +143,10 @@ func TestMergeXLV2LatestNullCrossParityScope(t *testing.T) {
 				history.header.VersionID = [16]byte{1}
 				input[0] = append(input[0], history)
 			}
-			if got := mergeXLV2Versions(8, strict, requested, input...); len(got) != 0 {
-				t.Fatalf("excluded input changed: %v", got)
+			for _, requested := range []int{1, 0} {
+				if got := mergeXLV2Versions(8, strict, requested, input...); len(got) != 0 {
+					t.Fatalf("requested %d: excluded input changed: %v", requested, got)
+				}
 			}
 		})
 	}
@@ -216,6 +221,61 @@ func TestListCrossParityReadableMajority(t *testing.T) {
 			}
 			if code, keys := nullQuorumListV2Keys(t, router, bucket); code != http.StatusOK || !slices.Equal(keys, []string{object}) {
 				t.Fatalf("LIST lost readable majority: %d %v", code, keys)
+			}
+		})
+	}
+}
+
+// Decommission and rebalance list every version. A readable degraded overwrite
+// must not be skipped there, or removing the pool loses it.
+func TestMigrationCrossParityReadableMajority(t *testing.T) {
+	z, bucket, _ := nullQuorumBackend(t)
+	set := z.serverPools[0].sets[0]
+	disks := set.getDisks()
+	const object = "object"
+	mtime := time.Now().UTC().Add(-time.Hour)
+	oldBody := bytes.Repeat([]byte{'a'}, 256<<10)
+	newBody := bytes.Repeat([]byte{'b'}, 256<<10)
+	nullQuorumPut(t, z, bucket, object, oldBody, ObjectOptions{MTime: mtime})
+	old := make([][]byte, len(disks))
+	for i, disk := range disks {
+		old[i] = mustReadNullQuorumMeta(t, disk, bucket, object)
+	}
+	nullQuorumPut(t, z, bucket, object, newBody, ObjectOptions{MTime: mtime.Add(time.Minute), MaxParity: true})
+	for i := 12; i < len(disks); i++ {
+		if err := disks[i].WriteAll(t.Context(), bucket, object+"/"+xlStorageFormatFile, old[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, kind := range []string{"rebalance", "decommission"} {
+		t.Run(kind, func(t *testing.T) {
+			var names []string
+			consume := func(entry metaCacheEntry) {
+				versions, err := entry.fileInfoVersions(bucket)
+				if err != nil || len(versions.Versions) != 1 || !versions.Versions[0].ModTime.Equal(mtime.Add(time.Minute)) {
+					t.Errorf("invalid migration metadata: %+v, %v", versions, err)
+					return
+				}
+				reader, err := set.GetObjectNInfo(t.Context(), bucket, entry.name, nil, nil, ObjectOptions{VersionID: nullVersionID, NoLock: true, NoDecryption: true})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				body, err := io.ReadAll(reader)
+				reader.Close()
+				if err != nil || !bytes.Equal(body, newBody) {
+					t.Errorf("migration could not read selected object data: %v", err)
+				}
+				names = append(names, entry.name)
+			}
+			var err error
+			if kind == "rebalance" {
+				err = set.listObjectsToRebalance(t.Context(), bucket, consume)
+			} else {
+				err = set.listObjectsToDecommission(t.Context(), decomBucketInfo{Name: bucket}, consume)
+			}
+			if err != nil || !slices.Equal(names, []string{object}) {
+				t.Fatalf("migration listing skipped a readable object: %v, %v", names, err)
 			}
 		})
 	}
