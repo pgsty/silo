@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	madmin "github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 )
@@ -183,6 +184,29 @@ func (f *freeVersionTest) stored(pool int, object string) []string {
 	return got
 }
 
+// versions labels the versions of a listing as "<object> <label>[ latest]".
+func (f *freeVersionTest) versions(objects []ObjectInfo) []string {
+	var got []string
+	for _, oi := range objects {
+		label := oi.Name + " " + f.label(FileInfo{VersionID: oi.VersionID, Deleted: oi.DeleteMarker})
+		if oi.IsLatest {
+			label += " latest"
+		}
+		got = append(got, label)
+	}
+	return got
+}
+
+// listVersions returns the versions ListObjectVersions lists in one page.
+func (f *freeVersionTest) listVersions() []string {
+	f.t.Helper()
+	lv, err := f.z.ListObjectVersions(f.t.Context(), f.bucket, "", "", "", "", 100)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return f.versions(lv.Objects)
+}
+
 // expiryQueue replaces the expiry workers with a queue for the test.
 func (f *freeVersionTest) expiryQueue() chan expiryOp {
 	queue := make(chan expiryOp, 100)
@@ -304,5 +328,199 @@ func TestFreeVersionLatestDeleteMarker(t *testing.T) {
 		if got := entry.isLatestDeletemarker(); got != tc.hidden {
 			t.Errorf("%s: isLatestDeletemarker of the decoded metadata %v, want %v", tc.object, got, tc.hidden)
 		}
+	}
+}
+
+// ListObjectVersions lists v2 as the latest version of obj-01 and no delete
+// markers. Keys with nothing but a free version have no versions to list and
+// do not take up a page. Walk returns the same versions.
+func TestFreeVersionListObjectVersions(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	f.deleteVersion(f.tiered("obj-00", "v1", UTCNow().AddDate(0, 0, -3)))
+	want := []string{"obj-01 v2 latest", "obj-01 v1"}
+	if got := f.listVersions(); !slices.Equal(got, want) {
+		t.Errorf("ListObjectVersions: %v, want %v", got, want)
+	}
+
+	results := make(chan itemOrErr[ObjectInfo], 100)
+	if err := f.z.Walk(t.Context(), f.bucket, "", results, WalkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var walked []ObjectInfo
+	for r := range results {
+		if r.Err != nil {
+			t.Fatal(r.Err)
+		}
+		walked = append(walked, r.Item)
+	}
+	if got, want := f.versions(walked), []string{"obj-01 v1", "obj-01 v2 latest"}; !slices.Equal(got, want) {
+		t.Errorf("Walk: %v, want %v", got, want)
+	}
+
+	// Page by page, one version a page.
+	for _, delimiter := range []string{"", "/"} {
+		var got []string
+		marker, versionMarker := "", ""
+		for range 10 {
+			lv, err := f.z.ListObjectVersions(t.Context(), f.bucket, "", marker, versionMarker, delimiter, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, f.versions(lv.Objects)...)
+			if !lv.IsTruncated {
+				break
+			}
+			marker, versionMarker = lv.NextMarker, lv.NextVersionIDMarker
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("ListObjectVersions page by page, delimiter %q: %v, want %v", delimiter, got, want)
+		}
+	}
+}
+
+// Healing still visits the free versions, so a free version lost on some
+// drives is healed and the scanner still finds it.
+func TestFreeVersionHealObjects(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	var got []string
+	err := f.z.HealObjects(t.Context(), f.bucket, "", madmin.HealOpts{Recursive: true}, func(_, object, versionID string, _ madmin.HealScanMode) error {
+		label := f.labels[versionID]
+		if label == "" {
+			label = "free"
+		}
+		got = append(got, object+" "+label)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	if want := []string{"obj-01 free", "obj-01 v1", "obj-01 v2", "obj-02 free"}; !slices.Equal(got, want) {
+		t.Errorf("healed versions %v, want %v", got, want)
+	}
+}
+
+// Decommission and rebalance do not move a free version: in another pool it
+// would be a delete marker that hides v2. Decommission removes the remote
+// object and the free version, as the scanner would before the pool is
+// removed. Rebalance leaves both to the scanner of the source pool.
+func TestFreeVersionDataMovement(t *testing.T) {
+	for _, kind := range []string{"decommission", "rebalance"} {
+		for _, rules := range []string{"", freeVersionNoncurrent} {
+			name := kind
+			if rules != "" {
+				name += "/noncurrent-expiry"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newFreeVersionTest(t, rules)
+				queue := f.expiryQueue()
+				if failed := migrationTestWalk(t, f.z, f.bucket, 0, kind); failed != 0 {
+					t.Fatalf("%d versions failed to move", failed)
+				}
+				if expired := f.expired(queue); slices.Contains(expired, "v2") {
+					t.Errorf("%s queued the latest version v2 for expiry: %v", kind, expired)
+				}
+
+				// v1 has been noncurrent for days; whether a move skips an
+				// expired version is out of scope here.
+				if got := f.stored(1, "obj-01"); len(got) == 0 || got[0] != "v2" || slices.Contains(got, "DM") {
+					t.Errorf("pool 1 holds %v of obj-01, want v2 on top and no delete marker", got)
+				}
+				if got := f.stored(1, "obj-02"); len(got) != 0 {
+					t.Errorf("pool 1 holds %v of obj-02, want nothing", got)
+				}
+				if body := migrationTestBody(t, f.z.GetObjectNInfo, f.bucket, "obj-01", ""); body != "obj-01 v2" {
+					t.Errorf("obj-01 reads %q, want %q", body, "obj-01 v2")
+				}
+				if got := f.listVersions(); len(got) == 0 || got[0] != "obj-01 v2 latest" || slices.Contains(got, "obj-02 DM latest") {
+					t.Errorf("ListObjectVersions after %s: %v", kind, got)
+				}
+
+				if rules != "" {
+					// The expired v1 is not moved, so its source is kept.
+					return
+				}
+				var wantSource []string // decommission
+				removed := true
+				if kind == "rebalance" {
+					wantSource, removed = []string{"free"}, false
+				}
+				for _, object := range []string{"obj-01", "obj-02"} {
+					if got := f.stored(0, object); !slices.Equal(got, wantSource) {
+						t.Errorf("pool 0 holds %v of %s, want %v", got, object, wantSource)
+					}
+				}
+				for _, remote := range []string{f.remote("obj-01", "v3"), f.remote("obj-02", "v1")} {
+					if slices.Contains(f.tier.removed, remote) != removed {
+						t.Errorf("remote object %s of a deleted version removed: %v, want %v", remote, !removed, removed)
+					}
+				}
+			})
+		}
+	}
+}
+
+// decommission decommissions pool 0 as the admin API does, including the check
+// for versions left behind, and returns its state.
+func (f *freeVersionTest) decommission() PoolDecommissionInfo {
+	f.t.Helper()
+	ctx := f.t.Context()
+	if err := f.z.StartDecommission(ctx, 0); err != nil {
+		f.t.Fatal(err)
+	}
+	f.z.doDecommissionInRoutine(ctx, 0)
+	f.z.poolMetaMutex.RLock()
+	defer f.z.poolMetaMutex.RUnlock()
+	return *f.z.poolMeta.Pools[0].Decommission
+}
+
+// While the tier is unavailable, the decommission moves the versions but keeps
+// the free versions, and the check for versions left behind fails it. A retry
+// with the tier back completes it.
+func TestFreeVersionDecommissionTierUnavailable(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	f.tier.removeErr = errors.New("tier unavailable")
+	if info := f.decommission(); info.Complete || !info.Failed {
+		t.Fatalf("decommission with the tier unavailable: complete %v, failed %v; want failed", info.Complete, info.Failed)
+	}
+	if got, want := f.stored(1, "obj-01"), []string{"v2", "v1"}; !slices.Equal(got, want) {
+		t.Errorf("pool 1 holds %v of obj-01, want %v", got, want)
+	}
+	for _, object := range []string{"obj-01", "obj-02"} {
+		if got, want := f.stored(0, object), []string{"free"}; !slices.Equal(got, want) {
+			t.Errorf("pool 0 holds %v of %s, want %v", got, object, want)
+		}
+	}
+	if body := migrationTestBody(t, f.z.GetObjectNInfo, f.bucket, "obj-01", ""); body != "obj-01 v2" {
+		t.Errorf("obj-01 reads %q, want %q", body, "obj-01 v2")
+	}
+	if len(f.tier.removed) != 0 {
+		t.Errorf("remote objects removed: %v", f.tier.removed)
+	}
+
+	// The failed decommission moved the bucket metadata, so pool 0 has no
+	// .minio.sys/buckets left. On a server the scanner recreates it when it
+	// saves its usage cache there; it does not run here.
+	for _, set := range f.z.serverPools[0].sets {
+		for _, disk := range set.getDisks() {
+			if err := disk.MakeVol(t.Context(), pathJoin(minioMetaBucket, bucketMetaPrefix)); err != nil && !errors.Is(err, errVolumeExists) {
+				t.Fatal(err)
+			}
+		}
+	}
+	f.tier.removeErr = nil
+	if info := f.decommission(); !info.Complete || info.Failed {
+		t.Fatalf("retry: complete %v, failed %v; want complete", info.Complete, info.Failed)
+	}
+	if got, want := f.stored(1, "obj-01"), []string{"v2", "v1"}; !slices.Equal(got, want) {
+		t.Errorf("pool 1 holds %v of obj-01 after the retry, want %v", got, want)
+	}
+	for _, object := range []string{"obj-01", "obj-02"} {
+		if got := f.stored(0, object); len(got) != 0 {
+			t.Errorf("pool 0 holds %v of %s after the retry", got, object)
+		}
+	}
+	if want := []string{f.remote("obj-01", "v3"), f.remote("obj-02", "v1")}; !slices.Equal(slices.Sorted(slices.Values(f.tier.removed)), want) {
+		t.Errorf("remote objects removed: %v, want %v", f.tier.removed, want)
 	}
 }

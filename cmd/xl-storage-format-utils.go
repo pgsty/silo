@@ -32,7 +32,9 @@ import (
 // Otherwise IsLatest, SuccessorModTime and LatestModTime are those of the
 // non-free versions.
 //
-// Note: Only the scanner requires fivs.Versions to have exclusively non-free versions. This is used while enforcing NewerNoncurrentVersions lifecycle element.
+// Only healing needs the free versions among the versions. Free versions are
+// not versions of the object, and lifecycle evaluation, listings and data
+// movement must not count them.
 func getFileInfoVersions(xlMetaBuf []byte, volume, path string, inclFreeVersions bool) (FileInfoVersions, error) {
 	fivs, err := getAllFileInfoVersions(xlMetaBuf, volume, path, true)
 	if err != nil {

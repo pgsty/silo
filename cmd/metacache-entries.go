@@ -285,9 +285,21 @@ func (e *metaCacheEntry) xlmeta() (*xlMetaV2, error) {
 	return e.cached, nil
 }
 
-// fileInfoVersions returns the metadata as FileInfoVersions.
+// fileInfoVersions returns the metadata as FileInfoVersions. The free
+// versions of deleted tiered versions are not versions of the object; they
+// are in FreeVersions.
 // If entry is a directory it is returned as that.
 func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, error) {
+	return e.getFileInfoVersions(bucket, false)
+}
+
+// allFileInfoVersions returns the metadata as FileInfoVersions with the free
+// versions among the versions, for healing.
+func (e *metaCacheEntry) allFileInfoVersions(bucket string) (FileInfoVersions, error) {
+	return e.getFileInfoVersions(bucket, true)
+}
+
+func (e *metaCacheEntry) getFileInfoVersions(bucket string, inclFreeVersions bool) (FileInfoVersions, error) {
 	if e.isDir() {
 		return FileInfoVersions{
 			Volume: bucket,
@@ -302,7 +314,7 @@ func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, erro
 		}, nil
 	}
 	// Too small gains to reuse cache here.
-	return getFileInfoVersions(e.metadata, bucket, e.name, true)
+	return getFileInfoVersions(e.metadata, bucket, e.name, inclFreeVersions)
 }
 
 // metaCacheEntries is a slice of metacache entries.
