@@ -447,3 +447,10 @@ func TestPoolsDecommissionCountsExpiredCurrentVersions(t *testing.T) {
 		t.Fatal("decommission check passed with an expired current version left in the pool")
 	}
 }
+
+// Rebalance removes the source copies of an object only when it has counted
+// all of its versions. A version that ILM deletes must be counted, or the
+// moved versions stay in pool 0 as duplicates.
+func TestPoolsRebalanceLifecycleExpiry(t *testing.T) {
+	testMigrationLifecycleExpiry(t, "rebalance")
+}
