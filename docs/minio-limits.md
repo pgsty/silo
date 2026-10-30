@@ -62,7 +62,7 @@ We found the following APIs to be redundant or less useful outside of AWS S3. If
 
 Silo recommends using Linux operating system for production workloads.
 
-- Objects must not have conflicting objects as parent objects, applications using this behavior should change their behavior and use non-conflicting unique keys, for example situations such as following conflicting key patterns are not supported.
+- In the default (safe) object naming mode, objects must not have conflicting objects as parent objects. Applications using this behavior should change their behavior and use non-conflicting unique keys; for example, situations such as the following conflicting key patterns are not supported, and LIST operations at the collision return an empty result set.
 
 ```
 PUT <bucketname>/a/b/1.txt
@@ -73,3 +73,24 @@ PUT <bucketname>/a/b
 PUT <bucketname>/a/b
 PUT <bucketname>/a/b/1.txt
 ```
+
+  A cluster formatted with `--object-naming=extended` (or
+  `MINIO_OBJECT_NAMING=extended`) supports these conflicting keys: an object
+  and a prefix of the same name (`obj1` and `obj1/obj2`) are stored in
+  physically separate directories, so both appear in LIST results and exact-key
+  reads, writes and deletes behave independently. Be aware of the following:
+
+  - The mode is chosen when the cluster is formatted for the first time, is
+    recorded in every drive's `format.json`, and cannot be changed afterwards.
+    Every node must use the same mode; drives or pools that disagree refuse to
+    start. Existing safe-mode clusters cannot be migrated in place.
+  - Object names on disk are escaped and carry a terminal marker (for example
+    `data◊file.txt` is stored as `data␣4file.txt◊`). Tools that read raw drive
+    contents, such as `mc admin inspect`, must address the encoded name.
+  - Escape sequences make some names slightly longer on disk. The 1024-byte
+    object name limit and the 255-byte per-segment limit still apply to the
+    encoded form.
+  - Replication and data movement between extended and safe mode clusters is
+    not supported.
+  - Keys ending with `__XLDIR__` remain reserved for directory objects, as in
+    safe mode.

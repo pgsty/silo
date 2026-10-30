@@ -215,6 +215,7 @@ func TestCheckFormatErasureValue(t *testing.T) {
 					This             string     `json:"this"`
 					Sets             [][]string `json:"sets"`
 					DistributionAlgo string     `json:"distributionAlgo"`
+					ObjectNaming     string     `json:"objectNaming,omitempty"`
 				}{
 					Version: "2",
 				},
@@ -233,6 +234,7 @@ func TestCheckFormatErasureValue(t *testing.T) {
 					This             string     `json:"this"`
 					Sets             [][]string `json:"sets"`
 					DistributionAlgo string     `json:"distributionAlgo"`
+					ObjectNaming     string     `json:"objectNaming,omitempty"`
 				}{
 					Version: "2",
 				},
@@ -251,6 +253,7 @@ func TestCheckFormatErasureValue(t *testing.T) {
 					This             string     `json:"this"`
 					Sets             [][]string `json:"sets"`
 					DistributionAlgo string     `json:"distributionAlgo"`
+					ObjectNaming     string     `json:"objectNaming,omitempty"`
 				}{
 					Version: "0",
 				},

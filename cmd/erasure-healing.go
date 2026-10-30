@@ -248,7 +248,7 @@ func (er *erasureObjects) auditHealObject(ctx context.Context, bucket, object, v
 	opts := AuditLogOptions{
 		Event:     "HealObject",
 		Bucket:    bucket,
-		Object:    decodeDirObject(object),
+		Object:    decodeObjectName(object),
 		VersionID: versionID,
 	}
 	if err != nil {
@@ -1120,7 +1120,7 @@ func healTrace(funcName healingMetric, startTime time.Time, bucket, object strin
 		NodeName:  globalLocalNodeName,
 		FuncName:  "heal." + funcName.String(),
 		Duration:  time.Since(startTime),
-		Path:      pathJoin(bucket, decodeDirObject(object)),
+		Path:      pathJoin(bucket, decodeObjectName(object)),
 	}
 	if opts != nil {
 		tr.Custom = map[string]string{

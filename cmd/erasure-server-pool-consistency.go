@@ -56,9 +56,9 @@ func (z *erasureServerPools) objectPoolInfos(ctx context.Context, bucket, object
 	})
 	if len(copies) == 0 {
 		if opts.VersionID != "" {
-			return nil, VersionNotFound{Bucket: bucket, Object: decodeDirObject(object), VersionID: opts.VersionID}
+			return nil, VersionNotFound{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, object), VersionID: opts.VersionID}
 		}
-		return nil, ObjectNotFound{Bucket: bucket, Object: decodeDirObject(object)}
+		return nil, ObjectNotFound{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, object)}
 	}
 	return copies, nil
 }
@@ -102,7 +102,7 @@ func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket
 		}
 	}
 	if !sourcePresent {
-		return nil, VersionNotFound{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
+		return nil, VersionNotFound{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, object), VersionID: versionID}
 	}
 	for _, copy := range copies {
 		if copy.Index != opts.SrcPoolIdx && copy.ObjInfo.ModTime.After(opts.MTime) {
@@ -131,7 +131,7 @@ func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket
 // snapshot. A concurrent delete can create a new marker in the source pool;
 // deleting the whole prefix would remove that marker and expose moved data.
 func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo) error {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
@@ -265,7 +265,7 @@ func replicaCopiesInfo(copies []PoolObjInfo, err error, bucket, object, versionI
 		return ObjectInfo{}, err
 	}
 	if copies[0].ObjInfo.DeleteMarker {
-		return copies[0].ObjInfo, MethodNotAllowed{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
+		return copies[0].ObjInfo, MethodNotAllowed{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, object), VersionID: versionID}
 	}
 	return mergedPoolObjectInfo(copies), nil
 }
@@ -278,7 +278,7 @@ func (z *erasureServerPools) metadataPoolInfos(ctx context.Context, bucket, obje
 		return nil, err
 	}
 	if copies[0].ObjInfo.DeleteMarker {
-		return nil, MethodNotAllowed{Bucket: bucket, Object: decodeDirObject(object), VersionID: opts.VersionID}
+		return nil, MethodNotAllowed{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, object), VersionID: opts.VersionID}
 	}
 	if opts.VersionID == "" {
 		opts.VersionID = copies[0].ObjInfo.VersionID
@@ -417,7 +417,7 @@ func (z *erasureServerPools) retireReplicaCopies(ctx context.Context, bucket, ob
 		}
 	}
 	if len(retained) == 0 {
-		return VersionNotFound{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
+		return VersionNotFound{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, object), VersionID: versionID}
 	}
 	for i, copy := range copies {
 		if copy.Index == keep {
@@ -513,7 +513,7 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 		// A single new delete marker hides the current version. Older versions
 		// remain history and must not be removed by an unqualified DELETE.
 		oi, err := z.serverPools[primary.Index].DeleteObject(ctx, bucket, object, opts)
-		oi.Name = decodeDirObject(object)
+		oi.Name = decodeObjectNameForBucket(bucket, object)
 		oi.replicationDecision = opts.DeleteReplication.ReplicateDecisionStr
 		return oi, err
 	}
@@ -530,7 +530,7 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 		}
 	}
 	oi, err := z.serverPools[primary.Index].DeleteObject(ctx, bucket, object, opts)
-	oi.Name = decodeDirObject(object)
+	oi.Name = decodeObjectNameForBucket(bucket, object)
 	oi.replicationDecision = opts.DeleteReplication.ReplicateDecisionStr
 	return oi, err
 }
@@ -562,7 +562,7 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 				}
 			} else if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 				if isErrReadQuorum(err) {
-					err = InsufficientWriteQuorum{Bucket: bucket, Object: decodeDirObject(obj.ObjectName)}
+					err = InsufficientWriteQuorum{Bucket: bucket, Object: decodeObjectNameForBucket(bucket, obj.ObjectName)}
 				}
 				errs[i] = err
 			}

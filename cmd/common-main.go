@@ -442,6 +442,7 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 	ctxt.FTP = ctx.StringSlice("ftp")
 	ctxt.SFTP = ctx.StringSlice("sftp")
 	ctxt.Interface = ctx.String("interface")
+	ctxt.ObjectNaming = ctx.String("object-naming")
 	ctxt.UserTimeout = ctx.Duration("conn-user-timeout")
 	ctxt.SendBufSize = ctx.Int("send-buf-size")
 	ctxt.RecvBufSize = ctx.Int("recv-buf-size")
@@ -770,6 +771,16 @@ func serverHandleEarlyEnvVars() {
 
 func serverHandleEnvVars() {
 	var err error
+
+	// Object naming mode must be valid before any format is written. The
+	// recorded format is authoritative for an existing cluster; a mismatch is
+	// rejected when the object layer starts.
+	if mode := globalServerCtxt.ObjectNaming; mode != "" {
+		if !isObjectNamingModeValid(mode) {
+			logger.Fatal(fmt.Errorf("invalid object naming mode %q: must be %q or %q", mode, objectNamingSafe, objectNamingExtended), "Invalid %s value in environment variable", config.EnvObjectNaming)
+		}
+	}
+	globalObjectNaming = globalServerCtxt.ObjectNaming
 
 	// Re-read the source-address trust policy now that loadEnvVarsFromFiles has
 	// run: a policy taken at package initialisation would miss every deployment

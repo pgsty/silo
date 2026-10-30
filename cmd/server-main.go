@@ -119,6 +119,11 @@ var ServerFlags = []cli.Flag{
 		Hidden: true,
 		EnvVar: "MINIO_INTERFACE",
 	},
+	cli.StringFlag{
+		Name:   "object-naming",
+		Usage:  "on-disk object naming mode chosen at first format: \"safe\" (default) or \"extended\"; cannot be changed after the cluster is formatted",
+		EnvVar: "MINIO_OBJECT_NAMING",
+	},
 	cli.DurationFlag{
 		Name:   "dns-cache-ttl",
 		Usage:  "custom DNS cache TTL",

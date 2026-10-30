@@ -79,6 +79,7 @@ func (z *erasureServerPools) SinglePool() bool {
 func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServerPools) (ObjectLayer, error) {
 	var (
 		deploymentID       string
+		objectNaming       string
 		commonParityDrives int
 		err                error
 
@@ -154,6 +155,19 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			return nil, fmt.Errorf("all pools must have same deployment ID - expected %s, got %s for pool(%s)", deploymentID, formats[i].ID, humanize.Ordinal(i+1))
 		}
 
+		// Object naming is a format-wide choice: every pool must agree, or
+		// keys would be addressable only in part of the deployment. The mode
+		// recorded on disk always wins over the command line.
+		naming := normalizeObjectNamingMode(formats[i].Erasure.ObjectNaming)
+		if requested := globalObjectNaming; requested != "" && requested != naming {
+			return nil, fmt.Errorf("object naming mode %q requested but the cluster was formatted with %q: object naming cannot be changed after the cluster was formatted", requested, naming)
+		}
+		if objectNaming == "" {
+			objectNaming = naming
+		} else if naming != objectNaming {
+			return nil, fmt.Errorf("all pools must use the same object naming mode - expected %s, got %s for pool(%s)", objectNaming, naming, humanize.Ordinal(i+1))
+		}
+
 		bootstrapTrace(fmt.Sprintf("newErasureSets: initializing %s pool", humanize.Ordinal(i+1)), func() {
 			z.serverPools[i], err = newErasureSets(ctx, ep, storageDisks[i], formats[i], commonParityDrives, i)
 		})
@@ -171,6 +185,9 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			}
 		}
 	}
+
+	// The mode recorded in the formats is authoritative from here on.
+	globalObjectNamingExtended = objectNaming == objectNamingExtended
 
 	if !globalIsDistErasure {
 		globalLocalDrivesMu.Lock()
@@ -961,10 +978,14 @@ func (z *erasureServerPools) GetObjectNInfo(ctx context.Context, bucket, object 
 	gr = nil
 	err = nil
 
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 
 	if z.SinglePool() {
-		return z.serverPools[0].GetObjectNInfo(ctx, bucket, object, rs, h, opts)
+		gr, err := z.serverPools[0].GetObjectNInfo(ctx, bucket, object, rs, h, opts)
+		if err == nil {
+			gr.ObjInfo.Name = decodeObjectNameForBucket(bucket, object)
+		}
+		return gr, err
 	}
 
 	var unlockOnDefer bool
@@ -1017,6 +1038,8 @@ func (z *erasureServerPools) GetObjectNInfo(ctx context.Context, bucket, object 
 		return nil, err
 	}
 
+	gr.ObjInfo.Name = decodeObjectNameForBucket(bucket, object)
+
 	if unlockOnDefer {
 		unlockOnDefer = gr.ObjInfo.Inlined
 	}
@@ -1031,7 +1054,8 @@ func (z *erasureServerPools) GetObjectNInfo(ctx context.Context, bucket, object 
 // is present in-case there were duplicate writes to both pools, this function also returns the
 // additional index where the latest object exists, that is used to start the GetObject stream.
 func (z *erasureServerPools) getLatestObjectInfoWithIdx(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, int, error) {
-	object = encodeDirObject(object)
+	// Callers pass the stack-domain name (already encoded by the public
+	// method they were entered through).
 	results := make([]struct {
 		zIdx int
 		oi   ObjectInfo
@@ -1064,11 +1088,13 @@ func (z *erasureServerPools) getLatestObjectInfoWithIdx(ctx context.Context, buc
 	for _, res := range results {
 		err := res.err
 		if err == nil {
+			res.oi.Name = decodeObjectNameForBucket(bucket, object)
 			return res.oi, res.zIdx, nil
 		}
 		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			// some errors such as MethodNotAllowed for delete marker
 			// should be returned upwards.
+			res.oi.Name = decodeObjectNameForBucket(bucket, object)
 			return res.oi, res.zIdx, err
 		}
 		// When its a delete marker and versionID is empty
@@ -1078,7 +1104,7 @@ func (z *erasureServerPools) getLatestObjectInfoWithIdx(ctx context.Context, buc
 		}
 	}
 
-	object = decodeDirObject(object)
+	object = decodeObjectNameForBucket(bucket, object)
 	if opts.VersionID != "" {
 		return ObjectInfo{}, -1, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
 	}
@@ -1100,10 +1126,14 @@ func (z *erasureServerPools) GetObjectInfo(ctx context.Context, bucket, object s
 	err = nil
 	objInfo = ObjectInfo{}
 
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 
 	if z.SinglePool() {
-		return z.serverPools[0].GetObjectInfo(ctx, bucket, object, opts)
+		oi, err := z.serverPools[0].GetObjectInfo(ctx, bucket, object, opts)
+		if err == nil {
+			oi.Name = decodeObjectNameForBucket(bucket, object)
+		}
+		return oi, err
 	}
 
 	if !opts.NoLock {
@@ -1130,13 +1160,17 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		return ObjectInfo{}, err
 	}
 
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
 		_, err := z.getPoolIdx(ctx, bucket, object, data.Size())
 		if err != nil {
 			return ObjectInfo{}, err
 		}
-		return z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
+		oi, err := z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
+		if err == nil {
+			oi.Name = decodeObjectNameForBucket(bucket, object)
+		}
+		return oi, err
 	}
 
 	if !opts.NoLock {
@@ -1218,12 +1252,17 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	if err == nil && opts.ReplicaLockReconcile && !opts.DataMovement {
 		err = z.retireReplicaCopies(ctx, bucket, object, idx, oi)
 	}
+	if err == nil {
+		oi.Name = decodeObjectNameForBucket(bucket, object)
+	}
 	return oi, err
 }
 
 func (z *erasureServerPools) deletePrefix(ctx context.Context, bucket string, prefix string) error {
 	for _, pool := range z.serverPools {
-		if _, err := pool.DeleteObject(ctx, bucket, prefix, ObjectOptions{DeletePrefix: true}); err != nil {
+		// Call the set layer directly: prefix is already in the storage-stack
+		// form, and re-entering the public method would escape it again.
+		if err := pool.deletePrefix(ctx, bucket, prefix); err != nil {
 			return err
 		}
 	}
@@ -1235,8 +1274,15 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return objInfo, err
 	}
 
-	if !opts.DeletePrefix { // DeletePrefix handles dir object encoding differently.
-		object = encodeDirObject(object)
+	switch {
+	case !opts.DeletePrefix, opts.DeletePrefixObject:
+		// A normal delete, or a prefix delete scoped to one exact object
+		// (lifecycle "expire all versions"), addresses the object.
+		object = encodeObjectNameForBucket(bucket, object)
+	default:
+		// A bare prefix delete addresses a directory tree, not an object:
+		// escape the components but do not add the terminal marker.
+		object = encodeObjectPrefixName(object)
 	}
 
 	// Serialize logical deletion with pooled writes and metadata updates.
@@ -1267,7 +1313,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 			return objInfo, DataMovementOverwriteErr{Bucket: bucket, Object: object, VersionID: opts.VersionID, Err: errDataMovementSrcDstPoolSame}
 		}
 		objInfo, err = z.serverPools[idx].DeleteObject(ctx, bucket, object, opts)
-		objInfo.Name = decodeDirObject(object)
+		objInfo.Name = decodeObjectNameForBucket(bucket, object)
 		return objInfo, err
 	}
 
@@ -1352,7 +1398,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	// Delete marker already present we are not going to create new delete markers.
 	if pinfo.ObjInfo.DeleteMarker && opts.VersionID == "" {
-		pinfo.ObjInfo.Name = decodeDirObject(object)
+		pinfo.ObjInfo.Name = decodeObjectNameForBucket(bucket, object)
 		return pinfo.ObjInfo, nil
 	}
 
@@ -1369,7 +1415,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	// All replication requests needs to go to pool with the object.
 	if opts.ReplicationRequest {
 		objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
-		objInfo.Name = decodeDirObject(object)
+		objInfo.Name = decodeObjectNameForBucket(bucket, object)
 		return objInfo, err
 	}
 
@@ -1383,7 +1429,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 				continue
 			}
 			objInfo, err = pool.DeleteObject(ctx, bucket, object, opts)
-			objInfo.Name = decodeDirObject(object)
+			objInfo.Name = decodeObjectNameForBucket(bucket, object)
 			return objInfo, err
 		}
 	}
@@ -1391,16 +1437,16 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	for _, pool := range z.serverPools {
 		objInfo, err := pool.DeleteObject(ctx, bucket, object, opts)
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			objInfo.Name = decodeDirObject(object)
+			objInfo.Name = decodeObjectNameForBucket(bucket, object)
 			return objInfo, err
 		}
 		if err == nil {
-			objInfo.Name = decodeDirObject(object)
+			objInfo.Name = decodeObjectNameForBucket(bucket, object)
 			return objInfo, nil
 		}
 	}
 
-	objInfo.Name = decodeDirObject(object)
+	objInfo.Name = decodeObjectNameForBucket(bucket, object)
 	if opts.VersionID != "" {
 		return objInfo, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
 	}
@@ -1408,7 +1454,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 }
 
 func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucket string, object string, opts ObjectOptions, poolIndices []poolErrs) (objInfo ObjectInfo, err error) {
-	objInfo.Name = decodeDirObject(object)
+	objInfo.Name = decodeObjectNameForBucket(bucket, object)
 
 	// Delete in all server pools that reported no error or read quorum error
 	// where the read quorum issue is from metadata inconsistency. The
@@ -1427,11 +1473,11 @@ func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucke
 			break
 		}
 		if derr != nil && !isErrObjectNotFound(derr) && !isErrVersionNotFound(derr) {
-			dobj.Name = decodeDirObject(object)
+			dobj.Name = decodeObjectNameForBucket(bucket, object)
 			return dobj, derr
 		}
 	}
-	objInfo.Name = decodeDirObject(object)
+	objInfo.Name = decodeObjectNameForBucket(bucket, object)
 	return objInfo, err
 }
 
@@ -1485,14 +1531,16 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	dobjects := make([]DeletedObject, len(objects))
 	objSets := set.NewStringSet()
 	for i := range derrs {
-		objects[i].ObjectName = encodeDirObject(objects[i].ObjectName)
+		// Validate the user-domain key before the stack transformation; the
+		// escaped form is longer and would be rejected near the name limit.
+		derrs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
+		userName := objects[i].ObjectName
+		objects[i].ObjectName = encodeObjectNameForBucket(bucket, userName)
 		dobjects[i] = DeletedObject{
-			ObjectName:       decodeDirObject(objects[i].ObjectName),
+			ObjectName:       userName,
 			VersionID:        objects[i].VersionID,
 			ReplicationState: objects[i].ReplicationState(),
 		}
-
-		derrs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
 		objSets.Add(objects[i].ObjectName)
 	}
 
@@ -1580,7 +1628,7 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	}
 
 	for i := range dobjects {
-		dobjects[i].ObjectName = decodeDirObject(dobjects[i].ObjectName)
+		dobjects[i].ObjectName = decodeObjectNameForBucket(bucket, dobjects[i].ObjectName)
 	}
 	return dobjects, derrs
 }
@@ -1593,8 +1641,8 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		return ObjectInfo{}, err
 	}
 
-	srcObject = encodeDirObject(srcObject)
-	dstObject = encodeDirObject(dstObject)
+	srcObject = encodeObjectNameForBucket(srcBucket, srcObject)
+	dstObject = encodeObjectNameForBucket(dstBucket, dstObject)
 
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
 
@@ -1621,6 +1669,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		oi, err := z.serverPools[idx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 		if err == nil {
 			err = z.retireReplicaCopies(ctx, dstBucket, dstObject, idx, oi)
+			oi.Name = decodeObjectNameForBucket(dstBucket, dstObject)
 		}
 		return oi, err
 	}
@@ -1641,17 +1690,26 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		}
 	}
 
+	// decodeCopyResult restores the user-domain name on a result built from
+	// the stack-domain destination name.
+	decodeCopyResult := func(oi ObjectInfo, err error) (ObjectInfo, error) {
+		if err == nil {
+			oi.Name = decodeObjectNameForBucket(dstBucket, dstObject)
+		}
+		return oi, err
+	}
+
 	// CopyObjectHandler predicts the outcome of this decision in
 	// copyRewritesObjectData(); keep the two in sync.
 	if cpSrcDstSame && srcInfo.metadataOnly {
 		// Version ID is set for the destination and source == destination version ID.
 		if dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID {
-			return z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+			return decodeCopyResult(z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts))
 		}
 		// Destination is not versioned and source version ID is empty
 		// perform an in-place update.
 		if !dstOpts.Versioned && srcOpts.VersionID == "" {
-			return z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+			return decodeCopyResult(z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts))
 		}
 		// Destination is versioned, source is not destination version,
 		// as a special case look for if the source object is not legacy
@@ -1661,7 +1719,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 			// CopyObject optimization where we don't create an entire copy
 			// of the content, instead we add a reference.
 			srcInfo.versionOnly = true
-			return z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+			return decodeCopyResult(z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts))
 		}
 	}
 
@@ -1682,7 +1740,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		replicaObjectInfo:          dstOpts.replicaObjectInfo,
 	}
 
-	return z.serverPools[poolIdx].PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
+	return decodeCopyResult(z.serverPools[poolIdx].PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts))
 }
 
 func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
@@ -2055,19 +2113,36 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 		return poolResult, nil
 	}
 
+	// The non-empty-prefix path addresses one exact upload key: it lists the
+	// SHA directory for that name. Apply the same name transformation used
+	// when the upload was created so the directory is found.
+	searchKey := encodeObjectNameForBucket(bucket, prefix)
+	decodeUploads := func(result *ListMultipartsInfo) {
+		result.Prefix = decodeObjectNameForBucket(bucket, result.Prefix)
+		for i := range result.Uploads {
+			result.Uploads[i].Object = decodeObjectNameForBucket(bucket, result.Uploads[i].Object)
+		}
+	}
+
 	if z.SinglePool() {
-		return z.serverPools[0].getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+		result, err := z.serverPools[0].getHashedSet(searchKey).listMultipartUploadsExact(ctx, bucket, searchKey, keyMarker, uploadIDMarker, delimiter, maxUploads)
+		decodeUploads(&result)
+		return result, err
 	}
 
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
-		result, err := pool.getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+		result, err := pool.getHashedSet(searchKey).listMultipartUploadsExact(ctx, bucket, searchKey, keyMarker, uploadIDMarker, delimiter, maxUploads)
 		if err != nil {
+			decodeUploads(&result)
 			return result, err
 		}
 		poolResult.Uploads = append(poolResult.Uploads, result.Uploads...)
+	}
+	for i := range poolResult.Uploads {
+		poolResult.Uploads[i].Object = decodeObjectNameForBucket(bucket, poolResult.Uploads[i].Object)
 	}
 
 	return poolResult, nil
@@ -2079,11 +2154,14 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 		return nil, err
 	}
 
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
+
 	defer func() {
 		if err == nil && mp != nil {
 			z.mpCache.Store(mp.UploadID, MultipartInfo{
 				Bucket:    bucket,
-				Object:    object,
+				Object:    userObject,
 				UploadID:  mp.UploadID,
 				Initiated: time.Now(),
 			})
@@ -2121,7 +2199,7 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 	if opts.DataMovement && idx == opts.SrcPoolIdx {
 		return nil, DataMovementOverwriteErr{
 			Bucket:    bucket,
-			Object:    object,
+			Object:    userObject,
 			VersionID: opts.VersionID,
 			Err:       errDataMovementSrcDstPoolSame,
 		}
@@ -2145,6 +2223,9 @@ func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, 
 	if err := checkPutObjectPartArgs(ctx, bucket, object, uploadID); err != nil {
 		return PartInfo{}, err
 	}
+
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
 
 	if z.SinglePool() {
 		_, err := z.getPoolIdx(ctx, bucket, object, data.Size())
@@ -2172,7 +2253,7 @@ func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, 
 
 	return PartInfo{}, InvalidUploadID{
 		Bucket:   bucket,
-		Object:   object,
+		Object:   userObject,
 		UploadID: uploadID,
 	}
 }
@@ -2181,6 +2262,9 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 	if err := checkListPartsArgs(ctx, bucket, object, uploadID); err != nil {
 		return MultipartInfo{}, err
 	}
+
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
 
 	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
 	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
@@ -2191,7 +2275,9 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 	defer uploadIDLock.RUnlock(lkctx)
 
 	if z.SinglePool() {
-		return z.serverPools[0].GetMultipartInfo(ctx, bucket, object, uploadID, opts)
+		mi, err := z.serverPools[0].GetMultipartInfo(ctx, bucket, object, uploadID, opts)
+		mi.Object = decodeObjectNameForBucket(bucket, object)
+		return mi, err
 	}
 
 	for idx, pool := range z.serverPools {
@@ -2212,7 +2298,7 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 
 	return MultipartInfo{}, InvalidUploadID{
 		Bucket:   bucket,
-		Object:   object,
+		Object:   userObject,
 		UploadID: uploadID,
 	}
 }
@@ -2223,6 +2309,9 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 		return ListPartsInfo{}, err
 	}
 
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
+
 	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
 	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
@@ -2232,7 +2321,9 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 	defer uploadIDLock.RUnlock(lkctx)
 
 	if z.SinglePool() {
-		return z.serverPools[0].ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)
+		result, err := z.serverPools[0].ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)
+		result.Object = userObject
+		return result, err
 	}
 
 	for idx, pool := range z.serverPools {
@@ -2241,6 +2332,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 		}
 		result, err := pool.ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)
 		if err == nil {
+			result.Object = userObject
 			return result, nil
 		}
 		if _, ok := err.(InvalidUploadID); ok {
@@ -2251,7 +2343,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 
 	return ListPartsInfo{}, InvalidUploadID{
 		Bucket:   bucket,
-		Object:   object,
+		Object:   userObject,
 		UploadID: uploadID,
 	}
 }
@@ -2264,6 +2356,9 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 	if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		return toObjectErr(err, bucket)
 	}
+
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
 
 	// Unlock cancels the derived lock context before this notification runs.
 	// Keep the request context so successful cancellation reaches peer caches.
@@ -2294,7 +2389,7 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 	}
 	return InvalidUploadID{
 		Bucket:   bucket,
-		Object:   object,
+		Object:   userObject,
 		UploadID: uploadID,
 	}
 }
@@ -2305,6 +2400,9 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		return objInfo, err
 	}
 
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
+
 	defer func() {
 		if err == nil {
 			z.mpCache.Delete(uploadID)
@@ -2314,7 +2412,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	if !z.SinglePool() {
 		if !opts.NoLock {
-			lk := z.NewNSLock(bucket, encodeDirObject(object))
+			lk := z.NewNSLock(bucket, object)
 			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 			if err != nil {
 				return objInfo, err
@@ -2334,7 +2432,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		// Once satisfied, the callback is cleared so the set layer does not
 		// re-evaluate it against its local copy.
 		if opts.CheckPrecondFn != nil {
-			copies, lerr := z.objectPoolInfos(ctx, bucket, encodeDirObject(object), ObjectOptions{
+			copies, lerr := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{
 				// Conditions always compare the logical current object,
 				// independently of the completion's destination version.
 				VersionID:        "",
@@ -2365,7 +2463,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 			opts.CheckPrecondFn = nil
 		}
 		if opts.DataMovement {
-			resolve, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(object), opts)
+			resolve, err := z.checkDataMovementCopies(ctx, bucket, object, opts)
 			if err != nil {
 				return ObjectInfo{}, err
 			}
@@ -2384,7 +2482,11 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 	defer uploadIDLock.Unlock(wlkctx)
 
 	if z.SinglePool() {
-		return z.serverPools[0].CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
+		oi, err := z.serverPools[0].CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
+		if err == nil {
+			oi.Name = decodeObjectNameForBucket(bucket, object)
+		}
+		return oi, err
 	}
 
 	if opts.ReplicaLockReconcile || opts.DataMovement {
@@ -2401,8 +2503,9 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		objInfo, err = pool.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
 		if err == nil {
 			if opts.ReplicaLockReconcile && !opts.DataMovement {
-				err = z.retireReplicaCopies(ctx, bucket, encodeDirObject(object), idx, objInfo)
+				err = z.retireReplicaCopies(ctx, bucket, object, idx, objInfo)
 			}
+			objInfo.Name = decodeObjectNameForBucket(bucket, object)
 			return objInfo, err
 		}
 		if _, ok := err.(InvalidUploadID); ok {
@@ -2414,7 +2517,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	return objInfo, InvalidUploadID{
 		Bucket:   bucket,
-		Object:   object,
+		Object:   userObject,
 		UploadID: uploadID,
 	}
 }
@@ -2927,7 +3030,8 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 }
 
 func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
-	object = encodeDirObject(object)
+	userObject := object
+	object = encodeObjectNameForBucket(bucket, object)
 
 	errs := make([]error, len(z.serverPools))
 	results := make([]madmin.HealResultItem, len(z.serverPools))
@@ -2940,7 +3044,7 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 		go func(idx int, pool *erasureSets) {
 			defer wg.Done()
 			result, err := z.healObjectInPool(ctx, pool.getHashedSet(object), bucket, object, versionID, opts)
-			result.Object = decodeDirObject(result.Object)
+			result.Object = decodeObjectName(result.Object)
 			errs[idx] = err
 			results[idx] = result
 		}(idx, pool)
@@ -2964,7 +3068,7 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 	hr := madmin.HealResultItem{
 		Type:      madmin.HealItemObject,
 		Bucket:    bucket,
-		Object:    object,
+		Object:    userObject,
 		VersionID: versionID,
 	}
 
@@ -2972,13 +3076,13 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 	if versionID != "" {
 		return hr, VersionNotFound{
 			Bucket:    bucket,
-			Object:    object,
+			Object:    userObject,
 			VersionID: versionID,
 		}
 	}
 	return hr, ObjectNotFound{
 		Bucket: bucket,
-		Object: object,
+		Object: userObject,
 	}
 }
 
@@ -3192,9 +3296,13 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 
 // PutObjectMetadata - replace or add tags to an existing object
 func (z *erasureServerPools) PutObjectMetadata(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
-		return z.serverPools[0].PutObjectMetadata(ctx, bucket, object, opts)
+		oi, err := z.serverPools[0].PutObjectMetadata(ctx, bucket, object, opts)
+		if err == nil {
+			oi.Name = decodeObjectNameForBucket(bucket, object)
+		}
+		return oi, err
 	}
 
 	if !opts.NoLock {
@@ -3208,14 +3316,22 @@ func (z *erasureServerPools) PutObjectMetadata(ctx context.Context, bucket, obje
 		defer lk.Unlock(lkctx)
 	}
 
-	return z.updatePoolMetadata(ctx, bucket, object, opts)
+	oi, err := z.updatePoolMetadata(ctx, bucket, object, opts)
+	if err == nil {
+		oi.Name = decodeObjectNameForBucket(bucket, object)
+	}
+	return oi, err
 }
 
 // PutObjectTags - replace or add tags to an existing object
 func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object string, tags string, opts ObjectOptions) (ObjectInfo, error) {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
-		return z.serverPools[0].PutObjectTags(ctx, bucket, object, tags, opts)
+		oi, err := z.serverPools[0].PutObjectTags(ctx, bucket, object, tags, opts)
+		if err == nil {
+			oi.Name = decodeObjectNameForBucket(bucket, object)
+		}
+		return oi, err
 	}
 
 	if !opts.NoLock {
@@ -3257,6 +3373,7 @@ func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object s
 			primary = oi
 		}
 	}
+	primary.Name = decodeObjectNameForBucket(bucket, object)
 	return primary, nil
 }
 
@@ -3267,11 +3384,12 @@ func (z *erasureServerPools) DeleteObjectTags(ctx context.Context, bucket, objec
 
 // GetObjectTags - get object tags from an existing object
 func (z *erasureServerPools) GetObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (*tags.Tags, error) {
-	object = encodeDirObject(object)
 	if z.SinglePool() {
-		return z.serverPools[0].GetObjectTags(ctx, bucket, object, opts)
+		return z.serverPools[0].GetObjectTags(ctx, bucket, encodeObjectNameForBucket(bucket, object), opts)
 	}
 
+	// GetObjectInfo takes the user-domain name and applies the storage-stack
+	// transformation itself.
 	oi, err := z.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		return nil, err
@@ -3282,7 +3400,7 @@ func (z *erasureServerPools) GetObjectTags(ctx context.Context, bucket, object s
 
 // TransitionObject - transition object content to target tier.
 func (z *erasureServerPools) TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
 		return z.serverPools[0].TransitionObject(ctx, bucket, object, opts)
 	}
@@ -3311,7 +3429,7 @@ func (z *erasureServerPools) TransitionObject(ctx context.Context, bucket, objec
 
 // RestoreTransitionedObject - restore transitioned object content locally on this cluster.
 func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
 		return z.serverPools[0].RestoreTransitionedObject(ctx, bucket, object, opts)
 	}
@@ -3339,7 +3457,7 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 }
 
 func (z *erasureServerPools) CheckAbandonedParts(ctx context.Context, bucket, object string, opts madmin.HealOpts) error {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
 		return z.serverPools[0].CheckAbandonedParts(ctx, bucket, object, opts)
 	}
@@ -3367,7 +3485,7 @@ func (z *erasureServerPools) CheckAbandonedParts(ctx context.Context, bucket, ob
 
 // DecomTieredObject - moves tiered object to another pool during decommissioning.
 func (z *erasureServerPools) DecomTieredObject(ctx context.Context, bucket, object string, fi FileInfo, opts ObjectOptions) error {
-	object = encodeDirObject(object)
+	object = encodeObjectNameForBucket(bucket, object)
 	if z.SinglePool() {
 		return fmt.Errorf("error decommissioning %s/%s", bucket, object)
 	}

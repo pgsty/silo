@@ -54,6 +54,10 @@ const (
 	EnvSiteName   = "MINIO_SITE_NAME"
 	EnvSiteRegion = "MINIO_SITE_REGION"
 
+	// EnvObjectNaming selects the on-disk object naming mode at first format:
+	// "safe" (default) or "extended".
+	EnvObjectNaming = "MINIO_OBJECT_NAMING"
+
 	EnvMinIOSubnetLicense = "MINIO_SUBNET_LICENSE" // Deprecated Dec 2021
 	EnvMinIOSubnetAPIKey  = "MINIO_SUBNET_API_KEY"
 	EnvMinIOSubnetProxy   = "MINIO_SUBNET_PROXY"

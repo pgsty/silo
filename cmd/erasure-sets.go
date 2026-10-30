@@ -561,7 +561,7 @@ func auditObjectErasureSet(ctx context.Context, api, object string, set *erasure
 	}
 
 	op := auditObjectOp{
-		Name: decodeDirObject(object),
+		Name: decodeObjectName(object),
 		Pool: set.poolIndex + 1,
 		Set:  set.setIndex + 1,
 	}

@@ -275,17 +275,17 @@ func checkObjectLockedForOverwrite(ctx context.Context, bucket, object string, g
 		return err
 	}
 	if objectlock.GetObjectLegalHoldMeta(objInfo.UserDefined).Status == objectlock.LegalHoldOn {
-		return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: nullVersionID}
+		return ObjectLocked{Bucket: bucket, Object: decodeObjectName(object), VersionID: nullVersionID}
 	}
 	r := objectlock.GetObjectRetentionMeta(objInfo.UserDefined)
 	if r.Mode == objectlock.RetCompliance || r.Mode == objectlock.RetGovernance {
 		t, err := objectlock.UTCNowNTP()
 		if err != nil {
 			internalLogIf(ctx, err, logger.WarningKind)
-			return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: nullVersionID}
+			return ObjectLocked{Bucket: bucket, Object: decodeObjectName(object), VersionID: nullVersionID}
 		}
 		if r.RetainUntilDate.After(t) {
-			return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: nullVersionID}
+			return ObjectLocked{Bucket: bucket, Object: decodeObjectName(object), VersionID: nullVersionID}
 		}
 	}
 	return nil

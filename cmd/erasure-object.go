@@ -777,7 +777,7 @@ func (er erasureObjects) readListingFileInfo(ctx context.Context, bucket, object
 }
 
 func listingReadQuorumError(bucket, object string) error {
-	return InsufficientReadQuorum{Bucket: bucket, Object: decodeDirObject(object), Err: errErasureReadQuorum, Type: RQInconsistentMeta}
+	return InsufficientReadQuorum{Bucket: bucket, Object: decodeObjectName(object), Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 }
 
 func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object string, opts ObjectOptions, readData bool) (FileInfo, []FileInfo, []StorageAPI, error) {

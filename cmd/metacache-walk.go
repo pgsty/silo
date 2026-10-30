@@ -119,6 +119,16 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 		return nil
 	}
 
+	// Extended object naming keeps objects and their own prefixes in distinct
+	// directories, so the walk emits both and re-sorts each directory level in
+	// the user domain (on disk the terminal marker sorts after '/').
+	// Meta buckets keep their raw layout and the standard walk.
+	if globalObjectNamingExtended && !skipAccessChecks(opts.Bucket) {
+		return s.walkDirExtended(ctx, opts, volumeDir, legacyFS, send, func() bool {
+			return opts.Limit > 0 && objsReturned >= opts.Limit
+		})
+	}
+
 	// Fast exit track to check if we are listing an object with
 	// a trailing slash, this will avoid to list the object content.
 	if HasSuffix(opts.BaseDir, SlashSeparator) {
@@ -404,6 +414,222 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 
 	// Stream output.
 	return scanDir(opts.BaseDir)
+}
+
+// walkDirExtended implements WalkDir for the extended object naming mode.
+//
+// On disk a regular object lives in a directory whose final component carries
+// the terminal marker (`obj1` -> `obj1◊/xl.meta`), prefix directories are plain
+// escaped names (`obj1/` stays `obj1/`) and directory objects keep the legacy
+// `__XLDIR__` suffix. The terminal marker sorts after '/' in byte order, so
+// disk order is not S3 key order: every level is decoded, sorted in the user
+// domain and emitted with recursion inline, which keeps the whole stream
+// ascending. Objects and the prefix of the same name therefore both appear,
+// which is the point of the mode.
+func (s *xlStorage) walkDirExtended(ctx context.Context, opts WalkDirOptions, volumeDir string, legacyFS bool, send func(metaCacheEntry) error, limitReached func() bool) error {
+	userBase := opts.BaseDir
+
+	// Translate BaseDir into the disk domain.
+	var (
+		diskBase  string
+		objectDir bool
+	)
+	switch {
+	case userBase == "":
+	case strings.HasSuffix(userBase, SlashSeparator):
+		diskBase = escapeExtendedNaming(userBase)
+	default:
+		// Callers that address one object (healing, heal scans) pass the key
+		// without a trailing slash. Prefer the object directory when it
+		// exists, mirroring the directory-oriented safe-mode walk.
+		candidate := encodeExtendedObjectPath(userBase)
+		if _, sterr := Lstat(pathJoin(volumeDir, candidate)); sterr == nil {
+			diskBase = candidate
+			objectDir = true
+		} else {
+			diskBase = escapeExtendedNaming(userBase)
+		}
+	}
+
+	// A trailing-slash prefix may also be stored as a directory object; emit
+	// it first. Both representations can coexist with children of their own.
+	if !objectDir && strings.HasSuffix(userBase, SlashSeparator) {
+		dirObj := escapeExtendedNaming(strings.TrimSuffix(userBase, SlashSeparator)) + globalDirSuffix
+		if s.walkReadMu != nil {
+			s.walkReadMu.Lock()
+		}
+		metadata, merr := s.readMetadata(ctx, pathJoin(volumeDir, dirObj, xlStorageFormatFile))
+		if s.walkReadMu != nil {
+			s.walkReadMu.Unlock()
+		}
+		diskHealthCheckOK(ctx, merr)
+		if merr == nil && !limitReached() {
+			if err := send(metaCacheEntry{name: userBase, metadata: metadata}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// The base itself is an object directory: emit it and stop, matching the
+	// safe-mode behavior for a directory-oriented base.
+	if objectDir {
+		if limitReached() {
+			return nil
+		}
+		if s.walkReadMu != nil {
+			s.walkReadMu.Lock()
+		}
+		metadata, merr := s.readMetadata(ctx, pathJoin(volumeDir, diskBase, xlStorageFormatFile))
+		if s.walkReadMu != nil {
+			s.walkReadMu.Unlock()
+		}
+		diskHealthCheckOK(ctx, merr)
+		if merr != nil {
+			if osIsNotExist(merr) || isSysErrIsDir(merr) {
+				return nil
+			}
+			return merr
+		}
+		return send(metaCacheEntry{name: userBase, metadata: metadata})
+	}
+
+	// A non-slash base that resolved to a prefix directory still prefixes the
+	// emitted names with "dir/" to match pathJoin semantics.
+	userRoot := userBase
+	if userRoot != "" && !strings.HasSuffix(userRoot, SlashSeparator) {
+		userRoot += SlashSeparator
+	}
+
+	type extendedWalkEntry struct {
+		disk     string // disk-relative entry name without the trailing '/'
+		user     string // user-domain name; prefixes end with '/'
+		isObject bool
+	}
+
+	var scanDir func(userCurrent, diskCurrent string) error
+	scanDir = func(userCurrent, diskCurrent string) error {
+		if s.walkMu != nil {
+			s.walkMu.Lock()
+		}
+		entries, lerr := s.ListDir(ctx, "", opts.Bucket, diskCurrent, -1)
+		if s.walkMu != nil {
+			s.walkMu.Unlock()
+		}
+		if lerr != nil {
+			if lerr != errVolumeNotFound && lerr != errFileNotFound {
+				internalLogOnceIf(ctx, lerr, "metacache-walk-scan-dir")
+			}
+			if opts.ReportNotFound && lerr == errFileNotFound && diskCurrent == diskBase {
+				lerr = errFileNotFound
+			} else {
+				lerr = nil
+			}
+			diskHealthCheckOK(ctx, lerr)
+			return lerr
+		}
+		diskHealthCheckOK(ctx, nil)
+
+		items := make([]extendedWalkEntry, 0, len(entries))
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry, SlashSeparator) {
+				// Only directories represent objects or prefixes in this mode.
+				continue
+			}
+			diskName := strings.TrimSuffix(entry, SlashSeparator)
+			switch {
+			case isExtendedObjectDirName(diskName):
+				items = append(items, extendedWalkEntry{
+					disk:     diskName,
+					user:     decodeExtendedObjectPath(diskName),
+					isObject: true,
+				})
+			case strings.HasSuffix(diskName, globalDirSuffix):
+				stem := strings.TrimSuffix(diskName, globalDirSuffix)
+				items = append(items, extendedWalkEntry{
+					disk:     diskName,
+					user:     unescapeExtendedNaming(stem) + SlashSeparator,
+					isObject: true,
+				})
+			default:
+				items = append(items, extendedWalkEntry{
+					disk: diskName,
+					user: decodeExtendedObjectPath(diskName) + SlashSeparator,
+				})
+			}
+		}
+
+		// Emit in S3 key order. For the same name a directory object precedes
+		// the prefix directory, matching the merge layer's object-over-directory
+		// rule.
+		sort.SliceStable(items, func(i, j int) bool {
+			if items[i].user != items[j].user {
+				return items[i].user < items[j].user
+			}
+			return items[i].isObject && !items[j].isObject
+		})
+
+		firstLevel := diskCurrent == diskBase
+		for _, item := range items {
+			if limitReached() {
+				return nil
+			}
+			if contextCanceled(ctx) {
+				return ctx.Err()
+			}
+			if firstLevel && len(opts.FilterPrefix) > 0 && !strings.HasPrefix(item.user, opts.FilterPrefix) {
+				continue
+			}
+			// Conservative forwarding: keep everything that may still be at or
+			// beyond the marker; Marker filtering happens downstream.
+			if forward := opts.ForwardTo; len(forward) > 0 && item.user < forward && !strings.HasPrefix(forward, item.user) {
+				continue
+			}
+
+			diskPath := pathJoin(volumeDir, diskCurrent, item.disk)
+			if !item.isObject {
+				if isDirEmpty(diskPath, legacyFS) {
+					// Emptied concurrently; the safe walk skips such directories too.
+					continue
+				}
+				name := userCurrent + item.user
+				if err := send(metaCacheEntry{name: name}); err != nil {
+					return err
+				}
+				if opts.Recursive {
+					if err := scanDir(name, item.disk+SlashSeparator); err != nil {
+						if errors.Is(err, context.Canceled) {
+							return err
+						}
+						internalLogIf(ctx, err)
+					}
+				}
+				continue
+			}
+
+			if s.walkReadMu != nil {
+				s.walkReadMu.Lock()
+			}
+			metadata, merr := s.readMetadata(ctx, pathJoin(diskPath, xlStorageFormatFile))
+			if s.walkReadMu != nil {
+				s.walkReadMu.Unlock()
+			}
+			diskHealthCheckOK(ctx, merr)
+			if merr != nil {
+				// A marker-named directory without metadata is a torn write;
+				// skip it the way the safe walk skips an unreadable object.
+				if osIsNotExist(merr) || isSysErrIsDir(merr) {
+					continue
+				}
+				return merr
+			}
+			if err := send(metaCacheEntry{name: userCurrent + item.user, metadata: metadata}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return scanDir(userRoot, diskBase)
 }
 
 func (p *xlStorageDiskIDCheck) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writer) (err error) {

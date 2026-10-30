@@ -617,7 +617,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 
 	if objInfo.isMultipart() {
 		// Completion repeats this check under the object write lock.
-		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(objInfo.Name), ObjectOptions{
+		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeObjectNameForBucket(bucket, objInfo.Name), ObjectOptions{
 			VersionID: objInfo.VersionID, MTime: objInfo.ModTime, SrcPoolIdx: idx,
 		}); err != nil {
 			return err
@@ -921,7 +921,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					}
 					gr, err := set.GetObjectNInfo(ctx,
 						bi.Name,
-						encodeDirObject(version.Name),
+						encodeObjectNameForBucket(bi.Name, version.Name),
 						nil,
 						http.Header{},
 						ObjectOptions{
@@ -951,6 +951,11 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 						stopFn(version.Size, err)
 						continue
 					}
+					// Restore the user-domain name: the set layer works on the
+					// storage-stack form, while the pooled APIs below expect the
+					// original key.
+					gr.ObjInfo.Name = version.Name
+
 					if err = z.decommissionObject(ctx, idx, bi.Name, gr); err != nil && !isDataMovementSuperseded(err) {
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
 							ignore = true

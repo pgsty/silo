@@ -168,6 +168,10 @@ type serverCtxt struct {
 
 	SendBufSize, RecvBufSize int
 	CrossDomainXML           string
+
+	// ObjectNaming is the requested on-disk object naming mode
+	// ("safe" or "extended"); empty means unspecified.
+	ObjectNaming string
 	// The layout of disks as interpreted
 	Layout disksLayout
 }
@@ -386,6 +390,17 @@ var (
 
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
+
+	// Requested object naming mode, set from --object-naming or
+	// MINIO_OBJECT_NAMING before the object layer is initialized. Empty means
+	// "not specified": a fresh cluster then defaults to safe mode, and an
+	// existing cluster adopts the mode recorded in its format.
+	globalObjectNaming = ""
+
+	// Resolved cluster-wide object naming mode. Set once the loaded formats
+	// have been verified to agree; read-only afterwards. Used by the listing
+	// merge layer, which has no disk context.
+	globalObjectNamingExtended bool
 
 	globalProxyEndpoints []ProxyEndpoint
 

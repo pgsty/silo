@@ -121,6 +121,10 @@ type formatErasureV3 struct {
 		// Distribution algorithm represents the hashing algorithm
 		// to pick the right set index for an object.
 		DistributionAlgo string `json:"distributionAlgo"`
+		// ObjectNaming carries the cluster-wide object naming mode chosen
+		// when the cluster was first formatted: "safe" (the default when
+		// absent) or "extended". It cannot be changed afterwards.
+		ObjectNaming string `json:"objectNaming,omitempty"`
 	} `json:"xl"`
 	Info DiskInfo `json:"-"`
 }
@@ -155,6 +159,7 @@ func newFormatErasureV3(numSets int, setLen int) *formatErasureV3 {
 	format.ID = mustGetUUID()
 	format.Erasure.Version = formatErasureVersionV3
 	format.Erasure.DistributionAlgo = formatErasureVersionV3DistributionAlgoV3
+	format.Erasure.ObjectNaming = normalizeObjectNamingMode(globalObjectNaming)
 	format.Erasure.Sets = make([][]string, numSets)
 
 	for i := range numSets {
@@ -287,8 +292,12 @@ func formatErasureMigrateV2ToV3(data []byte, export, version string) ([]byte, er
 	formatV3 := formatErasureV3{}
 	formatV3.Version = formatV2.Version
 	formatV3.Format = formatV2.Format
-	formatV3.Erasure = formatV2.Erasure
 	formatV3.Erasure.Version = formatErasureVersionV3
+	formatV3.Erasure.This = formatV2.Erasure.This
+	formatV3.Erasure.Sets = formatV2.Erasure.Sets
+	formatV3.Erasure.DistributionAlgo = formatV2.Erasure.DistributionAlgo
+	// Migrated V2 clusters were written before extended object naming existed,
+	// so they keep the default (safe) mode; ObjectNaming stays empty.
 
 	return json.Marshal(formatV3)
 }
@@ -426,17 +435,29 @@ func checkFormatErasureValue(formatErasure *formatErasureV3, disk StorageAPI) er
 	if formatErasure.Erasure.Version != formatErasureVersionV3 {
 		return fmt.Errorf("Unsupported Erasure backend format found [%s] on %s", formatErasure.Erasure.Version, disk)
 	}
+	if !isObjectNamingModeValid(formatErasure.Erasure.ObjectNaming) {
+		return fmt.Errorf("Unsupported object naming mode [%s] found on %s", formatErasure.Erasure.ObjectNaming, disk)
+	}
 	return nil
 }
 
 // Check all format values.
 func checkFormatErasureValues(formats []*formatErasureV3, disks []StorageAPI, setDriveCount int) error {
+	expectedNaming := ""
 	for i, formatErasure := range formats {
 		if formatErasure == nil {
 			continue
 		}
 		if err := checkFormatErasureValue(formatErasure, disks[i]); err != nil {
 			return err
+		}
+		// Every drive in the deployment must use the same object naming mode;
+		// mixing them would make some keys invisible to part of the cluster.
+		naming := normalizeObjectNamingMode(formatErasure.Erasure.ObjectNaming)
+		if expectedNaming == "" {
+			expectedNaming = naming
+		} else if naming != expectedNaming {
+			return objectNamingModeMismatchError(naming, expectedNaming, disks[i])
 		}
 		if len(formats) != len(formatErasure.Erasure.Sets)*len(formatErasure.Erasure.Sets[0]) {
 			return fmt.Errorf("%s drive is already being used in another erasure deployment. (Number of drives specified: %d but the number of drives found in the %s drive's format.json: %d)",
@@ -494,6 +515,11 @@ func formatErasureV3Check(reference *formatErasureV3, format *formatErasureV3) e
 	tmpFormat := format.Clone()
 	this := tmpFormat.Erasure.This
 	tmpFormat.Erasure.This = ""
+	if normalizeObjectNamingMode(reference.Erasure.ObjectNaming) != normalizeObjectNamingMode(format.Erasure.ObjectNaming) {
+		return fmt.Errorf("object naming mode mismatch, expected %q got %q: %w",
+			normalizeObjectNamingMode(reference.Erasure.ObjectNaming),
+			normalizeObjectNamingMode(format.Erasure.ObjectNaming), errInconsistentDisk)
+	}
 	if len(reference.Erasure.Sets) != len(format.Erasure.Sets) {
 		return fmt.Errorf("Expected number of sets %d, got %d", len(reference.Erasure.Sets), len(format.Erasure.Sets))
 	}
@@ -708,6 +734,7 @@ func newHealFormatSets(refFormat *formatErasureV3, setCount, setDriveCount int, 
 				newFormats[i][j].Erasure.Sets = refFormat.Erasure.Sets
 				newFormats[i][j].Erasure.Version = refFormat.Erasure.Version
 				newFormats[i][j].Erasure.DistributionAlgo = refFormat.Erasure.DistributionAlgo
+				newFormats[i][j].Erasure.ObjectNaming = refFormat.Erasure.ObjectNaming
 			}
 			if format := formats[i*setDriveCount+j]; format != nil && (errs[i*setDriveCount+j] == nil) {
 				if format.Info.Endpoint != "" {

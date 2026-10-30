@@ -690,7 +690,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					// GetObjectReader.Close is called by rebalanceObject
 					gr, err := set.GetObjectNInfo(ctx,
 						bucket,
-						encodeDirObject(version.Name),
+						encodeObjectNameForBucket(bucket, version.Name),
 						nil,
 						http.Header{},
 						ObjectOptions{
@@ -711,6 +711,11 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 						stopFn(0, err)
 						continue
 					}
+
+					// Restore the user-domain name: the set layer works on the
+					// storage-stack form, while the pooled APIs below expect the
+					// original key.
+					gr.ObjInfo.Name = version.Name
 
 					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil && !isDataMovementSuperseded(err) {
 						// This can happen when rebalance stop races with ongoing rebalance workers.
@@ -849,7 +854,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 
 	if oi.isMultipart() {
 		// Completion repeats this check under the object write lock.
-		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(oi.Name), ObjectOptions{
+		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeObjectNameForBucket(bucket, oi.Name), ObjectOptions{
 			VersionID: oi.VersionID, MTime: oi.ModTime, SrcPoolIdx: poolIdx,
 		}); err != nil {
 			return err

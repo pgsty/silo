@@ -810,7 +810,16 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 				bestIdx = otherIdx
 				continue
 			}
-			if path.Clean(best.name) == path.Clean(other.name) {
+			// In extended naming mode an object `name` and the directory of the
+			// prefix `name/` are distinct keys that must both be listed, so the
+			// collision test is exact-name equality. In safe mode a trailing
+			// slash is the only difference that can occur (an object `name/`
+			// versus the directory `name/`), and path.Clean catches it.
+			sameName := best.name == other.name
+			if !globalObjectNamingExtended {
+				sameName = path.Clean(best.name) == path.Clean(other.name)
+			}
+			if sameName {
 				// We may be in a situation where we have a directory and an object with the same name.
 				// In that case we will drop the directory entry.
 				// This should however not be confused with an object with a trailing slash.

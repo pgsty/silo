@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Add an `extended` object naming mode, seeded with `--object-naming=extended`
+  or `MINIO_OBJECT_NAMING=extended` on a cluster's first start and recorded in
+  every `format.json`. In this mode an object and a prefix of the same name
+  (`obj1` and `obj1/obj2`) coexist and are both listed: object names are
+  escaped and regular objects carry a terminal marker on disk, so an object
+  directory can never double as another key's parent. The default (safe) mode
+  keeps its existing behavior and disk layout; the mode cannot be changed or
+  migrated in place, and mixed modes across drives, pools or nodes are rejected
+  at startup. See `docs/minio-limits.md` for the resulting restrictions.
+
 ## RELEASE.2026-10-26T00-00-00Z
 
 Package version: `20261026000000.0.0`; published from source `c3ad836aed0d`.

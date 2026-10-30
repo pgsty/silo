@@ -315,7 +315,7 @@ func (z *erasureServerPools) resolveListingGroup(ctx context.Context, bucket str
 		}
 	}()
 	name := group[0].name
-	object := encodeDirObject(name)
+	object := encodeObjectNameForBucket(bucket, name)
 	if z.SinglePool() {
 		target := z.serverPools[0].getHashedSet(object)
 		for _, entry := range group {

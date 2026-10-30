@@ -420,7 +420,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			}
 
 			// erasureObjects layer needs object names to be encoded
-			encodedEntryName := encodeDirObject(entry.name)
+			encodedEntryName := encodeObjectNameForBucket(bucket, entry.name)
 
 			var result healEntryResult
 			fivs, err := entry.fileInfoVersions(bucket)

@@ -419,6 +419,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 
 		// If there are lifecycle rules for the prefix.
 		_, prefix := path2BucketObjectWithBasePath(f.root, folder.name)
+		// Folder names are disk paths; rules and reported prefixes use the
+		// user-domain key, which differs in extended naming mode.
+		prefix = decodeExtendedDiskPath(prefix)
 		var activeLifeCycle *lifecycle.Lifecycle
 		if f.oldCache.Info.lifeCycle != nil && f.oldCache.Info.lifeCycle.HasActiveRules(prefix) {
 			if f.dataUsageScannerDebug {
@@ -447,7 +450,13 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				}
 				return nil
 			}
-			bucket, prefix := path2BucketObjectWithBasePath(f.root, entName)
+			// Object API calls below run in the user domain, while Path stays
+			// the raw disk path for metadata reads.
+			userEntName := entName
+			if globalObjectNamingExtended {
+				userEntName = decodeExtendedDiskPath(entName)
+			}
+			bucket, prefix := path2BucketObjectWithBasePath(f.root, userEntName)
 			if bucket == "" {
 				if f.dataUsageScannerDebug {
 					console.Debugf(scannerLogPrefix+" no bucket (%s,%s)\n", f.root, entName)
@@ -522,8 +531,8 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 
 			// Object already accounted for, remove from heal map,
 			// simply because getSize() function already heals the
-			// object.
-			delete(abandonedChildren, pathJoin(item.bucket, item.objectPath()))
+			// object. Cache children are keyed by disk paths.
+			delete(abandonedChildren, path.Dir(entName))
 
 			if err != errIgnoreFileContrib {
 				into.addSizes(sz)
@@ -713,6 +722,8 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				break
 			}
 			bucket, prefix := path2BucketObject(k)
+			// WalkDir takes user-domain paths.
+			prefix = decodeObjectName(prefix)
 			stopFn := globalScannerMetrics.time(scannerMetricCheckMissing)
 			f.updateCurrentPath(k)
 
@@ -1260,7 +1271,7 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		}
 	}()
 
-	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, encodeDirObject(obj.Name), opts)
+	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, obj.Name, opts)
 	if err != nil {
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			traceFn(ILMExpiry, nil, nil)
