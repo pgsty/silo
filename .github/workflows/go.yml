@@ -102,7 +102,7 @@ jobs:
         run: go test -race ./cmd -run '^Test(Multipart|PaginateMultipartUploads|ListMultipartUploads|CleanupStaleUploads|ExtractModTime)' -count=1 -timeout=5m
 
       - name: Run listing metadata recovery, pagination and cancellation tests under race detector
-        run: go test -race ./cmd -run '^Test(ListFallback|ListingCache|ListingMerge|ListingRecovery|ListingPending|ListingEntry|ListingSecondLock|StreamMetadataParts|LocalLockerListing|DistributedListing|MergeXLV2LatestNullCrossParity|CountXLV2MixedECGroups|ListCrossParity)' -count=1 -timeout=5m
+        run: go test -race ./cmd -run '^Test(ListFallback|ListingCache|ListingMerge|ListingRecovery|ListingPending|ListingEntry|ListingSecondLock|StreamMetadataParts|LocalLockerListing|DistributedListing|MergeXLV2LatestNullCrossParity|CountXLV2MixedECGroups|ListCrossParity|MigrationCrossParity)' -count=1 -timeout=5m
 
       - name: Run lock cancellation and late-grant cleanup tests under race detector
         run: go test -race ./internal/dsync ./internal/lsync -run '^Test(DRWMutex|LRWMutex)' -count=1 -timeout=5m
