@@ -819,6 +819,26 @@ func TestHasActiveRules(t *testing.T) {
 			prefix:      "",
 			want:        true,
 		},
+		{ // DelMarkerExpiration as the only action
+			inputConfig: `<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter></Filter><DelMarkerExpiration><Days>1</Days></DelMarkerExpiration></Rule></LifecycleConfiguration>`,
+			prefix:      "",
+			want:        true,
+		},
+		{
+			inputConfig: `<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Prefix>foodir/</Prefix></Filter><DelMarkerExpiration><Days>1</Days></DelMarkerExpiration></Rule></LifecycleConfiguration>`,
+			prefix:      "foodir/foobject",
+			want:        true,
+		},
+		{
+			inputConfig: `<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Prefix>foodir/</Prefix></Filter><DelMarkerExpiration><Days>1</Days></DelMarkerExpiration></Rule></LifecycleConfiguration>`,
+			prefix:      "zdir/foobject",
+			want:        false,
+		},
+		{
+			inputConfig: `<LifecycleConfiguration><Rule><Status>Disabled</Status><Filter></Filter><DelMarkerExpiration><Days>1</Days></DelMarkerExpiration></Rule></LifecycleConfiguration>`,
+			prefix:      "",
+			want:        false,
+		},
 	}
 
 	for i, tc := range testCases {
