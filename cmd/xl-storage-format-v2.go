@@ -1138,6 +1138,17 @@ func (x *xlMetaV2) latestModtime() time.Time {
 	return time.Unix(0, x.versions[0].header.ModTime)
 }
 
+// isLatestDeleteMarker returns true if the latest version that is not a free
+// version is a delete marker, or if there is none.
+func (x *xlMetaV2) isLatestDeleteMarker() bool {
+	for _, ver := range x.versions {
+		if !ver.header.FreeVersion() {
+			return ver.header.Type == DeleteType
+		}
+	}
+	return true
+}
+
 func (x *xlMetaV2) addVersion(ver xlMetaV2Version) error {
 	modTime := ver.getModTime().UnixNano()
 	if !ver.Valid() {
@@ -2289,6 +2300,7 @@ func (x xlMetaBuf) ListVersions(volume, path string, allParts bool) ([]FileInfo,
 }
 
 // IsLatestDeleteMarker returns true if latest version is a deletemarker or there are no versions.
+// Free versions are not versions of the object and are skipped.
 // If any error occurs false is returned.
 func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 	vers, headerV, _, buf, err := decodeXLHeaders(x)
@@ -2298,12 +2310,16 @@ func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 	if vers == 0 {
 		return true
 	}
-	isDeleteMarker := false
+	isDeleteMarker := true // only free versions
 
 	_ = decodeVersions(buf, vers, func(idx int, hdr, _ []byte) error {
 		var xl xlMetaV2VersionHeader
 		if _, err := xl.unmarshalV(headerV, hdr); err != nil {
+			isDeleteMarker = false
 			return errDoneForNow
+		}
+		if xl.FreeVersion() {
+			return nil
 		}
 		isDeleteMarker = xl.Type == DeleteType
 		return errDoneForNow
@@ -2312,7 +2328,7 @@ func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 }
 
 // AllHidden returns true are no versions that would show up in a listing (ie all free markers)
-// Optionally also return early if top is a delete marker.
+// Optionally also return early if the top version that is not free is a delete marker.
 func (x xlMetaBuf) AllHidden(topDeleteMarker bool) bool {
 	vers, headerV, _, buf, err := decodeXLHeaders(x)
 	if err != nil {
@@ -2328,16 +2344,12 @@ func (x xlMetaBuf) AllHidden(topDeleteMarker bool) bool {
 		if _, err := xl.unmarshalV(headerV, hdr); err != nil {
 			return errDoneForNow
 		}
-		if topDeleteMarker && idx == 0 && xl.Type == DeleteType {
-			hidden = true
-			return errDoneForNow
+		if xl.FreeVersion() {
+			// Check next version
+			return nil
 		}
-		if !xl.FreeVersion() {
-			hidden = false
-			return errDoneForNow
-		}
-		// Check next version
-		return nil
+		hidden = topDeleteMarker && xl.Type == DeleteType
+		return errDoneForNow
 	})
 	return hidden
 }

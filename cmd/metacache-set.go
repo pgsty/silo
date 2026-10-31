@@ -193,6 +193,11 @@ func (o *listPathOptions) shouldSkip(ctx context.Context, entry metaCacheEntry) 
 	if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
 		return true
 	}
+	// Free versions are not versions of the object. Without other versions
+	// there is nothing to list, and the entry must not count toward the limit.
+	if o.InclDeleted && entry.isObject() && entry.isAllFreeVersions() {
+		return true
+	}
 	if o.Lifecycle != nil || o.Replication.Config != nil {
 		return triggerExpiryAndRepl(ctx, *o, entry)
 	}

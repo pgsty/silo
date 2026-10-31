@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"errors"
+	"time"
 
 	"github.com/zeebo/xxh3"
 )
@@ -28,8 +29,12 @@ import (
 //   - fivs.FreeVersions has all the free versions
 //
 // if inclFreeVersions is true all the versions are in fivs.Versions, free and non-free versions alike.
+// Otherwise IsLatest, SuccessorModTime and LatestModTime are those of the
+// non-free versions.
 //
-// Note: Only the scanner requires fivs.Versions to have exclusively non-free versions. This is used while enforcing NewerNoncurrentVersions lifecycle element.
+// Only healing needs the free versions among the versions. Free versions are
+// not versions of the object, and lifecycle evaluation, listings and data
+// movement must not count them.
 func getFileInfoVersions(xlMetaBuf []byte, volume, path string, inclFreeVersions bool) (FileInfoVersions, error) {
 	fivs, err := getAllFileInfoVersions(xlMetaBuf, volume, path, true)
 	if err != nil {
@@ -56,6 +61,19 @@ func getFileInfoVersions(xlMetaBuf []byte, volume, path string, inclFreeVersions
 	}
 	if !inclFreeVersions {
 		fivs.Versions = fivs.Versions[:n]
+		// A free version is not a version of the object. The latest
+		// version, and the successor of each other version, is among
+		// the rest.
+		for i := range fivs.Versions {
+			fivs.Versions[i].IsLatest = i == 0
+			fivs.Versions[i].SuccessorModTime = time.Time{}
+			if i > 0 {
+				fivs.Versions[i].SuccessorModTime = fivs.Versions[i-1].ModTime
+			}
+		}
+		if n > 0 {
+			fivs.LatestModTime = fivs.Versions[0].ModTime
+		}
 	}
 	// Update numversions
 	for i := range fivs.Versions {
