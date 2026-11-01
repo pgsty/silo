@@ -29,6 +29,7 @@ const (
 	iamRevisionPeerPath  = "/v3/site-replication/peer/iam-revisions"
 	iamUserBoundaryType  = "silo-user-revocation"
 	iamGroupBoundaryType = "silo-group-revocation"
+	iamSTSDeleteType     = "silo-sts-revocation"
 	maxIAMRevisionBatch  = 128
 )
 
@@ -49,6 +50,7 @@ type iamGroupBoundary struct {
 // before applying any change that would lose revocation or member metadata.
 type iamReplicationItem struct {
 	madmin.SRIAMItem
+	STSExpiresAt    time.Time            `json:"stsExpiresAt,omitempty"`
 	GroupGrants     map[string]time.Time `json:"groupGrants,omitempty"`
 	GroupSnapshot   bool                 `json:"groupSnapshot,omitempty"`
 	UserRevocation  *iamUserBoundary     `json:"userRevocation,omitempty"`
@@ -155,6 +157,13 @@ type (
 
 func (c *SiteReplicationSys) replicationItem(ctx context.Context, item madmin.SRIAMItem) (iamReplicationItem, error) {
 	out := iamReplicationItem{SRIAMItem: item}
+	if item.Type == iamSTSDeleteType {
+		r, err := loadIAMRevision(ctx, globalIAMSys.store, getUserIdentityPath(item.Name, stsUser))
+		if err != nil {
+			return out, err
+		}
+		out.STSExpiresAt = r.ExpiresAt
+	}
 	if item.Type == madmin.SRIAMItemSvcAcc && item.SvcAccChange != nil {
 		var key string
 		if item.SvcAccChange.Create != nil {
@@ -242,6 +251,15 @@ func applyIAMReplicationItem(ctx context.Context, item iamReplicationItem) error
 		ctx = context.WithValue(ctx, iamRecordBoundaryKey{}, item.RevokedBefore)
 	}
 	switch item.Type {
+	case iamSTSDeleteType:
+		if item.Name == "" || strings.ContainsAny(item.Name, "/\\") || item.UpdatedAt.IsZero() {
+			return errSRInvalidRequest(errInvalidArgument)
+		}
+		if err := globalIAMSys.store.revokeTempUser(withIAMReplicationTime(ctx, item.UpdatedAt), item.Name, item.STSExpiresAt); err != nil {
+			return iamReplicationError(err)
+		}
+		globalIAMSys.notifyForUser(ctx, item.Name, true)
+		return nil
 	case iamUserBoundaryType:
 		if item.UserRevocation == nil || item.UserRevocation.User == "" || item.UserRevocation.Before.IsZero() {
 			return errSRInvalidRequest(errInvalidArgument)

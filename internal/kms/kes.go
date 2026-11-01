@@ -235,8 +235,11 @@ func (c *kesConn) Decrypt(ctx context.Context, req *DecryptRequest) ([]byte, err
 		return nil, err
 	}
 
-	plaintext, err := c.client.Decrypt(context.Background(), req.Name, req.Ciphertext, aad)
+	plaintext, err := c.client.Decrypt(ctx, req.Name, req.Ciphertext, aad)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if errors.Is(err, kes.ErrKeyNotFound) {
 			return nil, ErrKeyNotFound
 		}

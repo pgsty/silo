@@ -1891,6 +1891,23 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 				if err == nil {
 					continue
 				}
+				if err == errFileNotFound || err == errFileVersionNotFound {
+					// A retry after partial physical deletion may mix removals
+					// with already-absent replies. Both prove the desired outcome.
+					// Marker creation and replication-state updates still require
+					// successful writes; absence cannot acknowledge those operations.
+					physical := true
+					for _, v := range dedupVersions[i].Versions {
+						if v.Deleted || v.MarkDeleted || v.ReplicationState.ReplicationStatusInternal != "" ||
+							v.ReplicationState.VersionPurgeStatusInternal != "" || v.ReplicationState.ReplicaStatus != "" {
+							physical = false
+							break
+						}
+					}
+					if physical {
+						continue
+					}
+				}
 				for _, v := range dedupVersions[i].Versions {
 					delObjErrs[index][v.Idx] = err
 				}
@@ -2193,6 +2210,13 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 				deleteMarker = false
 			}
 		}
+	}
+
+	if opts.DataMovement && opts.DeleteMarker {
+		// Moving a null marker replaces any older null data/marker. Moving
+		// a UUID marker preserves it on retries instead of purging it.
+		deleteMarker = true
+		markDelete = opts.VersionID != nullVersionID
 	}
 
 	purge := opts.isVersionPurge()

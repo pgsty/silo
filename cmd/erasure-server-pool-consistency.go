@@ -27,6 +27,7 @@ import (
 	madmin "github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/pgsty/silo-pkg/v3/sync/errgroup"
 )
 
 // objectPoolInfos reads the addressed version in every pool, including pools
@@ -60,6 +61,125 @@ func (z *erasureServerPools) objectPoolInfos(ctx context.Context, bucket, object
 		return nil, ObjectNotFound{Bucket: bucket, Object: decodeDirObject(object)}
 	}
 	return copies, nil
+}
+
+// checkDataMovementCopies rejects moving a version when another pool holds a
+// newer copy of it, which reads return instead. A cross-pool overwrite can
+// leave such a copy, and a client write can add one while the move copies.
+// Equal timestamps normally identify an interrupted move. Conflicting ties
+// retain the same pool-order winner as reads. While the caller holds the
+// pools-layer object lock, the returned resolver serves the set layer's
+// reconciliation of this version from the same reads. Without opts.NoLock
+// it takes the read lock itself.
+func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket, object string, opts ObjectOptions) (GetObjectInfoFn, error) {
+	if opts.MTime.IsZero() {
+		// The set layer would stamp the moved copy as the newest one.
+		return nil, errInvalidArgument
+	}
+	if !opts.NoLock {
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetRLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return nil, err
+		}
+		ctx = lkctx.Context()
+		defer lk.RUnlock(lkctx)
+	}
+	versionID := opts.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{VersionID: versionID, NoAuditLog: true})
+	if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+		return nil, err
+	}
+	// The snapshot may have been purged or replaced after the reader opened.
+	// In that case the walker must leave the current source state alone.
+	sourcePresent := false
+	for _, copy := range copies {
+		if copy.Index == opts.SrcPoolIdx && copy.ObjInfo.ModTime.Equal(opts.MTime) && copy.ObjInfo.DeleteMarker == opts.DeleteMarker {
+			sourcePresent = true
+		}
+	}
+	if !sourcePresent {
+		return nil, VersionNotFound{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
+	}
+	for _, copy := range copies {
+		if copy.Index != opts.SrcPoolIdx && copy.ObjInfo.ModTime.After(opts.MTime) {
+			return nil, DataMovementOverwriteErr{Bucket: bucket, Object: object, VersionID: opts.VersionID, Err: errDataMovementSuperseded}
+		}
+	}
+	if winner := copies[0]; winner.Index != opts.SrcPoolIdx && winner.ObjInfo.ModTime.Equal(opts.MTime) {
+		for _, copy := range copies {
+			if copy.Index == opts.SrcPoolIdx && (copy.ObjInfo.ETag != winner.ObjInfo.ETag || copy.ObjInfo.DeleteMarker != winner.ObjInfo.DeleteMarker || copy.ObjInfo.Size != winner.ObjInfo.Size) {
+				return nil, DataMovementOverwriteErr{Bucket: bucket, Object: object, VersionID: opts.VersionID, Err: errDataMovementSuperseded}
+			}
+		}
+	}
+	return func(ctx context.Context, b, o string, ropts ObjectOptions) (ObjectInfo, error) {
+		if ropts.VersionID == "" {
+			ropts.VersionID = nullVersionID
+		}
+		if b != bucket || o != object || ropts.VersionID != versionID {
+			return z.replicaObjectInfo(ctx, b, o, ropts)
+		}
+		return replicaCopiesInfo(copies, err, bucket, object, versionID)
+	}, nil
+}
+
+// removeMovedVersions retires only the source versions in the walker's
+// snapshot. A concurrent delete can create a new marker in the source pool;
+// deleting the whole prefix would remove that marker and expose moved data.
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo) error {
+	object = encodeDirObject(object)
+	lk := z.NewNSLock(bucket, object)
+	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return err
+	}
+	ctx = lkctx.Context()
+	defer lk.Unlock(lkctx)
+	for _, version := range versions {
+		vid := version.VersionID
+		if vid == "" {
+			vid = nullVersionID
+		}
+		copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{VersionID: vid, NoAuditLog: true})
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		var src *ObjectInfo
+		var retained []PoolObjInfo
+		for _, copy := range copies {
+			if copy.Index == source {
+				src = &copy.ObjInfo
+			} else {
+				retained = append(retained, copy)
+			}
+		}
+		if src == nil {
+			continue
+		}
+		if !src.ModTime.Equal(version.ModTime) || src.DeleteMarker != version.Deleted {
+			return PreConditionFailed{}
+		}
+		// Successful movement is not enough if the destination changed again.
+		// Keep the source unless another copy still preserves its read result.
+		if len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime) {
+			return PreConditionFailed{}
+		}
+		_, err = z.serverPools[source].DeleteObject(ctx, bucket, object, ObjectOptions{
+			VersionID: vid, NoLock: true, NoAuditLog: true,
+			SkipFreeVersion: true, // preserve the old prefix cleanup's tier-GC behavior
+		})
+		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // Healing also commits object metadata. Both queued healing and drive healing
@@ -137,11 +257,15 @@ func (z *erasureServerPools) replicaObjectInfo(ctx context.Context, bucket, obje
 		opts.VersionID = nullVersionID
 	}
 	copies, err := z.objectPoolInfos(ctx, bucket, object, opts)
+	return replicaCopiesInfo(copies, err, bucket, object, opts.VersionID)
+}
+
+func replicaCopiesInfo(copies []PoolObjInfo, err error, bucket, object, versionID string) (ObjectInfo, error) {
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	if copies[0].ObjInfo.DeleteMarker {
-		return copies[0].ObjInfo, MethodNotAllowed{Bucket: bucket, Object: decodeDirObject(object), VersionID: opts.VersionID}
+		return copies[0].ObjInfo, MethodNotAllowed{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
 	}
 	return mergedPoolObjectInfo(copies), nil
 }
@@ -409,4 +533,111 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 	oi.Name = decodeDirObject(object)
 	oi.replicationDecision = opts.DeleteReplication.ReplicateDecisionStr
 	return oi, err
+}
+
+// deleteObjectsReconciled removes data while retaining each item's authoritative
+// copy until every other pool has completed its cleanup. The caller holds the
+// pools-layer write locks and separates marker creation from this batch.
+func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
+	deleted := make([]DeletedObject, len(objects))
+	errs := make([]error, len(objects))
+	primary := make([]int, len(objects))
+	tiered := make([]bool, len(objects))
+	lookup := errgroup.WithNErrs(len(objects)).WithConcurrency(32)
+	for i, obj := range objects {
+		// Preserve the full request identity even if lookup or cleanup fails.
+		// The HTTP handler includes replication state in its response-index key.
+		deleted[i] = DeletedObject{
+			ObjectName:       obj.ObjectName,
+			VersionID:        obj.VersionID,
+			ReplicationState: obj.ReplicationState(),
+		}
+		primary[i] = -1
+		lookup.Go(func() error {
+			copies, err := z.objectPoolInfos(ctx, bucket, obj.ObjectName, ObjectOptions{VersionID: obj.VersionID, NoAuditLog: true})
+			if err == nil {
+				primary[i] = copies[0].Index
+				for _, copy := range copies {
+					tiered[i] = tiered[i] || copy.ObjInfo.TransitionedObject.Status == lifecycle.TransitionComplete
+				}
+			} else if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+				if isErrReadQuorum(err) {
+					err = InsufficientWriteQuorum{Bucket: bucket, Object: decodeDirObject(obj.ObjectName)}
+				}
+				errs[i] = err
+			}
+			return nil
+		}, i)
+	}
+	lookup.Wait()
+
+	type poolBatch struct {
+		objects []ObjectToDelete
+		indices []int
+		deleted []DeletedObject
+		errs    []error
+	}
+	for phase := 0; phase < 2; phase++ {
+		batches := make([]poolBatch, len(z.serverPools))
+		for i, obj := range objects {
+			if errs[i] != nil || tiered[i] {
+				continue
+			}
+			for p := range z.serverPools {
+				if (p == primary[i]) != (phase == 1) {
+					continue
+				}
+				batches[p].objects = append(batches[p].objects, obj)
+				batches[p].indices = append(batches[p].indices, i)
+			}
+		}
+		// Each phase still uses the set layer's bulk disk I/O and runs pools
+		// concurrently. Include apparently absent pools in cleanup: read-quorum
+		// absence is not proof that an offline drive holds no remaining copy.
+		group := errgroup.WithNErrs(len(z.serverPools))
+		for p, pool := range z.serverPools {
+			if len(batches[p].objects) == 0 {
+				continue
+			}
+			group.Go(func() error {
+				batches[p].deleted, batches[p].errs = pool.DeleteObjects(ctx, bucket, batches[p].objects, opts)
+				return nil
+			}, p)
+		}
+		group.Wait()
+		for _, batch := range batches {
+			for j, i := range batch.indices {
+				if errs[i] != nil {
+					continue
+				}
+				if batch.errs[j] != nil {
+					errs[i] = batch.errs[j]
+				} else if phase == 1 || primary[i] == -1 {
+					deleted[i] = batch.deleted[j]
+				}
+			}
+		}
+	}
+	// Tiered copies can share one remote object, including restored copies.
+	// Reuse the existing reconciliation which suppresses premature tier GC.
+	// Serializing this uncommon path also keeps duplicate key/version entries
+	// in one request from racing their metadata updates under the shared lock.
+	for i, obj := range objects {
+		if !tiered[i] || errs[i] != nil {
+			continue
+		}
+		deleteOpts := opts
+		deleteOpts.VersionID, deleteOpts.NoLock = obj.VersionID, true
+		deleteOpts.DeleteReplication = obj.ReplicationState()
+		if opts.PrefixEnabledFn != nil {
+			deleteOpts.Versioned = opts.PrefixEnabledFn(obj.ObjectName)
+		}
+		_, err := z.deleteObjectReconciled(ctx, bucket, obj.ObjectName, deleteOpts)
+		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			errs[i] = err
+		} else {
+			deleted[i].found = true
+		}
+	}
+	return deleted, errs
 }

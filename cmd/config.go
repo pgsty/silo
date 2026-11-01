@@ -68,7 +68,7 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 					continue
 				}
 
-				data, err = decryptData(data, obj.Name)
+				data, err = decryptData(ctx, data, obj.Name)
 				if err != nil {
 					// ignore history file that cannot be loaded.
 					continue
@@ -110,7 +110,7 @@ func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV str
 		return nil, err
 	}
 
-	return decryptData(data, historyFile)
+	return decryptData(ctx, data, historyFile)
 }
 
 func saveServerConfigHistory(ctx context.Context, objAPI ObjectLayer, kv []byte) error {
@@ -162,7 +162,7 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer, data []byte) (con
 			return nil, err
 		}
 
-		data, err = decryptData(data, configFile)
+		data, err = decryptData(ctx, data, configFile)
 		if err != nil {
 			lookupConfigs(srvCfg, objAPI)
 			return nil, err

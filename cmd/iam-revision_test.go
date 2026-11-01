@@ -7,14 +7,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/grid"
+	"github.com/pgsty/silo-pkg/v3/ldap"
 	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
@@ -88,6 +93,211 @@ func TestIAMRevocationTombstoneReplayIsIdempotent(t *testing.T) {
 			}
 			if err := saveIAMRevision(withIAMReplicationTime(ctx, newer.Add(time.Minute)), store, record.name, record.new(false)); err != nil {
 				t.Fatalf("newer recreation rejected: %v", err)
+			}
+		})
+	}
+}
+
+// An LDAP parent named by a normalized DN longer than NAME_MAX has no record
+// on object storage. Its lookups must find nothing instead of failing login.
+func TestLoadIAMRevisionNameTooLong(t *testing.T) {
+	for _, backend := range []string{"object", "etcd"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx, sys, _ := prepareIAMRevisionFixture(t, backend)
+			store := sys.store.IAMStorageAPI
+			// 160 bytes of UTF-8 become 384 characters.
+			parent, err := ldap.NormalizeDN("uid=Сотрудник,ou=Отдел разработки,ou=Дирекция информационных технологий,ou=people,ou=swengg,dc=min,dc=io")
+			mustIAM(t, err)
+			if len(parent) <= 255 {
+				t.Fatalf("normalized DN has only %d characters", len(parent))
+			}
+			parentPath := getUserIdentityPath(parent, regUser)
+			for _, path := range []string{parentPath, getUserIdentityPath("missing-parent", regUser)} {
+				r, err := loadIAMRevision(ctx, store, path)
+				if err != nil || r.Deleted || !r.timestamp().IsZero() || !r.RevokedBefore.IsZero() {
+					t.Fatalf("absent revision %.40s...: %+v, %v", path, r, err)
+				}
+			}
+			if backend == "object" {
+				var invalid ObjectNameInvalid
+				if _, err := loadIAMRevision(ctx, store, iamConfigUsersPrefix+"a//b/"+iamIdentityFile); !errors.As(err, &invalid) {
+					t.Fatalf("invalid name not caused by length was masked: %v", err)
+				}
+			}
+
+			claims := map[string]any{}
+			mustIAM(t, setIAMParentRevocationClaim(ctx, store, parent, claims))
+			if _, ok := claims[iamParentRevocationClaim]; ok {
+				t.Fatalf("unexpected revocation claim: %v", claims)
+			}
+			if _, err := sys.PolicyDBGet(parent); err != nil {
+				t.Fatalf("policy lookup failed: %v", err)
+			}
+			// The call that failed in AssumeRoleWithLDAPIdentity.
+			secret, err := getTokenSigningKey()
+			mustIAM(t, err)
+			cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{"exp": UTCNow().Add(time.Hour).Unix(), parentClaim: parent}, secret)
+			mustIAM(t, err)
+			cred.ParentUser = parent
+			_, err = sys.SetTempUser(ctx, cred.AccessKey, cred, "")
+			mustIAM(t, err)
+			if _, ok := sys.store.GetUser(cred.AccessKey); !ok {
+				t.Fatal("temporary credential not cached")
+			}
+
+			// Object storage still cannot record a revocation for this parent;
+			// the failure must be reported. Etcd has no such limit.
+			err = saveIAMRevision(ctx, store, parentPath, &iamUserRevocation{})
+			if backend == "object" {
+				if !iamConfigNameTooLong(parentPath, err) {
+					t.Fatalf("expected name-too-long error, got %v", err)
+				}
+				return
+			}
+			mustIAM(t, err)
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.Is(err, errIAMStaleUpdate) {
+				t.Fatalf("revoked parent accepted: %v", err)
+			}
+		})
+	}
+}
+
+// checkPathLength does not count backslashes outside Windows, so this escaped
+// DN passes it. Once config/iam/users exists, as after creating any built-in
+// user, the filesystem rejects the element with ENAMETOOLONG instead.
+func TestLoadIAMRevisionFilesystemNameTooLong(t *testing.T) {
+	ctx, sys, obj := prepareIAMRevisionFixture(t)
+	parent, err := ldap.NormalizeDN("cn=Сидоров П.П.,ou=Отдел ИТ-поддержки,ou=Пользователи,ou=people,ou=swengg,dc=min,dc=io")
+	mustIAM(t, err)
+	parentPath := getUserIdentityPath(parent, regUser)
+	if len(parent) <= 255 || checkPathLength(parentPath) != nil {
+		t.Fatalf("normalized DN must exceed NAME_MAX yet pass checkPathLength: %d characters, %v", len(parent), checkPathLength(parentPath))
+	}
+	_, err = sys.CreateUser(ctx, "existing-user", madmin.AddOrUpdateUserReq{SecretKey: "synthetic-user-password", Status: madmin.AccountEnabled})
+	mustIAM(t, err)
+	mustIAM(t, saveIAMRevision(ctx, sys.store.IAMStorageAPI, getMappedPolicyPath("existing-parent", stsUser, false), &MappedPolicy{Version: 1, Policies: "readwrite"}))
+	store := &IAMStoreSys{IAMStorageAPI: newIAMObjectStore(obj, LDAPUsersSysType)}
+	mustIAM(t, store.LoadIAMCache(ctx, false))
+	r, err := loadIAMRevision(ctx, store.IAMStorageAPI, parentPath)
+	if err != nil || r.Deleted || !r.timestamp().IsZero() {
+		t.Fatalf("absent revision: %+v, %v", r, err)
+	}
+	// LDAP mode reads policydb/sts-users/<DN>.json.
+	if _, err := store.PolicyDBGet(parent); err != nil {
+		t.Fatalf("policy lookup failed: %v", err)
+	}
+	secret, err := getTokenSigningKey()
+	mustIAM(t, err)
+	cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{"exp": UTCNow().Add(time.Hour).Unix(), parentClaim: parent}, secret)
+	mustIAM(t, err)
+	cred.ParentUser = parent
+	if _, err := store.SetTempUser(ctx, cred.AccessKey, cred, ""); err != nil {
+		t.Fatalf("temporary credential rejected: %v", err)
+	}
+	err = saveIAMRevision(ctx, store.IAMStorageAPI, parentPath, &iamUserRevocation{})
+	if !iamConfigNameTooLong(parentPath, err) {
+		t.Fatalf("expected name-too-long error, got %v", err)
+	}
+}
+
+func TestIAMConfigNameTooLong(t *testing.T) {
+	long := iamConfigUsersPrefix + strings.Repeat("x", 256) + "/" + iamIdentityFile
+	short := iamConfigUsersPrefix + strings.Repeat("x", 200) + "/" + iamIdentityFile
+	invalid := iamConfigUsersPrefix + "a//b/" + iamIdentityFile
+	escaped := iamConfigUsersPrefix + strings.Repeat("\\d0", 86) + "/" + iamIdentityFile
+	limit := iamConfigUsersPrefix + strings.Repeat("x", 255) + "/" + iamIdentityFile
+	unicode := iamConfigUsersPrefix + strings.Repeat("界", 100) + "/" + iamIdentityFile
+	deep := iamConfigUsersPrefix + strings.Repeat("nested/", 160) + iamIdentityFile
+	for _, tc := range []struct {
+		name string
+		path string
+		err  error
+		want bool
+	}{
+		{"NAME_MAX", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
+		{"escaped DN", escaped, ObjectNameInvalid{Bucket: minioMetaBucket, Object: escaped}, runtime.GOOS != "windows"},
+		{"short component", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, false},
+		{"exact component limit", limit, ObjectNameInvalid{Bucket: minioMetaBucket, Object: limit}, false},
+		{"unicode byte length", unicode, ObjectNameInvalid{Bucket: minioMetaBucket, Object: unicode}, false},
+		{"total path length", deep, ObjectNameInvalid{Bucket: minioMetaBucket, Object: deep}, false},
+		{"short drive path", short, errFileNameTooLong, false},
+		{"policy suffix at limit", getMappedPolicyPath(strings.Repeat("x", 250), stsUser, false), errFileNameTooLong, false},
+		{"policy suffix exceeds limit", getMappedPolicyPath(strings.Repeat("x", 251), stsUser, false), errFileNameTooLong, true},
+		{"drive", long, errFileNameTooLong, true},
+		{"wrapped drive", long, fmt.Errorf("read: %w", errFileNameTooLong), true},
+		{"wrapped object", long, fmt.Errorf("read: %w", ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}), true},
+		{"no error", long, nil, false},
+		{"not found", long, errConfigNotFound, false},
+		{"offline drive", long, errDiskNotFound, false},
+		{"read quorum", long, InsufficientReadQuorum{}, false},
+		{"access denied", long, PrefixAccessDenied{}, false},
+		{"deadline", long, context.DeadlineExceeded, false},
+		{"invalid name", invalid, ObjectNameInvalid{Bucket: minioMetaBucket, Object: invalid}, false},
+		{"invalid long name", invalid + strings.Repeat("x", 256), errFileNameTooLong, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := iamConfigNameTooLong(tc.path, tc.err); got != tc.want {
+				t.Errorf("got %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// Moving a drive can make an existing record exceed the total path limit.
+// A length error must not turn that parent's revocation into a missing record.
+func TestLoadIAMRevisionDeepPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("exercises the Darwin total-path limit")
+	}
+	for _, tc := range []struct {
+		name   string
+		parent string
+	}{
+		{"ASCII", strings.Repeat("p", 200)},
+		{"Unicode", strings.Repeat("界", 100)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetTestGlobals()
+			defer resetTestGlobals()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			base := t.TempDir()
+			oldRoot := filepath.Join(base, "drive")
+			mustIAM(t, os.Mkdir(oldRoot, 0o700))
+			obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, oldRoot))
+			mustIAM(t, err)
+			defer func() { obj.Shutdown(ctx) }()
+			store := newIAMObjectStore(obj, LDAPUsersSysType)
+			cred := auth.Credentials{ParentUser: tc.parent}
+			parentPath := getUserIdentityPath(tc.parent, regUser)
+			mustIAM(t, store.saveIAMConfig(ctx, &UserIdentity{Version: 1, Deleted: true, RevokedBefore: UTCNow()}, parentPath))
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.Is(err, errIAMStaleUpdate) {
+				t.Fatalf("original parent revocation ineffective: %v", err)
+			}
+			mustIAM(t, obj.Shutdown(ctx))
+			deep := base
+			for len(deep) < 850 {
+				deep = filepath.Join(deep, strings.Repeat("d", 80))
+			}
+			mustIAM(t, os.MkdirAll(deep, 0o700))
+			newRoot := filepath.Join(deep, "drive")
+			mustIAM(t, checkPathLength(newRoot))
+			mustIAM(t, os.Rename(oldRoot, newRoot))
+			// The record still exists; a relative read avoids the total-path limit.
+			root, err := os.OpenRoot(newRoot)
+			mustIAM(t, err)
+			defer root.Close()
+			data, err := root.ReadFile(filepath.Join(minioMetaBucket, parentPath, xlStorageFormatFile))
+			mustIAM(t, err)
+			if len(data) == 0 {
+				t.Fatal("missing physical revocation record")
+			}
+			obj, _, err = initObjectLayer(ctx, mustGetPoolEndpoints(0, newRoot))
+			mustIAM(t, err)
+			store = newIAMObjectStore(obj, LDAPUsersSysType)
+			var invalid ObjectNameInvalid
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.As(err, &invalid) {
+				t.Fatalf("expected path error for an existing parent revocation, got %v", err)
 			}
 		})
 	}

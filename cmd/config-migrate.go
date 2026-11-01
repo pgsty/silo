@@ -91,7 +91,7 @@ func readConfigWithoutMigrate(ctx context.Context, objAPI ObjectLayer) (config.C
 			return nil, err
 		}
 
-		data, err = decryptData(data, configFile)
+		data, err = decryptData(ctx, data, configFile)
 		if err != nil {
 			return nil, err
 		}

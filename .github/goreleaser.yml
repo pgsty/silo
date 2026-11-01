@@ -27,6 +27,10 @@ archives:
     ids:
       - silo
     name_template: "silo_{{ .Env.PKG_VERSION }}_{{ .Os }}_{{ .Arch }}"
+    formats: ["tar.gz"]
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
     # Explicit so the license materials cannot silently drop out of the
     # binary archives: GoReleaser's default file globs would miss NOTICE.
     # CREDITS stays out deliberately -- at 1.8MB it would dominate the

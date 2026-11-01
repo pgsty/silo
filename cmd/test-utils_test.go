@@ -503,6 +503,8 @@ func resetTestGlobals() {
 	resetGlobalHealState()
 	// Reset globalIAMSys to `nil`
 	resetGlobalIAMSys()
+	// Object-layer fixtures must not reuse the preceding IAM suite's etcd store.
+	globalEtcdClient = nil
 }
 
 // Configure the server for the test run.

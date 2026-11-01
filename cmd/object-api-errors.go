@@ -834,10 +834,21 @@ func (de DataMovementOverwriteErr) Error() string {
 	if de.VersionID != "" {
 		objInfoStr = fmt.Sprintf("%s version-id=%s", objInfoStr, de.VersionID)
 	}
+	if de.Err == errDataMovementSuperseded {
+		return fmt.Sprintf("data movement skipped, another pool holds a newer copy of %s", objInfoStr)
+	}
 	return fmt.Sprintf("invalid data movement operation, source and destination pool are the same for %s", objInfoStr)
 }
 
 func isDataMovementOverWriteErr(err error) bool {
 	var de DataMovementOverwriteErr
 	return errors.As(err, &de)
+}
+
+// isDataMovementSuperseded reports a version that was not moved because
+// another pool already holds a newer copy, which reads return. The source copy
+// is a stale duplicate: the move is complete, and the source may be removed.
+func isDataMovementSuperseded(err error) bool {
+	var de DataMovementOverwriteErr
+	return errors.As(err, &de) && de.Err == errDataMovementSuperseded
 }

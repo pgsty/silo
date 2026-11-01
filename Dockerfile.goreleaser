@@ -1,4 +1,4 @@
-FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS curl-build
+FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS curl-build
 ARG TARGETARCH
 COPY dockerscripts/build-static-curl.sh /build/build-static-curl
 RUN /bin/sh /build/build-static-curl
@@ -9,7 +9,7 @@ COPY --from=curl-build /go/bin/curl /curl
 COPY --from=curl-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENTRYPOINT ["/curl"]
 
-FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
+FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
 
 ARG TARGETARCH
 
@@ -17,9 +17,9 @@ ENV GOPATH=/go
 ENV CGO_ENABLED=0
 
 ARG MC_REPO=pgsty/mc
-ARG MC_VERSION=RELEASE.2026-10-18T00-00-00Z
-ARG MC_AMD64_SHA256=b5392a642dbc9685b517ee901f032d1d5e88f41704436f0f08dde6060b577db3
-ARG MC_ARM64_SHA256=17f3eb694ed34e155b331b1215832140749656d8d4b60e2e3a4d0573b8f320d7
+ARG MC_VERSION=RELEASE.2026-10-26T00-00-00Z
+ARG MC_AMD64_SHA256=54bd131039dad6677f083a75207b28f82818c067c8e65fae1973f51510d268e1
+ARG MC_ARM64_SHA256=9bb294f1912f8c6b9ac08c9a0b8d2964b86306a7c440b987ee5f0570d18de3c5
 
 RUN apk add -U --no-cache \
     ca-certificates \
@@ -68,7 +68,19 @@ RUN apk add -U --no-cache \
     ln -sf mcli /go/bin/mc
 
 FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3 AS certs
+# Native root blocklist mitigation: https://access.redhat.com/security/vulnerabilities/RHSB-2026-012
 RUN dnf -y install ca-certificates && \
+    if [ -d /etc/pki/ca-trust/source/blocklist ]; then \
+      blocklist=/etc/pki/ca-trust/source/blocklist; \
+    else \
+      blocklist=/etc/pki/ca-trust/source/blacklist; \
+    fi && \
+    trust extract --overwrite --format=pem-bundle \
+      --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' \
+      "$blocklist/Comodo_AAA_Services_root.pem" && \
+    trust extract --overwrite --format=pem-bundle \
+      --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' \
+      "$blocklist/emSign_ECC_Root_CA_-_G3.pem" && \
     update-ca-trust && \
     cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tmp/ca-certificates.crt && \
     dnf clean all && \

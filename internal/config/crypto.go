@@ -48,8 +48,8 @@ func EncryptBytes(k *kms.KMS, plaintext []byte, context kms.Context) ([]byte, er
 // DecryptBytes decrypts the ciphertext using a key managed by the KMS.
 // The same context that have been used during encryption must be
 // provided.
-func DecryptBytes(k *kms.KMS, ciphertext []byte, context kms.Context) ([]byte, error) {
-	plaintext, err := Decrypt(k, bytes.NewReader(ciphertext), context)
+func DecryptBytes(ctx context.Context, k *kms.KMS, ciphertext []byte, associatedData kms.Context) ([]byte, error) {
+	plaintext, err := Decrypt(ctx, k, bytes.NewReader(ciphertext), associatedData)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +115,10 @@ func Encrypt(k *kms.KMS, plaintext io.Reader, ctx kms.Context) (io.Reader, error
 // Decrypt decrypts the ciphertext using a key managed by the KMS.
 // The same context that have been used during encryption must be
 // provided.
-func Decrypt(k *kms.KMS, ciphertext io.Reader, associatedData kms.Context) (io.Reader, error) {
+func Decrypt(ctx context.Context, k *kms.KMS, ciphertext io.Reader, associatedData kms.Context) (io.Reader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	const (
 		MaxMetadataSize = 1 << 20 // max. size of the metadata
 		Version         = 1
@@ -145,7 +148,7 @@ func Decrypt(k *kms.KMS, ciphertext io.Reader, associatedData kms.Context) (io.R
 		return nil, err
 	}
 
-	key, err := k.Decrypt(context.TODO(), &kms.DecryptRequest{
+	key, err := k.Decrypt(ctx, &kms.DecryptRequest{
 		Name:           metadata.KeyID,
 		Ciphertext:     metadata.KMSKey,
 		AssociatedData: associatedData,

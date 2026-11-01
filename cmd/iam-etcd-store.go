@@ -123,8 +123,8 @@ func (ies *IAMEtcdStore) saveIAMConfig(ctx context.Context, item any, itemPath s
 	return nil
 }
 
-func (ies *IAMEtcdStore) decodeIAMConfig(item any, data []byte, path string) error {
-	data, err := decryptData(data, path)
+func (ies *IAMEtcdStore) decodeIAMConfig(ctx context.Context, item any, data []byte, path string) error {
+	data, err := decryptData(ctx, data, path)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (ies *IAMEtcdStore) loadIAMConfigBytes(ctx context.Context, path string) ([
 	if err != nil {
 		return nil, err
 	}
-	data, err = decryptData(data, path)
+	data, err = decryptData(ctx, data, path)
 	if err == nil {
 		ies.index.observe(path, data)
 	}
@@ -187,7 +187,7 @@ func (ies *IAMEtcdStore) loadPolicyDoc(ctx context.Context, policy string, m map
 }
 
 func (ies *IAMEtcdStore) getPolicyDocKV(ctx context.Context, kvs *mvccpb.KeyValue, m map[string]PolicyDoc) error {
-	data, err := decryptData(kvs.Value, string(kvs.Key))
+	data, err := decryptData(ctx, kvs.Value, string(kvs.Key))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
@@ -211,27 +211,31 @@ func (ies *IAMEtcdStore) getPolicyDocKV(ctx context.Context, kvs *mvccpb.KeyValu
 }
 
 func (ies *IAMEtcdStore) loadPolicyDocs(ctx context.Context, m map[string]PolicyDoc) error {
-	ctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
+	// Bound the etcd read without shortening the caller's decryption budget.
+	cctx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 	defer cancel()
 	//  Retrieve all keys and values to avoid too many calls to etcd in case of
 	//  a large number of policies
-	r, err := ies.client.Get(ctx, iamConfigPoliciesPrefix, etcd.WithPrefix())
+	r, err := ies.client.Get(cctx, iamConfigPoliciesPrefix, etcd.WithPrefix())
 	if err != nil {
 		return err
 	}
 
 	// Parse all values to construct the policies data model.
 	for _, kvs := range r.Kvs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err = ies.getPolicyDocKV(ctx, kvs, m); err != nil && !errors.Is(err, errNoSuchPolicy) {
 			return err
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (ies *IAMEtcdStore) getUserKV(ctx context.Context, userkv *mvccpb.KeyValue, userType IAMUserType, m map[string]UserIdentity, basePrefix string) error {
 	var u UserIdentity
-	err := ies.decodeIAMConfig(&u, userkv.Value, string(userkv.Key))
+	err := ies.decodeIAMConfig(ctx, &u, userkv.Value, string(userkv.Key))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchUser
@@ -392,9 +396,9 @@ func (ies *IAMEtcdStore) loadMappedPolicy(ctx context.Context, name string, user
 	return nil
 }
 
-func (ies *IAMEtcdStore) getMappedPolicy(kv *mvccpb.KeyValue, m *xsync.MapOf[string, MappedPolicy], basePrefix string) error {
+func (ies *IAMEtcdStore) getMappedPolicy(ctx context.Context, kv *mvccpb.KeyValue, m *xsync.MapOf[string, MappedPolicy], basePrefix string) error {
 	var p MappedPolicy
-	err := ies.decodeIAMConfig(&p, kv.Value, string(kv.Key))
+	err := ies.decodeIAMConfig(ctx, &p, kv.Value, string(kv.Key))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
@@ -434,7 +438,7 @@ func (ies *IAMEtcdStore) loadMappedPolicies(ctx context.Context, userType IAMUse
 
 	// Parse all policies mapping to create the proper data model
 	for _, kv := range r.Kvs {
-		if err = ies.getMappedPolicy(kv, m, basePrefix); err != nil && !errors.Is(err, errNoSuchPolicy) {
+		if err = ies.getMappedPolicy(ctx, kv, m, basePrefix); err != nil && !errors.Is(err, errNoSuchPolicy) {
 			return err
 		}
 	}

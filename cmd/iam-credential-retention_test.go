@@ -85,15 +85,21 @@ func TestIAMPolicyDeletionRemainsExplicit(t *testing.T) {
 			}
 			p, err := sys.store.GetPolicy("readwrite")
 			mustIAM(t, err)
+			native, err := sys.InfoPolicy("readwrite")
+			mustIAM(t, err)
 			if err := sys.DeletePolicy(ctx, "readwrite", true); err == nil {
 				t.Fatal("local pristine builtin policy became deletable")
 			}
 			_, err = sys.SetPolicy(ctx, "readwrite", p)
 			mustIAM(t, err)
 			mustIAM(t, sys.DeletePolicy(ctx, "readwrite", true))
+			assertIAMPolicyResetInfo(t, sys, "readwrite", native)
 			mustIAM(t, sys.store.LoadIAMCache(ctx, false))
-			if _, err := sys.store.GetPolicy("readwrite"); !errors.Is(err, errNoSuchPolicy) {
-				t.Fatalf("reload restored an explicitly deleted override: %v", err)
+			assertIAMPolicyResetInfo(t, sys, "readwrite", native)
+			r, err = loadIAMRevision(ctx, sys.store, getPolicyDocPath("readwrite"))
+			mustIAM(t, err)
+			if !r.Deleted {
+				t.Fatal("native policy restoration removed the override tombstone")
 			}
 			_, err = sys.SetPolicy(ctx, "readwrite", p)
 			mustIAM(t, err)

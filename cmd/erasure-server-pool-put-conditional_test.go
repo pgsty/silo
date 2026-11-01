@@ -355,7 +355,7 @@ func TestPoolsConditionalPutVersionSelection(t *testing.T) {
 				opts.ReplicaLockReconcile, opts.ReplicationRequest = true, true
 				want = addressed
 			case "movement":
-				opts.DataMovement, opts.SrcPoolIdx = true, 1
+				opts.DataMovement, opts.SrcPoolIdx, opts.MTime = true, 1, addressed.ModTime
 				want = addressed
 			case "tie":
 				want = putConsistencyObject(t, z, bucket, object, 0, "tie-winner", ObjectOptions{Versioned: true, MTime: current.ModTime})

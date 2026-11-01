@@ -399,12 +399,15 @@ func getCompleteMultipartMD5(parts []CompletePart) string {
 	return s3MD5
 }
 
-// Clean unwanted fields from metadata
+// Keep metadata written by pre-release builds out of public object metadata.
+const rollbackIDKey = ReservedMetadataPrefixLower + "rollback-id"
+
+// Clean unwanted fields from metadata.
 func cleanMetadata(metadata map[string]string) map[string]string {
 	// Remove STANDARD StorageClass
 	metadata = removeStandardStorageClass(metadata)
 	// Clean meta etag keys 'md5Sum', 'etag', "expires", "x-amz-tagging".
-	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey)
+	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey, rollbackIDKey)
 }
 
 // Filter X-Amz-Storage-Class field only if it is set to STANDARD.

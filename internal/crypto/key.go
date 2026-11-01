@@ -130,9 +130,12 @@ func (key *ObjectKey) Unseal(extKey []byte, sealedKey SealedKey, domain, bucket,
 		unsealConfig = sio.Config{MinVersion: sio.Version10, Key: sha.Sum(nil)}
 	}
 
-	if out, err := sio.DecryptBuffer(key[:0], sealedKey.Key[:], unsealConfig); len(out) != 32 || err != nil {
+	out, err := sio.DecryptBuffer(key[:0], sealedKey.Key[:], unsealConfig)
+	if len(out) != 32 || err != nil {
 		return ErrSecretKeyMismatch
 	}
+	// DARE v1 may allocate a new buffer instead of reusing key's backing array.
+	copy(key[:], out)
 	return nil
 }
 

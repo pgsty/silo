@@ -27,6 +27,7 @@ import (
 
 // Tests create endpoints with ellipses and without.
 func TestCreateServerEndpoints(t *testing.T) {
+	useStaticTestEndpoints(t)
 	testCases := []struct {
 		serverAddr string
 		args       []string

@@ -511,12 +511,11 @@ func testSiteReplicationStatusDetectsCorsTimestampMismatch(obj ObjectLayer, _ st
 	}))
 	defer remote.Close()
 
-	serviceCred, err := auth.CreateCredentials("cors-status-service", "cors-status-service-secret-key")
+	serviceCred, _, err := globalIAMSys.NewServiceAccount(ctx, credentials.AccessKey, nil, newServiceAccountOpts{
+		accessKey: "cors-status-service",
+		secretKey: "cors-status-service-secret-key",
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	serviceCred.ParentUser = credentials.AccessKey
-	if _, err = globalIAMSys.store.AddServiceAccount(ctx, serviceCred); err != nil {
 		t.Fatal(err)
 	}
 	defer globalIAMSys.DeleteServiceAccount(ctx, serviceCred.AccessKey, false)
@@ -585,12 +584,11 @@ func testSiteReplicationStatusCountsCorsPerSite(obj ObjectLayer, _ string, bucke
 	}))
 	defer remote.Close()
 
-	serviceCred, err := auth.CreateCredentials("cors-count-service", "cors-count-service-secret-key")
+	serviceCred, _, err := globalIAMSys.NewServiceAccount(ctx, credentials.AccessKey, nil, newServiceAccountOpts{
+		accessKey: "cors-count-service",
+		secretKey: "cors-count-service-secret-key",
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	serviceCred.ParentUser = credentials.AccessKey
-	if _, err = globalIAMSys.store.AddServiceAccount(ctx, serviceCred); err != nil {
 		t.Fatal(err)
 	}
 	defer globalIAMSys.DeleteServiceAccount(ctx, serviceCred.AccessKey, false)
@@ -1190,12 +1188,11 @@ func testCorsReplicationDispatchStatusHealReload(obj ObjectLayer, _ string, buck
 	}))
 	defer remote.Close()
 
-	serviceCred, err := auth.CreateCredentials("cors-integration-svc", "cors-integration-service-secret")
+	serviceCred, _, err := globalIAMSys.NewServiceAccount(ctx, credentials.AccessKey, nil, newServiceAccountOpts{
+		accessKey: "cors-integration-svc",
+		secretKey: "cors-integration-service-secret",
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	serviceCred.ParentUser = credentials.AccessKey
-	if _, err = globalIAMSys.store.AddServiceAccount(ctx, serviceCred); err != nil {
 		t.Fatal(err)
 	}
 	defer globalIAMSys.DeleteServiceAccount(ctx, serviceCred.AccessKey, false)

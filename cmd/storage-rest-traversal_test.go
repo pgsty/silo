@@ -231,12 +231,9 @@ func TestStorageRESTTraversalRejected(t *testing.T) {
 			{"DeleteVersion-DataDir", func() error {
 				return restClient.DeleteVersion(ctx, "foo", "obj", badFI(p), false, DeleteOptions{})
 			}},
-			// DeleteOptions.OldDataDir is guarded too, but cannot be exercised
-			// from here: DeleteVersionHandler hardcodes `opts := DeleteOptions{}`
-			// and never reads the wire value, so the field is unreachable today.
-			// That is an accidental mitigation, not a control - see
-			// TestGuardChecksUnreachableFields for the unit-level assertion that
-			// the guard is ready if anyone ever plumbs it through.
+			{"DeleteVersion-OldDataDir", func() error {
+				return restClient.DeleteVersion(ctx, "foo", "obj", badFI(""), false, DeleteOptions{UndoWrite: true, OldDataDir: p})
+			}},
 			{"RenameData-srcPath", func() error {
 				_, err := restClient.RenameData(ctx, "foo", p, badFI(""), "bar", "dst", RenameOptions{})
 				return err

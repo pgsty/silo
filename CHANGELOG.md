@@ -1,241 +1,164 @@
 # Changelog
 
-## Unreleased
+## RELEASE.2026-10-26T00-00-00Z
 
-Preparation target: `RELEASE.2026-10-18T00-00-00Z` (package version
-`20261018000000.0.0`). **This is a tag and Draft preparation; it is not a public
-Server release.** The latest published Server remains 20260916. Server 20261015
-also remains a Draft. Existing binaries, packages and images do not change.
-See the [component matrix](https://silo.pgsty.com/compatibility/versions/) and
-[changes since the public release](https://github.com/pgsty/silo/compare/RELEASE.2026-09-16T00-00-00Z...main).
+Package version: `20261026000000.0.0`; published from source `c3ad836aed0d`.
+Artifacts are listed in the [GitHub release](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-26T00-00-00Z).
+The coordinated [English release notes](https://silo.pgsty.com/blog/release/silo-20261026/)
+and [Chinese release notes](https://silo.pgsty.com/zh/blog/release/silo-20261026/)
+cover all components, upgrade guidance, and validation scope.
 
-### October 18 dependency update
+- Fix LDAP login for long normalized DNs without hiding unreadable IAM
+  revocation records. Only length errors for valid keys with an ASCII path
+  component over 255 bytes are treated as absent; long-DN writes still fail.
+  Thanks to [@910patin](https://github.com/910patin) for the original fix and
+  reproduction in [#250](https://github.com/pgsty/silo/pull/250).
+- Build the server and standalone debugging tools with Go 1.27.3 and refresh
+  Go dependencies, including silo-pkg v3.15.2, mcli 20261026
+  and upstream minio-go `320af050c445` for multipart, read/seek,
+  batch-delete and bucket-replication removal fixes. Retain output-format and NetBSD compatibility selections.
+- Embed Console v2.5.1 source `fff1618d9abb`, including its GUI update,
+  diagnostic WebSocket closing handshake, complete health-report decoding,
+  group-membership preservation, OIDC group permissions, TLS-proxy session
+  cookies, credential exports and accessibility fixes.
+- Bundle mcli 20261026 in container builds, the verified client installer and
+  Helm client jobs. Include client identity isolation, resync status and rate
+  fixes, and bounded batch-status fallback. Scripts must handle the additive
+  batch `pending` state and nonzero exits for partial resync mutations.
+- Read current bucket inventory in account-info responses so Console refreshes
+  immediately reflect successful creation and deletion. This management endpoint
+  now performs a live list instead of returning a cached inventory.
+- Restore the native built-in policy immediately after resetting an override.
+  Peer and etcd notifications reload committed state, so delayed delete events
+  preserve subsequent edits. Keep deletion revisions, policy-in-use checks and
+  custom-policy deletion behavior; storage failures retain the previous policy.
+- Reload policies without holding the authentication-cache lock, retain IAM
+  write ordering and publish replacements only after a complete successful load.
+  Propagate cancellation through IAM/KMS and SSE-S3 decryption without shortening
+  the caller's policy-query deadline.
+- Preserve authoritative copies when a multi-pool delete or bulk cleanup fails,
+  choose an available pool for a new delete marker, and keep tier data referenced
+  by surviving copies. This does not introduce strict cross-pool read recovery.
+- Preserve remote tier data when lifecycle expiry only adds a delete marker,
+  including non-null versions in suspended buckets. Forward `FULL_OBJECT`
+  checksum type for multipart replicas. Thanks to
+  [@botdeniska](https://github.com/botdeniska) for these lifecycle, replication
+  and multi-pool deletion contributions.
+- Preserve Kafka's default broker protocol 2.1 and terminal-width behavior;
+  fix legacy DARE v1 key unsealing and verify DARE v1/v2 and MinKMS TLS compatibility.
+- Forward storage RPC delete options, including the previous data directory
+  needed by overwrite rollback. Preserve existing drive/RPC timeouts, request
+  cancellation, object locking, read-quorum and healing behavior.
+- Update bundled curl to 8.23.0 and require patched static libraries. Apply
+  [Red Hat's compromised-CA mitigation](https://access.redhat.com/security/vulnerabilities/RHSB-2026-012);
+  the root blocklist also rejects legitimate chains under the affected roots.
+- Ship Windows platform archives as ZIP; Linux and macOS retain tar.gz.
 
-- Select silo-pkg v3.14.3, upstream minio-go v7.4.1, published mcli 20261018
-  and Console v2.4.2 source (`ef2dd2c41d21`). The SDK includes cancellation cleanup, UTC retention
-  timestamps and preserved STS duration; parallel GET/Compose remain opt-in.
-- Adopt silo-pkg's faster admin-action classification during policy evaluation,
-  preserving authorization behavior and compatibility with existing clients.
-  Update the standalone `reorder-disks` debugging module to the same package version.
-- Build with Go 1.27.2 and refresh Go x/* modules. Apply go-jose v4.1.6,
-  LDAP v3.4.15, compress v1.20.3, msgp v1.6.5, etcd v3.7.2, fwd v1.2.1 and
-  cpuid v2.4.1 bug/security fixes. OIDC JWK RSA keys must not exceed 4096 bits.
-- Update the bundled mcli archive hashes, installation helper and Helm client
-  image to the published 20261018 release. Server Helm image defaults retain the
-  public 20260916 version until a Server image is published.
-- Refresh pinned UBI 9 images and use GoReleaser v2.18.3, nFPM v2.48.0,
-  golangci-lint v2.15.0 and govulncheck v1.9.0. Keep the NetBSD go-systemd
-  v22.6.0 compatibility replacement.
+Storage timeouts retain their existing meaning: a returned timeout does not
+prove that the underlying disk operation stopped or that a write did not
+commit. Late commits or delayed rollback can affect newer writes; stale reads
+remain possible after partial failures, lease loss or network partitions. This
+release does not provide distributed fencing or repair previously inconsistent
+objects.
 
-The sections below retain the cumulative maintenance history, including changes
-already shipped in 20260916; the source comparison above identifies this
-candidate's exact delta.
+These source changes are not included in the published 20261018 artifacts.
 
-### Authorization and security
+## RELEASE.2026-10-18T00-00-00Z
 
-- Synchronize CPU metrics reads with resource-metrics updates (#210), preventing
-  concurrent map access from terminating the server during Prometheus scraping.
-  Metric names, values and authentication requirements are unchanged.
-- Restrict embedded Console's anonymous sharing proxy to object-content GETs
-  at the configured S3 origin, and reject every redirect. Internal metrics,
-  system paths and non-download S3 operations cannot be reached through it.
-  Normal public, presigned and versioned downloads remain available without a
-  new setting; a full sharing-disable switch is not introduced. See
-  [Console #56](https://github.com/pgsty/silo-console/pull/56) and the
-  [design record](https://github.com/pgsty/silo-console/issues/52).
-  Thanks to Jiri Pejchal (@jiri-pejchal) for the report.
-- Persist IAM deletion revisions and parent revocation boundaries so stale site
-  events cannot restore deleted identities, policies or their older grants
-  (#191, #192). Peer deletion notifications reload committed storage; deliberate
-  recreation requires a newer revision, and credentials issued before the
-  parent's revocation remain invalid.
-  **Coordinated upgrade required:** upgrade every participating node and site.
-  Mixed old/new nodes sharing an IAM backend and rolling downgrade are
-  unsupported. Back up complete IAM storage and encryption material; an admin
-  export of live records omits deletion history. Reissue credentials for
-  recreated parents and explicitly reconcile pre-upgrade revocations whose
-  history is already lost. Restoring an older backup can lose later revocations;
-  keep affected sites isolated until reconciliation/rekeying is complete. See
-  [the operator runbook](https://silo.pgsty.com/operations/replication/iam-upgrade/).
-- Enforce an absolute HTTP/1 request-header deadline through the connection
-  wrapper (#196). Repeated small reads no longer extend that deadline, and
-  `--read-header-timeout` / `MINIO_READ_HEADER_TIMEOUT` now reaches the HTTP
-  server. HTTP/1 request bodies retain the rolling idle timeout; this does not
-  impose a total upload/download duration. A shorter setting also constrains
-  TLS handshake reads. The wrapper's strict header mode is not applied to HTTP/2.
-- Reject unsigned `x-amz-*` request headers that could turn a signed PUT into a
-  copy of another object accessible to the signer (SN-2026-011). The latest
-  public Server is affected; the fix is on main. See [the advisory ledger](https://silo.pgsty.com/about/security-advisories/).
-- Align signed request fields with policy conditions and enforce header-only
-  presigned payload checksums. See [the signed-header review](https://silo.pgsty.com/blog/design/signed-header-coverage/).
-- **Breaking policy semantics:** separate self-service `admin:ChangeMyPassword`
-  from `admin:CreateUser`. Built-in read-only policies follow the split. Preserve
-  both denies if the previous combined restriction must survive upgrades or
-  rollback. Saved policies are not rewritten. Deploy with the matching Console
-  and pkg; see [the migration guide](docs/iam/password-permissions.md).
+Package version: `20261018000000.0.0`; published on 2026-10-18 from source
+`0cd388c666f8211f552604ae73448a066e9c25ce`. This section covers the changes
+after the public 20260916 source, `2a4d51406b7ed87af5fe6fe0f801f3290f96eb3c`.
 
-### Object storage and replication
+Full [English release notes](https://silo.pgsty.com/blog/release/silo-20261018/)
+and [Chinese release notes](https://silo.pgsty.com/zh/blog/release/silo-20261018/)
+cover the upgrade contract, evidence and remaining limits.
 
-- Withdraw default persistent `ListMultipartUploads` scanning (#79). Restore
-  node-local cache listing for an empty prefix and exact-key lookup otherwise;
-  restart omissions, true-prefix and cache-pagination limitations remain.
-  Preserve bucket/key identity metadata, path safety and stale-upload cleanup.
-  `MINIO_API_MULTIPART_LISTING` stays retired and ignored with a startup warning;
-  obsolete shared `api multipart_listing` keys remain tolerated. **Existing
-  opt-in strict users lose durable listing and strict cancellation.** The
-  read-only admin `multipart-preflight` reports `mode=legacy`; its scan budgets
-  and readiness do not gate public listing or startup. Durable, complete,
-  scalable enumeration remains deferred. See the
-  [design and limits](https://silo.pgsty.com/blog/design/list-multipart-uploads/#implementation).
-  Thanks to mr javad seydi (@mrjavadseydi) for the original metadata-and-scan
-  implementation (#198).
-- Keep the default read-quorum, best-effort multipart cancellation and
-  first-matching-pool behavior when retiring the listing switch. The optional
-  strict cancellation branch is removed. Wrong-target protection, upload-ID
-  path validation and peer notification with the request context remain.
-  HTTP 204 for an absent upload remains idempotent and does not prove physical
-  cleanup. **Known boundary:** delayed creation writes can still restore a
-  readable upload after cancellation; this change adds no creation fence.
-- Preserve object tags during multi-pool metadata reconciliation by reading the
-  resolved tag field together with its revision (#189). Previously, reconciliation
-  could replace existing tags with an empty value.
-- Preserve the tag revision on SSE-KMS metadata replication (#193), and advance
-  tag revisions monotonically on local PUT/DELETE tagging (#196). Empty tags
-  participate in reconciliation as an ordered deletion, preventing older
-  events from restoring removed tags. SSE-C key rotation also retains the tag
-  revision. Malformed historical revisions can fail and retry; their missing
-  history is not reconstructed by the upgrade.
-- Complete delete-marker version purges and preserve their identity and retry
-  state through MRF recovery (#196). Recovery accepts a 405 marker response only
-  when its version, bucket, object name and modification time match the task.
-  Purge audit status is normalized from `COMPLETE` to `COMPLETED`.
-  Thanks to Julien Laurenceau (@julienlau) for the investigation and proposed
-  fix in #184 that helped shape this follow-up.
-- Restore only the six replication-specific metadata fields after ordinary
-  request metadata extraction (#194). This prevents transport-only `aws-chunked`
-  from being stored as Content-Encoding while preserving the signed-header
-  protections. Trusted Snowball entries no longer inherit the outer archive's
-  ordinary metadata. Thanks to Mikhail Khadarenka (@chodorenko) for the fix in #187.
-  **Existing data:** these repairs prevent new errors; they do not scan or rewrite
-  historical object metadata, recover lost tags or prove that old purge work has
-  converged. Follow the [read-only audit procedure](https://silo.pgsty.com/operations/replication/replica-metadata-audit/)
-  before planning any repair of stored state.
+- **Object Lock (#234, #235):** require `s3:PutObjectRetention` with request-body
+  conditions before object lookup; weakening active GOVERNANCE additionally
+  requires bypass intent and permission. Protect caller-addressed write versions,
+  directory null versions and persisted multipart targets under the write lock;
+  fail closed on unreadable lock state. See SN-2026-015/016 in the
+  [advisory ledger](https://silo.pgsty.com/about/security-advisories/).
+- **IAM Admin authorization (#242, `995439260`):** enforce explicit self denies,
+  session restrictions and plugin decisions; prevent restricted delegation and
+  non-root mutation of root-derived credentials under built-in authorization.
+  Preserve empty-policy inheritance and damaged-key cleanup. Normalize bulk
+  self-list aliases and allow ordinary policyless self inspection. See
+  [SN-2026-017](https://silo.pgsty.com/blog/security/20261018-release-hardening/#sn-2026-017).
+- **Scoped STS revocation (`0cd388c66`):** enumerate durable parent/type-selected
+  tokens, propagate each committed tombstone to sibling nodes and sites, and
+  recover missed notifications through existing refresh/healing. Tokens issued
+  only at an isolated site are outside the requesting cluster's snapshot;
+  propagation is eventual and newly issued keys remain valid.
+- **Pool migration (#248, `60c7179dd`, `1748f62c7`):** prevent stale moved
+  payloads from overwriting newer copies, preserve null/UUID delete markers,
+  recheck source versions and clean only confirmed moved versions under the
+  object lock. Added per-pool reads and per-version cleanup have maintenance
+  costs; earlier data loss is not reconstructed.
 
-- Make exact-version delete-marker purges converge in replicated buckets
-  (`eb4f5e5b3`, `254b19ac0`, `358ab38fb`). A purge no longer creates the
-  marker on drives that lacked it; a retried purge of a missing version is
-  acknowledged only when a write-quorum majority of drives report it absent;
-  purge results merge removed and reliably absent replies; healing a marker
-  preserves its stored replication and purge metadata; and a queued marker
-  creation is re-checked against the source under the replication lock before
-  it is sent, so a purge that already reached the targets is not undone by a
-  stale task from another frontend, a GET/LIST heal, the scanner or MRF.
-  Purging a data version whose earlier purge is still pending reports it as a
-  data version. **Known limitations:** creations already in flight or replayed
-  from another site, and minority marker copies left by a crash after a
-  majority-acknowledged purge, are tracked in #217. See
-  [the replication reliability record](https://silo.pgsty.com/blog/design/replication-reliability/).
-- Keep a null object version that has listing quorum when a newer minority of
-  drives sorts first (`8d06424b1`). The resolver recounts per header only when
-  the original selection lacks quorum, every non-empty drive stream holds
-  exactly one ordinary null version and all share the same erasure layout;
-  mixed histories keep their previous behavior. **Known limitation:** a
-  successful ListObjects can still omit readable keys during rolling restarts
-  with concurrent overwrites (#218). Do not run destination-deleting sync tools
-  against a listing taken during a rolling restart; list again once the
-  cluster is stable.
-- Carry object tags through rebalance and decommission for ordinary and
-  multipart writes (`fced86303`). Both migration entry points restore the tags
-  and their revision fields when rewriting the object in the destination pool.
-  Tags dropped by earlier migrations are not recovered; audit tag-dependent
-  lifecycle and policy rules for pools migrated with an older build.
+- **LIST recovery (#239, `3dd53eb81`, `2080b3d03`):** confirm eligible uncertain
+  latest-object groups under the appropriate read locks, distinguish absence
+  from failure, preserve directory/common-prefix entries and terminal pagination
+  errors, and make lock backoff cancelable. Resolved entries keep their fast path;
+  version history, quorum and disk formats retain their contracts. The strict
+  sub-5% performance target remains unconfirmed in the recorded comparison.
+- **Multipart listing (`4733e1423`):** withdraw #243's default persistent scan.
+  Public listing uses node-local cache or exact-key lookup; restart omissions,
+  prefix and cache-pagination limits remain. The retired strict switch is ignored
+  with a startup warning. **Former strict users lose durable listing and strict
+  cancellation.** Keep identity metadata, path/wrong-target safety, default
+  best-effort Abort and peer notification. Diagnostic `multipart-preflight`
+  reports `mode=legacy`; its budgets do not gate public operations. #79 remains
+  open, including delayed creation after cancellation.
+- **Multipart cleanup (#236, `0f9199e0c`):** parse native timestamps before the
+  Base64 fallback and remove empty hash parents without a second expiry wait.
+  Keep active/unreadable uploads; default expiry/check intervals stay 24h/6h.
+- **Commit errors (#232):** missing staged `xl.meta` at final commit becomes
+  HTTP 503 `SlowDownWrite`; preserve this classification across storage RPC and
+  healing. Real incomplete bodies retain their existing errors.
+- **Reused metadata (#233):** clear absent legacy `EcM`/`Signature` and locally
+  reset mutually exclusive scanner response fields without changing disk/RPC formats.
+- **Checksum and Console errors (#225, #229, #238):** align Content-MD5 and
+  algorithm-specific messages, retaining the generic unknown-algorithm message;
+  embed Console's wrapped-error and `InvalidBucketState` handling.
+- **Lambda and erasure documentation (#220, `2fde3cf53`):** fix inverted
+  `TargetIDSet.IsEmpty`; document parity/quorum per object and erasure set.
+- **Coordinated dependencies:** Console v2.4.2 (`ef2dd2c41d21`), mcli 20261018
+  (`fa3b8bf72458`), silo-pkg v3.14.3, upstream minio-go v7.4.1 and Go 1.27.2.
+  Standalone Console/mcli still declare pkg v3.14.2. The Server package update
+  speeds admin-action classification without changing policy behavior. Refresh
+  Go x/*, go-jose v4.1.6, LDAP v3.4.15, compress v1.20.3, msgp v1.6.5, etcd v3.7.2,
+  fwd v1.2.1 and cpuid v2.4.1. OIDC RSA JWKs above 4096 bits are rejected.
+  Keep the NetBSD go-systemd v22.6.0 replacement; parallel SDK GET/Compose remain opt-in.
+- **Build and delivery:** gate releases on Object Lock regressions; use
+  Git for rebrand scanning without a ripgrep dependency (`7007c164a`). Refresh UBI 9 pins,
+  GoReleaser v2.18.3, nFPM v2.48.0, golangci-lint v2.15.0 and govulncheck v1.9.0.
+  Update bundled client hashes/helper and the Helm client image to mcli 20261018.
+  The chart's Server default stays at the public 20260916 image until publication.
 
-- Evaluate conditional multipart completion against the logical current object
-  across all pools while holding the existing object lock. A stale `If-Match`
-  can no longer replace newer data in another pool, and the current ETag is no
-  longer rejected because the upload resides next to an older copy. Conditions
-  are evaluated once; a current delete marker counts as an absent object.
-  **Availability change:** if any pool's metadata cannot be read, conditional
-  completion fails even when another pool can still serve GET/HEAD. This also
-  applies when the unreadable pool may not hold the object: absence cannot be
-  verified. Retry after the pool recovers. Unconditional completion and the
-  single-pool path retain their existing behavior.
+Upgrade every writer and replication site; follow the
+[IAM recovery guide](https://silo.pgsty.com/operations/replication/iam-upgrade/).
+Old strict multipart users must review the capability loss before upgrading.
+#217's multi-site delete-marker late creation and crash residue remain unresolved.
+Source tests, draft artifacts, public images and production rollout are separate
+acceptance boundaries; historical 20261015 test counts do not certify this source.
 
-- Evaluate ordinary multi-pool conditional PUT against the logical current
-  object across all pools, including draining pools, under the existing object
-  lock (#207). A stale destination copy no longer accepts a stale ETag or rejects
-  the current one; a current delete marker is treated as absence.
-  **Availability change:** if any pool's object metadata cannot be verified,
-  the condition fails even when GET can use another pool; read-quorum failures
-  return 503. Restore readability or heal before retrying. Unconditional PUT,
-  single-pool conditions and internal replication retain their existing behavior.
-  A public condition with a destination `versionId` compares the current object
-  while preserving the requested write version. This change does not retire
-  stale copies in other pools, undo historical accepted overwrites or provide
-  a new global clock-ordering guarantee. The multipart-completion repair in #190
-  neither introduced nor repaired this separate PUT defect.
+## RELEASE.2026-09-16T00-00-00Z
 
-- Reconcile ordinary single-object version DELETE across all pools, including
-  null versions, delete markers and unqualified directory-marker DELETE. This
-  applies the deletion to every resolved pool copy under existing quorum
-  rules. Pending outbound delete replication retains versions until the
-  existing replication worker completes their purge; a successful response
-  does not imply immediate physical removal from every drive. Unreadable
-  pools now consistently return 503 instead of depending on pool traversal
-  order; insufficient read quorum returns `SlowDownRead`. This extends the
-  existing failure surface. Retry after recovery.
-  Cleanup failures also return an error. Batch deletion already fans out across
-  pools; replication and scanner cleanup keep their existing contracts. See
-  [scope and limitations](docs/bucket/lifecycle/access-tiering-removal.md#version-deletion-scope).
+Package version: `20260916000000.0.0`; published source:
+`2a4d51406b7ed87af5fe6fe0f801f3290f96eb3c`.
 
-- Remove the opt-in GET-frequency pool-tiering feature from PR #60, including
-  its tracker, mover, scanner hooks, configuration, XML actions and metrics.
-  Accept and ignore retired configuration/XML and preserve ordinary statistics
-  when reading v9 caches. See [migration notes](docs/bucket/lifecycle/access-tiering-removal.md).
-  The [decision record](https://silo.pgsty.com/compatibility/access-tiering-removal/) preserves
-  the feature's introduction, subsequent fixes, rollback scope and review history.
-- Preserve the independent multi-pool write, metadata, healing and conditional
-  deletion fixes from PR #178, including shared remote-tier reference protection.
-- Enforce `If-Match` on DELETE, preserve retention and independently ordered
-  Object Lock/tag updates, and correctly retransmit encrypted replicas.
-- Preserve plaintext part sizes and raw SSE-C replicas; prevent SSE-C
-  compression, honor key-rotation checksums, and complete attributes pagination.
-- Repair federated CopyObject checksums, destination timestamps, reserved
-  metadata, encrypted-object forwarding, legal hold and KMS context.
-- Make resync counters, target selection, cancellation and worker lifetimes
-  reflect actual work, and report bounded MRF drops.
-- Converge bucket metadata with deterministic source state, deletion tombstones,
-  creation time recovery and diagnostics. The mixed-version export gate requires
-  coordinated upgrades before tombstones are exported. See [the #77 record](https://silo.pgsty.com/blog/design/bucket-metadata-convergence/).
-- Include per-bucket CORS in metadata export/import, close metadata publication
-  and logger races, and report effective bucket quotas in metrics.
+This release includes signed-header and payload-policy hardening (SN-2026-011/012),
+durable IAM revocations (SN-2026-013), the bounded Console sharing proxy
+(SN-2026-014), password-permission separation, multi-pool conditions/deletion/tag
+repairs, encrypted/federated copy repairs, delete-marker retry fixes, opt-in strict
+multipart discovery, Go-default TLS key exchange, absolute HTTP/1 header deadlines
+and synchronized CPU metrics. It embeds Console v2.4.1, mcli 20260916 and pkg v3.14.1.
 
-### Console, dependencies and delivery
-
-- Restore embedded Console login over loopback TLS, trusted-proxy handling and
-  all four WebSocket connection limits. Preserve Go TLS defaults across transports.
-- Directly require `github.com/pgsty/silo-pkg/v3` v3.14.1; select released Console
-  v2.4.1 (`v0.0.0-20260916075814-1360e26d976d`) and mcli 20260916
-  (`v0.0.0-20260916070421-e952aa78f10a`) with explicit PGSTY replacements.
-  The embedded frontend identifies itself as Console v2.4.1.
-- Pin upstream minio-go `v7.3.1-0.20260915093545-32e1f32cb176` to handle
-  CopyObject errors embedded in HTTP 200 responses. Update JWX to v3.3.0 for
-  JSON field-name escaping, strfmt to v0.27.2 for Go 1.27 hostname validation,
-  and LZ4 to v4.1.30 for frame-reader, partial-read and concurrency fixes.
-  Retain the earlier Go x/* and bounded AMQP frame updates, Go 1.27.1, and
-  go-systemd v22.6.0's NetBSD compatibility replacement.
-- Refresh container base digests and build static curl 8.22.0 from verified
-  source for both Linux architectures. Pin the published mcli 20260916 archives
-  and hashes in the container and update the client installer default.
-- Prepare Helm chart 7.0.3 with Server and client defaults for the September 16
-  batch. Publish the chart only after the corresponding Server image exists.
-- Pin GoReleaser v2.18.1 and its action commit identically in snapshot and release
-  workflows. Dependency-only PRs now run the Test Release Pipeline too.
-
-Validation of earlier source revisions does not establish acceptance of this
-candidate. Final source, package, image and multi-process checks are tracked
-separately in [#203](https://github.com/pgsty/silo/issues/203). No Server release
-or production rollout is implied by this preparation target.
+The complete release, contributor credits, historical artifact acceptance and
+upgrade requirements are preserved in the canonical
+[English](https://silo.pgsty.com/blog/release/silo-20260916/) and
+[Chinese](https://silo.pgsty.com/zh/blog/release/silo-20260916/) release records.
 
 ## RELEASE.2026-09-03T13-18-01Z
 

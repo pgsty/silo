@@ -186,6 +186,7 @@ func TestGetAPIEndpoints(t *testing.T) {
 }
 
 func TestCheckLocalServerAddr(t *testing.T) {
+	useTestEndpointDNS(t)
 	testCases := []struct {
 		serverAddr  string
 		expectedErr error

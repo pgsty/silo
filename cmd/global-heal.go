@@ -423,7 +423,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			encodedEntryName := encodeDirObject(entry.name)
 
 			var result healEntryResult
-			fivs, err := entry.fileInfoVersions(bucket)
+			fivs, err := entry.allFileInfoVersions(bucket)
 			if err != nil {
 				res, err := healInPool(ctx, bucket, encodedEntryName, "",
 					madmin.HealOpts{

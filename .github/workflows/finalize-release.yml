@@ -148,7 +148,9 @@ jobs:
           for rpm_file in finalize/packages/*.rpm; do
             signature_output="$(sudo rpmkeys --checksig --verbose "${rpm_file}")"
             printf '%s\n' "${signature_output}"
-            if ! printf '%s\n' "${signature_output}" | tr '[:upper:]' '[:lower:]' | grep -q "key id ${key_id}: ok"; then
+            normalized_signature="$(printf '%s\n' "${signature_output}" | tr '[:upper:]' '[:lower:]')"
+            full_fingerprint="$(printf '%s' "${expected_fingerprint}" | tr '[:upper:]' '[:lower:]')"
+            if ! printf '%s\n' "${normalized_signature}" | grep -Eq "key id ${key_id}: ok|key fingerprint: ${full_fingerprint}: ok"; then
               echo "Signature verification failed for ${rpm_file}" >&2
               exit 1
             fi

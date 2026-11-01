@@ -25,7 +25,7 @@ import (
 
 // DARECiphers returns a list of supported cipher suites
 // for the DARE object encryption.
-func DARECiphers() []byte { return []byte{sio.AES_256_GCM, sio.CHACHA20_POLY1305} }
+func DARECiphers() []byte { return []byte{sio.AES_GCM, sio.CHACHA20_POLY1305} }
 
 // TLSCiphers returns a list of supported TLS transport
 // cipher suite IDs.

@@ -1447,7 +1447,10 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 			return buckets[i].Name < buckets[j].Name
 		})
 	} else {
-		buckets, err = objectAPI.ListBuckets(ctx, BucketOptions{Cached: true})
+		// Console refreshes this inventory immediately after bucket mutations.
+		// A stale cached list can otherwise hide a creation or retain a deletion
+		// indefinitely in the client's snapshot.
+		buckets, err = objectAPI.ListBuckets(ctx, BucketOptions{})
 		if err != nil {
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return

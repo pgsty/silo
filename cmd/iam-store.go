@@ -647,6 +647,20 @@ func setDefaultCannedPolicies(policies map[string]PolicyDoc) {
 	}
 }
 
+// Remove a stored policy from cache. A built-in policy's deletion removes its
+// override, so its native definition remains available with native metadata.
+// The durable tombstone is retained separately to reject stale overrides.
+func removePolicyFromCache(name string, policies map[string]PolicyDoc) (restoredDefault bool) {
+	delete(policies, name)
+	for _, p := range policy.DefaultPolicies {
+		if p.Name == name {
+			policies[name] = defaultPolicyDoc(p.Definition)
+			return true
+		}
+	}
+	return false
+}
+
 // LoadIAMCache reads all IAM items and populates a new iamCache object and
 // replaces the in-memory cache object.
 func (store *IAMStoreSys) LoadIAMCache(ctx context.Context, firstTime bool) error {
@@ -711,13 +725,18 @@ func (store *IAMStoreSys) LoadIAMCache(ctx context.Context, firstTime bool) erro
 		if err := store.loadUsers(ctx, svcUser, newCache.iamUsersMap); err != nil {
 			return err
 		}
+		// Rebuild STS revisions as well: a missed etcd watch event must not
+		// leave a cached token valid or hide its tombstone after a restart.
+		if err := store.loadUsers(ctx, stsUser, newCache.iamSTSAccountsMap); err != nil {
+			return err
+		}
 
 		newCache.buildUserGroupMemberships()
 	}
 
 	for name := range newCache.iamPolicyDocsMap {
 		if store.revisionIndex().get(getPolicyDocPath(name)).Deleted {
-			delete(newCache.iamPolicyDocsMap, name)
+			removePolicyFromCache(name, newCache.iamPolicyDocsMap)
 		}
 	}
 
@@ -752,6 +771,14 @@ func (store *IAMStoreSys) LoadIAMCache(ctx context.Context, firstTime bool) erro
 		})
 
 		cache.updatedAt = time.Now()
+	}
+
+	// Revision loading is independent of cache replacement. Even if ongoing
+	// IAM writes defer the full swap, a missed STS notification must converge.
+	for key := range cache.iamSTSAccountsMap {
+		if store.revisionIndex().get(getUserIdentityPath(key, stsUser)).Deleted {
+			delete(cache.iamSTSAccountsMap, key)
+		}
 	}
 
 	return nil
@@ -1363,9 +1390,9 @@ func (store *IAMStoreSys) PolicyDBSet(ctx context.Context, name, policy string, 
 }
 
 // PolicyNotificationHandler - loads given policy from storage. If not present,
-// deletes from cache. This notification only reads from storage, and updates
-// cache. When the notification is for a policy deletion, it updates the
-// user-policy and group-policy maps as well.
+// removes its override from cache. This notification only reads from storage,
+// and updates cache. A deleted built-in override restores its native policy;
+// a deleted custom policy is removed from user-policy and group-policy maps.
 func (store *IAMStoreSys) PolicyNotificationHandler(ctx context.Context, policy string) error {
 	if policy == "" {
 		return errInvalidArgument
@@ -1376,8 +1403,10 @@ func (store *IAMStoreSys) PolicyNotificationHandler(ctx context.Context, policy 
 
 	err := store.loadPolicyDoc(ctx, policy, cache.iamPolicyDocsMap)
 	if errors.Is(err, errNoSuchPolicy) {
-		// policy was deleted, update cache.
-		delete(cache.iamPolicyDocsMap, policy)
+		if removePolicyFromCache(policy, cache.iamPolicyDocsMap) {
+			cache.updatedAt = time.Now()
+			return nil
+		}
 
 		// update user policy map
 		cache.iamUserPolicyMap.Range(func(u string, mp MappedPolicy) bool {
@@ -1413,74 +1442,77 @@ func (store *IAMStoreSys) PolicyNotificationHandler(ctx context.Context, policy 
 		cache.updatedAt = time.Now()
 		return nil
 	}
+	if err == nil {
+		cache.updatedAt = time.Now()
+	}
 	return err
 }
 
-// DeletePolicy - deletes policy from storage and cache. When this called in
-// response to a notification (i.e. isFromNotification = true), it skips the
-// validation of policy usage and the attempt to delete in the backend as well
-// (as this is already done by the notifying node).
+// DeletePolicy - deletes a stored policy and restores the native definition
+// when it was a built-in override. Notifications reload committed storage, so
+// a delayed deletion event cannot remove a subsequently recreated policy.
 func (store *IAMStoreSys) DeletePolicy(ctx context.Context, policy string, isFromNotification bool) error {
 	if policy == "" {
 		return errInvalidArgument
+	}
+	if isFromNotification {
+		return store.PolicyNotificationHandler(ctx, policy)
 	}
 
 	cache := store.lock()
 	defer store.unlock()
 
-	if !isFromNotification {
-		if err := store.checkIAMRevision(ctx, getPolicyDocPath(policy), true); err != nil {
-			return err
+	if err := store.checkIAMRevision(ctx, getPolicyDocPath(policy), true); err != nil {
+		return err
+	}
+	if _, replicated := iamReplicationTime(ctx); !replicated {
+		if _, exists := cache.iamPolicyDocsMap[policy]; !exists {
+			// Preserve idempotent local deletion without creating a durable
+			// revocation for a misspelled/nonexistent policy name.
+			return nil
 		}
-		if _, replicated := iamReplicationTime(ctx); !replicated {
-			if _, exists := cache.iamPolicyDocsMap[policy]; !exists {
-				// Preserve idempotent local deletion without creating a durable
-				// revocation for a misspelled/nonexistent policy name.
-				return nil
+		// Check if policy is mapped to any existing user or group. If so, we do not
+		// allow deletion of the policy. If the policy is mapped to an STS account,
+		// we do allow deletion.
+		users := []string{}
+		groups := []string{}
+		cache.iamUserPolicyMap.Range(func(u string, mp MappedPolicy) bool {
+			pset := mp.policySet()
+			if store.getUsersSysType() == MinIOUsersSysType {
+				if _, ok := cache.iamUsersMap[u]; !ok {
+					// This case can happen when a temporary account is
+					// deleted or expired - remove it from userPolicyMap.
+					cache.iamUserPolicyMap.Delete(u)
+					return true
+				}
 			}
-			// Check if policy is mapped to any existing user or group. If so, we do not
-			// allow deletion of the policy. If the policy is mapped to an STS account,
-			// we do allow deletion.
-			users := []string{}
-			groups := []string{}
-			cache.iamUserPolicyMap.Range(func(u string, mp MappedPolicy) bool {
-				pset := mp.policySet()
-				if store.getUsersSysType() == MinIOUsersSysType {
-					if _, ok := cache.iamUsersMap[u]; !ok {
-						// This case can happen when a temporary account is
-						// deleted or expired - remove it from userPolicyMap.
-						cache.iamUserPolicyMap.Delete(u)
-						return true
-					}
-				}
-				if pset.Contains(policy) {
-					users = append(users, u)
-				}
-				return true
-			})
-			cache.iamGroupPolicyMap.Range(func(g string, mp MappedPolicy) bool {
-				pset := mp.policySet()
-				if pset.Contains(policy) {
-					groups = append(groups, g)
-				}
-				return true
-			})
-			if len(users) != 0 || len(groups) != 0 {
-				return errPolicyInUse
+			if pset.Contains(policy) {
+				users = append(users, u)
 			}
-		}
-
-		err := store.deletePolicyDoc(ctx, policy)
-		if errors.Is(err, errNoSuchPolicy) {
-			// Ignore error if policy is already deleted.
-			err = nil
-		}
-		if err != nil {
-			return err
+			return true
+		})
+		cache.iamGroupPolicyMap.Range(func(g string, mp MappedPolicy) bool {
+			pset := mp.policySet()
+			if pset.Contains(policy) {
+				groups = append(groups, g)
+			}
+			return true
+		})
+		if len(users) != 0 || len(groups) != 0 {
+			return errPolicyInUse
 		}
 	}
 
-	delete(cache.iamPolicyDocsMap, policy)
+	err := store.deletePolicyDoc(ctx, policy)
+	if errors.Is(err, errNoSuchPolicy) {
+		// Ignore error if policy is already deleted.
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+
+	removePolicyFromCache(policy, cache.iamPolicyDocsMap)
 	cache.updatedAt = time.Now()
 
 	return nil
@@ -1568,8 +1600,20 @@ func (store *IAMStoreSys) ListPolicies(ctx context.Context, bucketName string) (
 	defer store.unlock()
 
 	m := map[string]PolicyDoc{}
-	err := store.loadPolicyDocs(ctx, m)
+	// Keep cache writers serialized, but let authentication use the committed
+	// cache while the replacement is loaded into this private map.
+	err := func() error {
+		store.IAMStorageAPI.unlock()
+		defer store.IAMStorageAPI.lock()
+		if err := store.loadPolicyDocs(ctx, m); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -1596,8 +1640,18 @@ func (store *IAMStoreSys) ListPolicyDocs(ctx context.Context, bucketName string)
 	defer store.unlock()
 
 	m := map[string]PolicyDoc{}
-	err := store.loadPolicyDocs(ctx, m)
+	err := func() error {
+		store.IAMStorageAPI.unlock()
+		defer store.IAMStorageAPI.lock()
+		if err := store.loadPolicyDocs(ctx, m); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -2184,45 +2238,68 @@ func (store *IAMStoreSys) SetTempUser(ctx context.Context, accessKey string, cre
 
 // RevokeTokens - revokes all temporary credentials, or those with matching type,
 // associated with the parent user.
-func (store *IAMStoreSys) RevokeTokens(ctx context.Context, parentUser string, tokenRevokeType string) error {
+func (store *IAMStoreSys) RevokeTokens(ctx context.Context, parentUser string, tokenRevokeType string) ([]string, error) {
 	if parentUser == "" {
-		return errInvalidArgument
+		return nil, errInvalidArgument
 	}
-
+	before := UTCNow()
 	cache := store.lock()
 	defer store.unlock()
-
 	secret, err := getTokenSigningKey()
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	var revoked bool
-	for _, ui := range cache.iamSTSAccountsMap {
-		if ui.Credentials.ParentUser != parentUser {
+	// Another node may have issued a token whose notification was lost.
+	// Enumerate durable identities, retaining cached entries for retrying a
+	// partially propagated revocation. Do not hold up cached authentication.
+	accounts := maps.Clone(cache.iamSTSAccountsMap)
+	if err := store.withIAMStorage(ctx, func(ctx context.Context) error {
+		return store.loadUsers(ctx, stsUser, accounts)
+	}); err != nil {
+		return nil, err
+	}
+	var revoked []string
+	var failures []error
+	for key, ui := range accounts {
+		if ui.Credentials.ParentUser != parentUser || ui.UpdatedAt.After(before) || ui.Credentials.IsExpired() {
 			continue
 		}
 		if tokenRevokeType != "" {
 			claims, err := getClaimsFromTokenWithSecret(ui.Credentials.SessionToken, secret)
 			if err != nil {
-				continue // skip if token is invalid
+				continue
 			}
-			// skip if token type is given and does not match
 			if v, _ := claims.Lookup(tokenRevokeTypeClaim); v != tokenRevokeType {
 				continue
 			}
 		}
-		if err := store.deleteUserIdentity(ctx, ui.Credentials.AccessKey, stsUser); err != nil {
-			return err
+		if err := store.deleteUserIdentity(ctx, key, stsUser); err != nil {
+			failures = append(failures, err)
+			continue
 		}
-		delete(cache.iamSTSAccountsMap, ui.Credentials.AccessKey)
-		revoked = true
+		delete(cache.iamSTSAccountsMap, key)
+		revoked = append(revoked, key)
 	}
-
-	if revoked {
+	if len(revoked) != 0 {
 		cache.updatedAt = time.Now()
 	}
+	return revoked, errors.Join(failures...)
+}
 
+// revokeTempUser applies an immutable token's replicated tombstone without
+// touching the parent, its policies, or other (including newer) tokens.
+func (store *IAMStoreSys) revokeTempUser(ctx context.Context, key string, expiresAt time.Time) error {
+	cache := store.lock()
+	defer store.unlock()
+	u := UserIdentity{Version: 1, Deleted: true, ExpiresAt: expiresAt}
+	if err := store.saveUserIdentity(ctx, key, stsUser, &u); err != nil {
+		return err
+	}
+	delete(cache.iamSTSAccountsMap, key)
+	cache.updatedAt = time.Now()
+	if store.group != nil {
+		store.group.Forget(key)
+	}
 	return nil
 }
 

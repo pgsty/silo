@@ -348,6 +348,13 @@ func saveIAMRevision(ctx context.Context, store IAMStorageAPI, path string, item
 		// STS access keys identify immutable tokens, not reusable user names.
 		return errIAMStaleUpdate
 	}
+	if strings.HasPrefix(path, iamConfigSTSPrefix) && deleted {
+		// STS keys are immutable. A delayed revocation must also defeat a
+		// replayed creation that was recorded with a newer event timestamp.
+		if origin, replicated := iamReplicationTime(ctx); replicated && previous.timestamp().After(origin) {
+			ctx = withIAMReplicationTime(ctx, previous.timestamp())
+		}
+	}
 	if origin, replicated := iamReplicationTime(ctx); replicated {
 		*at = origin
 		if previous.timestamp().After(origin) || (previous.Deleted && !deleted && !origin.After(previous.timestamp())) {
@@ -394,11 +401,18 @@ func saveIAMRevision(ctx context.Context, store IAMStorageAPI, path string, item
 			// Retain only the parent name for root-account exclusion during heal.
 			v.Credentials = auth.Credentials{ParentUser: previous.Credentials.ParentUser}
 			v.RevokedBefore = *at
-			if strings.HasPrefix(path, iamConfigSTSPrefix) && !previous.Credentials.Expiration.IsZero() && !previous.Credentials.Expiration.Equal(timeSentinel) {
-				// The signed STS token cannot authorize beyond this time, even
-				// if an offline site replays it with a newer event timestamp.
-				v.ExpiresAt = previous.Credentials.Expiration.Add(globalMaxSkewTime)
-				opts = []options{{ttl: max(1, int64(time.Until(v.ExpiresAt).Seconds())+1)}}
+			if strings.HasPrefix(path, iamConfigSTSPrefix) {
+				// Carry expiry when a revocation arrives before the token itself.
+				// It is safe to forget this key only after its signed lifetime.
+				if expiration := previous.Credentials.Expiration; !expiration.IsZero() && !expiration.Equal(timeSentinel) && expiration.Add(globalMaxSkewTime).After(v.ExpiresAt) {
+					v.ExpiresAt = expiration.Add(globalMaxSkewTime)
+				}
+				if previous.ExpiresAt.After(v.ExpiresAt) {
+					v.ExpiresAt = previous.ExpiresAt
+				}
+				if !v.ExpiresAt.IsZero() {
+					opts = []options{{ttl: max(1, int64(time.Until(v.ExpiresAt).Seconds())+1)}}
+				}
 			}
 		} else {
 			if v.Credentials.SessionToken != "" && v.Credentials.Claims == nil {
@@ -489,6 +503,12 @@ func iamDeletionItem(path string, r iamRevision) (item madmin.SRIAMItem, ok bool
 		name := strings.TrimSuffix(strings.TrimPrefix(path, iamConfigUsersPrefix), "/"+iamIdentityFile)
 		item.Type = madmin.SRIAMItemIAMUser
 		item.IAMUser = &madmin.SRIAMUser{AccessKey: name, IsDeleteReq: true}
+	case strings.HasPrefix(path, iamConfigSTSPrefix):
+		if !r.ExpiresAt.IsZero() && UTCNow().After(r.ExpiresAt) {
+			return item, false
+		}
+		item.Type = iamSTSDeleteType
+		item.Name = strings.TrimSuffix(strings.TrimPrefix(path, iamConfigSTSPrefix), "/"+iamIdentityFile)
 	case strings.HasPrefix(path, iamConfigServiceAccountsPrefix):
 		name := strings.TrimSuffix(strings.TrimPrefix(path, iamConfigServiceAccountsPrefix), "/"+iamIdentityFile)
 		if name == siteReplicatorSvcAcc || r.Credentials.ParentUser == globalActiveCred.AccessKey {
@@ -518,8 +538,7 @@ func iamDeletionItem(path string, r iamRevision) (item madmin.SRIAMItem, ok bool
 		item.Type = madmin.SRIAMItemPolicyMapping
 		item.PolicyMapping = &madmin.SRPolicyMapping{UserOrGroup: strings.TrimSuffix(name, ".json"), UserType: int(typ), IsGroup: prefix == "groups"}
 	default:
-		// Expired STS credentials are not replayed. Parent revocations and
-		// their retained timestamp reject delayed copies of derived tokens.
+		// Other config paths do not represent replicated IAM deletions.
 		return item, false
 	}
 	return item, true
@@ -527,6 +546,8 @@ func iamDeletionItem(path string, r iamRevision) (item madmin.SRIAMItem, ok bool
 
 func iamDeletionPath(item madmin.SRIAMItem) string {
 	switch item.Type {
+	case iamSTSDeleteType:
+		return getUserIdentityPath(item.Name, stsUser)
 	case madmin.SRIAMItemIAMUser:
 		if item.IAMUser != nil && item.IAMUser.IsDeleteReq {
 			return getUserIdentityPath(item.IAMUser.AccessKey, regUser)
@@ -582,6 +603,9 @@ func (c *SiteReplicationSys) healIAMDeletions(ctx context.Context) (err error) {
 			continue
 		}
 		out := iamReplicationItem{SRIAMItem: item}
+		if item.Type == iamSTSDeleteType {
+			out.STSExpiresAt = r.ExpiresAt
+		}
 		if item.Type == madmin.SRIAMItemIAMUser && !r.Deleted {
 			out.Type, out.IAMUser = iamUserBoundaryType, nil
 			out.UserRevocation = &iamUserBoundary{User: item.IAMUser.AccessKey, Before: r.RevokedBefore}
@@ -593,7 +617,7 @@ func (c *SiteReplicationSys) healIAMDeletions(ctx context.Context) (err error) {
 		byType[item.Type] = append(byType[item.Type], out)
 	}
 	var items []iamReplicationItem
-	for _, typ := range []string{madmin.SRIAMItemPolicyMapping, madmin.SRIAMItemIAMUser, madmin.SRIAMItemSvcAcc, madmin.SRIAMItemGroupInfo, madmin.SRIAMItemPolicy} {
+	for _, typ := range []string{madmin.SRIAMItemPolicyMapping, madmin.SRIAMItemIAMUser, madmin.SRIAMItemSvcAcc, iamSTSDeleteType, madmin.SRIAMItemGroupInfo, madmin.SRIAMItemPolicy} {
 		items = append(items, byType[typ]...)
 	}
 	if len(items) == 0 {

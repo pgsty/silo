@@ -19,6 +19,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"io"
 	"testing"
@@ -68,7 +69,7 @@ func TestEncryptDecrypt(t *testing.T) {
 			t.Fatalf("Test %d: failed to encrypt stream: %v", i, err)
 		}
 
-		plaintext, err := Decrypt(KMS, bytes.NewReader(data), test.Context)
+		plaintext, err := Decrypt(context.Background(), KMS, bytes.NewReader(data), test.Context)
 		if err != nil {
 			t.Fatalf("Test %d: failed to decrypt stream: %v", i, err)
 		}

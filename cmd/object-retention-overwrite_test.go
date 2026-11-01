@@ -244,6 +244,26 @@ func TestPoolsObjectLockOverwrite(t *testing.T) {
 					}
 				}
 				defer conditionalPutPool(t, z, key, 0)()
+				var source string
+				var copyInfo ObjectInfo
+				if op == "copy" || op == "self-copy" {
+					source = key
+					if op == "copy" {
+						source = "source-" + state
+						putConsistencyObject(t, z, bucket, source, 0, "replacement", ObjectOptions{Versioned: true})
+					}
+					// Resolve the source before the pool becomes unreadable.
+					// The destination must still reject a previously read source.
+					gr, gerr := z.GetObjectNInfo(ctx, bucket, source, nil, nil, ObjectOptions{})
+					if gerr != nil {
+						t.Fatal(gerr)
+					}
+					defer gr.Close()
+					copyInfo = gr.ObjInfo
+					copyInfo.metadataOnly = op == "self-copy"
+					copyInfo.PutObjReader = mustGetPutObjReader(t, gr, copyInfo.Size, "", "")
+					copyInfo.Reader = copyInfo.PutObjReader.Reader
+				}
 				var restore func()
 				if state == "unreadable" {
 					restore = conditionalPutSwapDisks(z.serverPools[1], key, func(d StorageAPI) StorageAPI {
@@ -257,22 +277,8 @@ func TestPoolsObjectLockOverwrite(t *testing.T) {
 				case "put":
 					_, writeErr = z.PutObject(ctx, bucket, key, mustGetPutObjReader(t, bytes.NewBufferString("replacement"), 11, "", ""), opts)
 				case "copy", "self-copy":
-					source := key
-					if op == "copy" {
-						source = "source-" + state
-						putConsistencyObject(t, z, bucket, source, 0, "replacement", ObjectOptions{Versioned: true})
-					}
-					gr, gerr := z.GetObjectNInfo(ctx, bucket, source, nil, nil, ObjectOptions{})
-					if gerr != nil {
-						t.Fatal(gerr)
-					}
-					defer gr.Close()
-					info := gr.ObjInfo
-					info.UserDefined = opts.UserDefined
-					info.metadataOnly = op == "self-copy"
-					info.PutObjReader = mustGetPutObjReader(t, gr, info.Size, "", "")
-					info.Reader = info.PutObjReader.Reader
-					_, writeErr = z.CopyObject(ctx, bucket, source, bucket, key, info, ObjectOptions{VersionID: nullVersionID}, opts)
+					copyInfo.UserDefined = opts.UserDefined
+					_, writeErr = z.CopyObject(ctx, bucket, source, bucket, key, copyInfo, ObjectOptions{VersionID: nullVersionID}, opts)
 				case "multipart":
 					id, parts := multipartConditionUpload(t, z, bucket, key, 0, opts)
 					_, writeErr = z.CompleteMultipartUpload(ctx, bucket, key, id, parts, ObjectOptions{Versioned: true})

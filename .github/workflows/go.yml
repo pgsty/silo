@@ -93,13 +93,16 @@ jobs:
       - name: Run conditional PUT tests under race detector
         run: go test -race ./cmd -run '^Test(PoolsConditionalPut|SinglePoolConditionalPutHTTP)' -count=1 -timeout=5m
 
+      - name: Run multi-pool delete consistency tests under race detector
+        run: go test -race ./cmd -run '^Test(Pools(Delete|BulkDelete|RetiringCopyPreservesSharedTierObject)|BulkDeleteQuorumEvidence)' -count=1 -timeout=5m
+
       - name: Run multipart listing, cancellation and cleanup tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
         run: go test -race ./cmd -run '^Test(Multipart|PaginateMultipartUploads|ListMultipartUploads|CleanupStaleUploads|ExtractModTime)' -count=1 -timeout=5m
 
       - name: Run listing metadata recovery, pagination and cancellation tests under race detector
-        run: go test -race ./cmd -run '^Test(ListFallback|ListingCache|ListingMerge|ListingRecovery|ListingPending|ListingEntry|ListingSecondLock|StreamMetadataParts|LocalLockerListing|DistributedListing|MergeXLV2LatestNullCrossParity|CountXLV2MixedECGroups|ListCrossParity)' -count=1 -timeout=5m
+        run: go test -race ./cmd -run '^Test(ListFallback|ListingCache|ListingMerge|ListingRecovery|ListingPending|ListingEntry|ListingSecondLock|StreamMetadataParts|LocalLockerListing|DistributedListing|MergeXLV2LatestNullCrossParity|CountXLV2MixedECGroups|ListCrossParity|ListObjectVersionsCrossParityNull|MigrationCrossParity)' -count=1 -timeout=5m
 
       - name: Run lock cancellation and late-grant cleanup tests under race detector
         run: go test -race ./internal/dsync ./internal/lsync -run '^Test(DRWMutex|LRWMutex)' -count=1 -timeout=5m
@@ -114,6 +117,14 @@ jobs:
         env:
           MINIO_API_REQUESTS_MAX: "10000"
         run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
+
+      - name: Run maintenance storage timeout and compatibility tests under race detector
+        env:
+          MINIO_API_REQUESTS_MAX: "10000"
+        run: go test -race -tags kqueue,dev ./cmd ./internal/grid ./internal/ioutil -run '^Test(StorageTimeout|StorageRollback|StoragePrerelease|MaintenancePartialFailedOverwriteAvailability|SingleRequest|WithDeadline)' -count=1 -timeout=5m
+
+      - name: Compile deferred consistency diagnostics
+        run: go test -tags kqueue,dev,consistency_strict ./cmd -run '^$'
 
   crosscompile:
     name: Cross Compile

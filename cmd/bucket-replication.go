@@ -4250,6 +4250,11 @@ func getCRCMeta(oi ObjectInfo, partNum int, h http.Header) (cs map[string]string
 		if cktype.IsSet() {
 			meta[cktype.Key()] = v
 			meta[xhttp.AmzChecksumAlgo] = cktype.String()
+			// Without the type the target creates a COMPOSITE multipart
+			// upload and rejects the full object CRC on completion.
+			if isMP && cktype.CanMerge() && cs[xhttp.AmzChecksumType] == xhttp.AmzChecksumTypeFullObject {
+				meta[xhttp.AmzChecksumType] = xhttp.AmzChecksumTypeFullObject
+			}
 		}
 	}
 	return meta, isMP

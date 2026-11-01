@@ -632,13 +632,25 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	}
 
 	// Delete remote object from warm-tier
-	err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
-	if err == nil {
-		// Skip adding free version since we successfully deleted the
-		// remote object
-		opts.SkipFreeVersion = true
-	} else {
-		transitionLogIf(ctx, err)
+	//
+	// Unless the expiry only puts a delete marker on top of the version, as
+	// for an object that is not transitioned: with versioning enabled, or
+	// suspended and the version is not the null version, the version stays
+	// as a noncurrent version and must remain readable. Its remote object is
+	// removed later, through the free version added when the version itself
+	// is deleted.
+	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name)
+	keepRemote := opts.VersionID == "" &&
+		(opts.Versioned || (opts.VersionSuspended && oi.VersionID != "" && oi.VersionID != nullVersionID))
+	if !keepRemote {
+		err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
+		if err == nil {
+			// Skip adding free version since we successfully deleted the
+			// remote object
+			opts.SkipFreeVersion = true
+		} else {
+			transitionLogIf(ctx, err)
+		}
 	}
 
 	// Now, delete object from hot-tier namespace

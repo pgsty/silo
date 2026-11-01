@@ -72,6 +72,15 @@ func (sses3) IsEncrypted(metadata map[string]string) bool {
 // from the metadata using KMS and returns the decrypted object
 // key.
 func (s3 sses3) UnsealObjectKey(k *kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	return s3.unsealObjectKey(context.Background(), k, metadata, bucket, object)
+}
+
+// unsealObjectKey carries the listing request's cancellation through the KMS.
+// Keep the existing single-object API for callers without a request context.
+func (s3 sses3) unsealObjectKey(ctx context.Context, k *kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	if err := ctx.Err(); err != nil {
+		return key, err
+	}
 	if k == nil {
 		return key, Errorf("KMS not configured")
 	}
@@ -79,7 +88,7 @@ func (s3 sses3) UnsealObjectKey(k *kms.KMS, metadata map[string]string, bucket, 
 	if err != nil {
 		return key, err
 	}
-	unsealKey, err := k.Decrypt(context.TODO(), &kms.DecryptRequest{
+	unsealKey, err := k.Decrypt(ctx, &kms.DecryptRequest{
 		Name:           keyID,
 		Ciphertext:     kmsKey,
 		AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
@@ -106,11 +115,14 @@ func (s3 sses3) UnsealObjectKeys(ctx context.Context, k *kms.KMS, metadata []map
 	}
 	keys := make([]ObjectKey, 0, len(metadata))
 	for i := range metadata {
-		key, err := s3.UnsealObjectKey(k, metadata[i], buckets[i], objects[i])
+		key, err := s3.unsealObjectKey(ctx, k, metadata[i], buckets[i], objects[i])
 		if err != nil {
 			return nil, err
 		}
 		keys = append(keys, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return keys, nil
 }

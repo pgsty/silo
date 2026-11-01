@@ -24,11 +24,14 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
@@ -114,15 +117,18 @@ func migrationTestPools(t *testing.T) (*erasureServerPools, string) {
 	t.Helper()
 	z, bucket := consistencyPools(t)
 	for _, pool := range z.serverPools {
-		for _, set := range pool.sets {
-			original := set.getDisks
-			disks := append([]StorageAPI(nil), original()...)
-			for i := range disks {
-				disks[i] = tagTestCapacityDisk{StorageAPI: disks[i]}
+		pool.erasureDisksMu.Lock()
+		previous := pool.erasureDisks
+		wrapped := make([][]StorageAPI, len(previous))
+		for i, disks := range previous {
+			wrapped[i] = append([]StorageAPI(nil), disks...)
+			for j := range wrapped[i] {
+				wrapped[i][j] = tagTestCapacityDisk{StorageAPI: wrapped[i][j]}
 			}
-			set.getDisks = func() []StorageAPI { return disks }
-			t.Cleanup(func() { set.getDisks = original })
 		}
+		pool.erasureDisks = wrapped
+		pool.erasureDisksMu.Unlock()
+		t.Cleanup(func() { pool.erasureDisksMu.Lock(); pool.erasureDisks = previous; pool.erasureDisksMu.Unlock() })
 	}
 	return z, bucket
 }
@@ -131,7 +137,10 @@ func migrationTestMover(t *testing.T, z *erasureServerPools, source int, kind st
 	t.Helper()
 	if kind == "rebalance" {
 		z.rebalMu.Lock()
-		z.rebalMeta = &rebalanceMeta{PoolStats: []*rebalanceStats{{}, {}}}
+		z.rebalMeta = &rebalanceMeta{PoolStats: make([]*rebalanceStats, len(z.serverPools))}
+		for i := range z.rebalMeta.PoolStats {
+			z.rebalMeta.PoolStats[i] = &rebalanceStats{}
+		}
 		z.rebalMeta.PoolStats[source] = &rebalanceStats{Participating: true, Info: rebalanceInfo{Status: rebalStarted}}
 		z.rebalMu.Unlock()
 		t.Cleanup(func() { z.rebalMu.Lock(); z.rebalMeta = nil; z.rebalMu.Unlock() })
@@ -588,5 +597,415 @@ func TestPoolsMigrationUnreadablePool(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Three pools give a move two candidate destinations.
+func migrationTestThreePools(t *testing.T) (*erasureServerPools, string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	dirs, err := getRandomDisks(12)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	var endpoints EndpointServerPools
+	for i := range 3 {
+		endpoints = append(endpoints, mustGetPoolEndpoints(i, dirs[4*i:4*i+4]...)...)
+	}
+	obj, _, err := initObjectLayer(ctx, endpoints)
+	if err != nil {
+		cancel()
+		removeRoots(dirs)
+		t.Fatal(err)
+	}
+	z := obj.(*erasureServerPools)
+	previous := newObjectLayerFn()
+	setObjectLayer(z)
+	t.Cleanup(func() { cancel(); z.Shutdown(context.Background()); removeRoots(dirs); setObjectLayer(previous) })
+	bucket := "pool-migration"
+	if err := z.MakeBucket(t.Context(), bucket, MakeBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	return z, bucket
+}
+
+type migrationTestGetter func(context.Context, string, string, *HTTPRangeSpec, http.Header, ObjectOptions) (*GetObjectReader, error)
+
+// migrationTestBody returns the content read for a version, or the read error.
+func migrationTestBody(t *testing.T, get migrationTestGetter, bucket, object, versionID string) string {
+	t.Helper()
+	gr, err := get(t.Context(), bucket, object, nil, nil, ObjectOptions{VersionID: versionID})
+	if err != nil {
+		return fmt.Sprintf("<%v>", err)
+	}
+	defer gr.Close()
+	data, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// migrationTestWalk runs one bucket of a decommission or rebalance of source,
+// including the walker's accounting and source cleanup. It returns the number
+// of versions decommission counted as failed.
+func migrationTestWalk(t *testing.T, z *erasureServerPools, bucket string, source int, kind string) int64 {
+	t.Helper()
+	migrationTestMover(t, z, source, kind)
+	if kind == "rebalance" {
+		if err := z.rebalanceBucket(t.Context(), bucket, source); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	}
+	z.poolMetaMutex.Lock()
+	z.poolMeta.Pools[source].LastUpdate = UTCNow() // keep pool.bin and peers out of the walk
+	z.poolMetaMutex.Unlock()
+	if err := z.decommissionPool(t.Context(), source, z.serverPools[source], decomBucketInfo{Name: bucket}); err != nil {
+		t.Fatal(err)
+	}
+	z.poolMetaMutex.RLock()
+	defer z.poolMetaMutex.RUnlock()
+	return z.poolMeta.Pools[source].Decommission.ItemsDecommissionFailed
+}
+
+// migrationTestTiered stores a null version whose data is in a remote tier, in
+// the form decommission moves it.
+func migrationTestTiered(t *testing.T, z *erasureServerPools, bucket, object string, pool int, mtime time.Time) ObjectInfo {
+	t.Helper()
+	oi := putConsistencyObject(t, z, bucket, object, pool, "old", ObjectOptions{MTime: mtime})
+	infos, errs := readAllFileInfo(t.Context(), z.serverPools[pool].getHashedSet(oi.Name).getDisks(), "", bucket, oi.Name, nullVersionID, false, false)
+	if errs[0] != nil {
+		t.Fatal(errs[0])
+	}
+	fi := infos[0]
+	fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName = lifecycle.TransitionComplete, "WARM", "remote"
+	if err := z.serverPools[pool].DecomTieredObject(t.Context(), bucket, oi.Name, fi, ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	return oi
+}
+
+// A cross-pool overwrite can leave copies of one version in several pools.
+// Reads return the newest copy, and moving an older one must not replace it.
+// An equal ModTime marks the same write, as an interrupted move leaves it.
+func TestPoolsMigrationKeepsCurrentCopy(t *testing.T) {
+	z, bucket := migrationTestPools(t)
+	base := time.Date(2026, 9, 16, 8, 0, 0, 0, time.UTC)
+	for _, kind := range []string{"rebalance", "decommission"} {
+		for _, method := range []string{"put", "multipart"} {
+			for _, versioned := range []bool{false, true} {
+				for source := range 2 {
+					for _, offset := range []time.Duration{-time.Minute, 0, time.Minute} {
+						t.Run(fmt.Sprintf("%s/%s/versioned=%t/source=%d/offset=%s", kind, method, versioned, source, offset), func(t *testing.T) {
+							move := migrationTestMover(t, z, source, kind)
+							opts := ObjectOptions{Versioned: versioned, MTime: base.Add(offset)}
+							if versioned {
+								opts.VersionID = mustGetUUID()
+							}
+							oi := migrationTestObject(t, z, bucket, t.Name(), source, method == "multipart", []string{"source"}, opts)
+							opts.MTime = base
+							want, other := "source", "other"
+							if offset == 0 {
+								other = "source"
+								opts.PreserveETag = oi.ETag // interrupted copies preserve the original multipart ETag
+							} else if offset < 0 {
+								want = "other"
+							}
+							putConsistencyObject(t, z, bucket, t.Name(), 1-source, other, opts)
+							version := migrationTestVersion(oi)
+							if got := migrationTestBody(t, z.GetObjectNInfo, bucket, t.Name(), version); got != want {
+								t.Fatalf("fixture reads %q, want %q", got, want)
+							}
+							err := move(t.Context(), source, bucket, migrationTestReader(t, z, source, oi))
+							if want == "other" && !isDataMovementSuperseded(err) || want == "source" && err != nil {
+								t.Fatalf("move: %v", err)
+							}
+							if err != nil && strings.Contains(err.Error(), "CompleteMultipartUpload") {
+								t.Error("copied the parts of a superseded version")
+							}
+							if got := migrationTestBody(t, z.serverPools[1-source].GetObjectNInfo, bucket, t.Name(), version); got != want {
+								t.Errorf("destination holds %q, want %q", got, want)
+							}
+							if got := migrationTestBody(t, z.GetObjectNInfo, bucket, t.Name(), version); got != want {
+								t.Errorf("move changed the read result to %q, want %q", got, want)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+// A client overwrite, or a replica of the same version, committed while a move
+// copies the old version is newer than the moved copy. The move must yield to
+// it, also at multipart completion.
+func TestPoolsMigrationYieldsToNewerWrite(t *testing.T) {
+	z, bucket := migrationTestPools(t)
+	for _, kind := range []string{"rebalance", "decommission"} {
+		for _, method := range []string{"put", "multipart"} {
+			for _, versioned := range []bool{false, true} {
+				for source := range 2 {
+					t.Run(fmt.Sprintf("%s/%s/versioned=%t/source=%d", kind, method, versioned, source), func(t *testing.T) {
+						migrationTestNewerWrite(t, z, bucket, kind, method, versioned, source)
+					})
+				}
+			}
+		}
+	}
+}
+
+func migrationTestNewerWrite(t *testing.T, z *erasureServerPools, bucket, kind, method string, versioned bool, source int) {
+	move := migrationTestMover(t, z, source, kind)
+	oi := migrationTestObject(t, z, bucket, t.Name(), source, method == "multipart", []string{"moved"}, ObjectOptions{Versioned: versioned, MTime: UTCNow().Add(-time.Hour)})
+	gr := migrationTestReader(t, z, source, oi)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	gate := newMigrationTestGate()
+	done, finished := make(chan error, 1), make(chan struct{})
+	if method == "multipart" {
+		// Hold the move after its initial check, while it copies parts.
+		gr.Reader = migrationTestGateReader{Reader: gr.Reader, ctx: ctx, gate: gate}
+		go func() { defer close(finished); done <- move(ctx, source, bucket, gr) }()
+		defer func() { gate.unblock(); cancel(); <-finished }()
+		select {
+		case <-gate.entered:
+		case err := <-done:
+			t.Fatalf("migration finished before the part barrier: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	// An ordinary PUT copies under the object lock, so this write
+	// lands between the mover's source read and its write.
+	if versioned {
+		putConsistencyObject(t, z, bucket, t.Name(), 1-source, "newer", ObjectOptions{Versioned: true, VersionID: oi.VersionID, MTime: UTCNow()})
+	} else if _, err := z.PutObject(ctx, bucket, t.Name(), mustGetPutObjReader(t, strings.NewReader("newer"), 5, "", ""), ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if method == "multipart" {
+		gate.unblock()
+		err = <-done
+	} else {
+		err = move(ctx, source, bucket, gr)
+	}
+	if !isDataMovementSuperseded(err) {
+		t.Fatalf("move over a newer write: %v", err)
+	}
+	if got := migrationTestBody(t, z.GetObjectNInfo, bucket, t.Name(), migrationTestVersion(oi)); got != "newer" {
+		t.Fatalf("newer write replaced by %q", got)
+	}
+}
+
+// With two candidate destinations a superseded copy must neither replace the
+// newer copy nor become a new duplicate in the third pool.
+func TestPoolsMigrationThreePools(t *testing.T) {
+	z, bucket := migrationTestThreePools(t)
+	stale, recent := UTCNow().Add(-time.Hour), UTCNow().Add(-time.Minute)
+	for _, kind := range []string{"rebalance", "decommission"} {
+		for _, newest := range []int{0, 1} {
+			t.Run(fmt.Sprintf("%s/newest=%d", kind, newest), func(t *testing.T) {
+				move := migrationTestMover(t, z, 0, kind)
+				mtime := func(pool int) time.Time {
+					if pool == newest {
+						return recent
+					}
+					return stale
+				}
+				oi := migrationTestObject(t, z, bucket, t.Name(), 0, false, []string{"pool-0"}, ObjectOptions{MTime: mtime(0)})
+				putConsistencyObject(t, z, bucket, t.Name(), 1, "pool-1", ObjectOptions{MTime: mtime(1)})
+				if newest == 0 {
+					putConsistencyObject(t, z, bucket, t.Name(), 2, "pool-2", ObjectOptions{MTime: stale})
+				}
+				want := fmt.Sprintf("pool-%d", newest)
+				err := move(t.Context(), 0, bucket, migrationTestReader(t, z, 0, oi))
+				if newest == 1 && !isDataMovementSuperseded(err) || newest == 0 && err != nil {
+					t.Fatalf("move: %v", err)
+				}
+				if got := migrationTestBody(t, z.GetObjectNInfo, bucket, t.Name(), ""); got != want {
+					t.Errorf("reads return %q, want %q", got, want)
+				}
+				if newest == 1 {
+					if _, err := z.serverPools[2].GetObjectInfo(t.Context(), bucket, t.Name(), ObjectOptions{}); !isErrObjectNotFound(err) {
+						t.Errorf("superseded copy duplicated into pool 2: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// The walkers count a superseded version as moved, so its stale source copy is
+// removed with the object and the source pool drains.
+func TestPoolsMigrationRetiresSupersededCopy(t *testing.T) {
+	for _, kind := range []string{"rebalance", "decommission"} {
+		t.Run(kind, func(t *testing.T) {
+			z, bucket := migrationTestPools(t)
+			ctx := t.Context()
+			stale, recent := UTCNow().Add(-time.Hour), UTCNow().Add(-time.Minute)
+			put := func(object string, pool int, body string, multipart bool, opts ObjectOptions) ObjectInfo {
+				return migrationTestObject(t, z, bucket, object, pool, multipart, []string{body}, opts)
+			}
+			put("stale", 0, "old", false, ObjectOptions{MTime: stale})
+			put("stale", 1, "new", false, ObjectOptions{MTime: recent})
+			put("stale-multipart", 0, "old", true, ObjectOptions{MTime: stale})
+			put("stale-multipart", 1, "new", false, ObjectOptions{MTime: recent})
+			put("newer", 0, "new", false, ObjectOptions{MTime: recent})
+			put("newer", 1, "old", false, ObjectOptions{MTime: stale})
+			oldest := put("history", 0, "old", false, ObjectOptions{Versioned: true, MTime: stale})
+			put("history", 1, "new", false, ObjectOptions{Versioned: true, MTime: recent})
+			// A suspended bucket's older null delete marker must not hide a newer
+			// null version.
+			hidden := put("stale-marker", 0, "old", false, ObjectOptions{Versioned: true, MTime: stale.Add(-time.Minute)})
+			if _, err := z.serverPools[0].DeleteObject(ctx, bucket, "stale-marker", ObjectOptions{VersionSuspended: true, MTime: stale}); err != nil {
+				t.Fatal(err)
+			}
+			put("stale-marker", 1, "new", false, ObjectOptions{VersionSuspended: true, MTime: recent})
+			objects := []string{"stale", "stale-multipart", "newer", "history", "stale-marker"}
+			if kind == "decommission" {
+				// Rebalance leaves tiered versions in place; decommission moves
+				// their metadata.
+				migrationTestTiered(t, z, bucket, "stale-tiered", 0, stale)
+				put("stale-tiered", 1, "new", false, ObjectOptions{MTime: recent})
+				objects = append(objects, "stale-tiered")
+			}
+			want := map[string]string{}
+			for _, object := range objects {
+				want[object] = migrationTestBody(t, z.GetObjectNInfo, bucket, object, "")
+			}
+			if want["stale"] != "new" || want["stale-marker"] != "new" {
+				t.Fatalf("fixture reads %v", want)
+			}
+			if failed := migrationTestWalk(t, z, bucket, 0, kind); failed != 0 {
+				t.Fatalf("%d versions failed to move", failed)
+			}
+			for _, object := range objects {
+				if got := migrationTestBody(t, z.GetObjectNInfo, bucket, object, ""); got != want[object] {
+					t.Errorf("%s: reads %q after the move, want %q", object, got, want[object])
+				}
+			}
+			var retained []string
+			for _, set := range z.serverPools[0].sets {
+				if err := set.listObjectsToDecommission(ctx, decomBucketInfo{Name: bucket}, func(entry metaCacheEntry) {
+					retained = append(retained, entry.name)
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(retained) > 0 {
+				t.Errorf("source pool retained %v", retained)
+			}
+			for _, oi := range []ObjectInfo{oldest, hidden} {
+				if got := migrationTestBody(t, z.GetObjectNInfo, bucket, oi.Name, oi.VersionID); got != "old" {
+					t.Errorf("%s: lost version %s: %q", oi.Name, oi.VersionID, got)
+				}
+			}
+		})
+	}
+}
+
+func TestPoolsMigrationAfterCompleteRemoval(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	dirs, err := getRandomDisks(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousEndpoints := globalEndpoints
+	endpoints := mustGetPoolEndpoints(0, dirs[:16]...)
+	endpoints = append(endpoints, mustGetPoolEndpoints(1, dirs[16:]...)...)
+	globalEndpoints = endpoints
+	obj, _, err := initObjectLayer(ctx, endpoints)
+	if err != nil {
+		globalEndpoints = previousEndpoints
+		removeRoots(dirs)
+		t.Fatal(err)
+	}
+	z := obj.(*erasureServerPools)
+	previous := newObjectLayerFn()
+	setObjectLayer(z)
+	var reopened *erasureServerPools
+	oldShutdown := false
+	t.Cleanup(func() {
+		if reopened != nil {
+			_ = reopened.Shutdown(context.Background())
+		}
+		if !oldShutdown {
+			_ = z.Shutdown(context.Background())
+		}
+		removeRoots(dirs)
+		globalEndpoints = previousEndpoints
+		setObjectLayer(previous)
+	})
+
+	bucket, _, err := initAPIHandlerTest(ctx, z, nil, MakeBucketOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const object = "object"
+	mtime := time.Now().UTC().Add(-time.Hour)
+	oldBody := bytes.Repeat([]byte{'a'}, 64<<10)
+	newBody := bytes.Repeat([]byte{'b'}, 256<<10)
+	nullQuorumCrossParityOverwrite(t, z, 0, bucket, object, oldBody, newBody, mtime, ObjectOptions{})
+
+	z.poolMetaMutex.Lock()
+	z.poolMeta.Pools[0].Decommission = &PoolDecommissionInfo{}
+	z.poolMetaMutex.Unlock()
+	if err := z.decommissionPool(ctx, 0, z.serverPools[0], decomBucketInfo{Name: bucket}); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.CompleteDecommission(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	oldShutdown = true
+
+	globalEndpoints = mustGetPoolEndpoints(0, dirs[16:]...)
+	reopenedObj, _, err := initObjectLayer(t.Context(), globalEndpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened = reopenedObj.(*erasureServerPools)
+	setObjectLayer(reopened)
+	_, router, err := initAPIHandlerTest(t.Context(), reopened, nil, MakeBucketOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	get := nullQuorumRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object))
+	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), newBody) {
+		t.Fatalf("GET after pool removal: status=%d bytes=%d", get.Code, get.Body.Len())
+	}
+	if code, keys := nullQuorumListV2Keys(t, router, bucket); code != http.StatusOK || !slices.Equal(keys, []string{object}) {
+		t.Fatalf("ListObjectsV2 after pool removal: status=%d keys=%v", code, keys)
+	}
+	if code, versions := nullQuorumListVersions(t, router, bucket); code != http.StatusOK || len(versions) != 1 || versions[0].Key != object || versions[0].VersionID != nullVersionID || versions[0].Size != int64(len(newBody)) {
+		t.Fatalf("ListObjectVersions after pool removal: status=%d versions=%+v", code, versions)
+	}
+}
+
+// A tiered move that fails, here because another pool cannot be read, must keep
+// its source like any other failed version.
+func TestPoolsMigrationTieredFailureKeepsSource(t *testing.T) {
+	z, bucket := migrationTestPools(t)
+	tiered := migrationTestTiered(t, z, bucket, t.Name(), 0, UTCNow().Add(-time.Hour))
+	set := z.serverPools[1].getHashedSet(tiered.Name)
+	original := set.getDisks
+	disks := append([]StorageAPI(nil), original()...)
+	for i := range disks {
+		disks[i] = consistencyReadFaultDisk{StorageAPI: disks[i], bucket: bucket, object: tiered.Name}
+	}
+	set.getDisks = func() []StorageAPI { return disks }
+	defer func() { set.getDisks = original }()
+	if failed := migrationTestWalk(t, z, bucket, 0, "decommission"); failed != 1 {
+		t.Fatalf("%d failed versions, want 1", failed)
+	}
+	if _, err := z.serverPools[0].GetObjectInfo(t.Context(), bucket, tiered.Name, ObjectOptions{VersionID: nullVersionID}); err != nil {
+		t.Fatalf("failed move removed its source: %v", err)
 	}
 }

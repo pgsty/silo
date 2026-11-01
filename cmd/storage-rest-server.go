@@ -415,8 +415,7 @@ func (s *storageRESTServer) DeleteVersionHandler(p *DeleteVersionHandlerParams) 
 	filePath := p.FilePath
 	forceDelMarker := p.ForceDelMarker
 
-	opts := DeleteOptions{}
-	err := s.getStorage().DeleteVersion(context.Background(), volume, filePath, p.FI, forceDelMarker, opts)
+	err := s.getStorage().DeleteVersion(context.Background(), volume, filePath, p.FI, forceDelMarker, p.Opts)
 	return np, grid.NewRemoteErr(err)
 }
 

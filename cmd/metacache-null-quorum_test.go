@@ -117,6 +117,10 @@ func (d *nullQuorumWalkDisk) WalkDir(ctx context.Context, opts WalkDirOptions, o
 }
 
 func nullQuorumBackend(t *testing.T) (*erasureServerPools, string, http.Handler) {
+	return nullQuorumBackendWithVersioning(t, false)
+}
+
+func nullQuorumBackendWithVersioning(t *testing.T, suspended bool) (*erasureServerPools, string, http.Handler) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	obj, dirs, err := prepareErasure16(ctx)
@@ -133,9 +137,15 @@ func nullQuorumBackend(t *testing.T) (*erasureServerPools, string, http.Handler)
 		removeRoots(dirs)
 		setObjectLayer(previous)
 	})
-	bucket, router, err := initAPIHandlerTest(ctx, z, nil, MakeBucketOptions{})
+	bucket, router, err := initAPIHandlerTest(ctx, z, nil, MakeBucketOptions{VersioningEnabled: suspended})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if suspended {
+		if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig,
+			[]byte(`<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>`)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return z, bucket, router
 }
@@ -158,6 +168,36 @@ func nullQuorumPut(t *testing.T, z *erasureServerPools, bucket, object string, b
 	}
 }
 
+func nullQuorumCrossParityOverwrite(t *testing.T, z *erasureServerPools, pool int, bucket, object string, oldBody, newBody []byte, oldTime time.Time, opts ObjectOptions) time.Time {
+	t.Helper()
+	set := z.serverPools[pool].getHashedSet(object)
+	disks := set.getDisks()
+	put := func(body []byte, opts ObjectOptions) {
+		if _, err := z.serverPools[pool].PutObject(t.Context(), bucket, object,
+			mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldOpts := opts
+	oldOpts.MTime = oldTime
+	oldOpts.MaxParity = false
+	put(oldBody, oldOpts)
+	old := make([][]byte, len(disks))
+	for i, disk := range disks {
+		old[i] = mustReadNullQuorumMeta(t, disk, bucket, object)
+	}
+	newTime := oldTime.Add(time.Minute)
+	opts.MTime = newTime
+	opts.MaxParity = true
+	put(newBody, opts)
+	for i := 12; i < len(disks); i++ {
+		if err := disks[i].WriteAll(t.Context(), bucket, object+"/"+xlStorageFormatFile, old[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return newTime
+}
+
 func nullQuorumListV2Keys(t *testing.T, router http.Handler, bucket string) (int, []string) {
 	t.Helper()
 	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectsV2URL("", bucket, "", "1000", "", "", ""))
@@ -173,6 +213,29 @@ func nullQuorumListV2Keys(t *testing.T, router http.Handler, bucket string) (int
 		keys = append(keys, object.Key)
 	}
 	return rec.Code, keys
+}
+
+type nullQuorumListedVersion struct {
+	Key          string
+	VersionID    string `xml:"VersionId"`
+	LastModified string
+	Size         int64
+	IsLatest     bool
+}
+
+func nullQuorumListVersions(t *testing.T, router http.Handler, bucket string) (int, []nullQuorumListedVersion) {
+	t.Helper()
+	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectVersionsURL("", bucket, "", "1000", ""))
+	if rec.Code != http.StatusOK {
+		return rec.Code, nil
+	}
+	var list struct {
+		Versions []nullQuorumListedVersion `xml:"Version"`
+	}
+	if err := xml.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	return rec.Code, list.Versions
 }
 
 func TestListObjectsSingleNullQuorumHTTP(t *testing.T) {
@@ -815,11 +878,22 @@ func scanNullQuorumAbandoned(t *testing.T, z *erasureServerPools, bucket, object
 	disks := z.serverPools[0].sets[0].getDisks()
 	seq := newBgHealSequence()
 	defer seq.cancelCtx()
-	previousState, previousRoutine := globalBackgroundHealState, globalBackgroundHealRoutine
-	globalBackgroundHealState = &allHealState{healSeqMap: map[string]*healSequence{"test": seq}}
+	// Disk monitors may still read the shared state between object-layer tests.
+	// Install the test sequence under its lock without replacing the state.
+	state := globalBackgroundHealState
+	state.Lock()
+	previousSequences := state.healSeqMap
+	state.healSeqMap = map[string]*healSequence{"test": seq}
+	state.Unlock()
+	previousRoutine := globalBackgroundHealRoutine
 	routine := &healRoutine{tasks: make(chan healTask)}
 	globalBackgroundHealRoutine = routine
-	defer func() { globalBackgroundHealState, globalBackgroundHealRoutine = previousState, previousRoutine }()
+	defer func() {
+		globalBackgroundHealRoutine = previousRoutine
+		state.Lock()
+		state.healSeqMap = previousSequences
+		state.Unlock()
+	}()
 	workerDone := make(chan struct{})
 	var healed []string
 	go func() {

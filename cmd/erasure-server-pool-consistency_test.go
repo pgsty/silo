@@ -1071,6 +1071,8 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 		restored          bool
 		unconditional     bool
 		skipFreeVersion   bool
+		bulk              bool
+		unversioned       bool
 	}{
 		{name: "metadata-copy"},
 		{name: "restored-metadata-copy", restored: true},
@@ -1081,6 +1083,14 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 		{name: "ordinary-failed-primary-delete", deleting: true, unconditional: true, failPrimaryDelete: true},
 		{name: "ordinary-successful-delete", deleting: true, unconditional: true},
 		{name: "ordinary-skip-free-version", deleting: true, unconditional: true, skipFreeVersion: true},
+		{name: "bulk-failed-primary-delete", deleting: true, bulk: true, failPrimaryDelete: true},
+		{name: "bulk-restored-failed-primary-delete", deleting: true, bulk: true, restored: true, failPrimaryDelete: true},
+		{name: "bulk-successful-delete", deleting: true, bulk: true},
+		{name: "bulk-distinct-reference", deleting: true, bulk: true, differentRemote: true},
+		{name: "bulk-skip-free-version", deleting: true, bulk: true, skipFreeVersion: true},
+		{name: "unversioned-failed-primary-delete", deleting: true, unconditional: true, unversioned: true, failPrimaryDelete: true},
+		{name: "unversioned-successful-delete", deleting: true, unconditional: true, unversioned: true},
+		{name: "bulk-unversioned-failed-primary-delete", deleting: true, bulk: true, unversioned: true, failPrimaryDelete: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			z, bucket := consistencyPools(t)
@@ -1094,13 +1104,13 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 			if test.restored {
 				metadata[xhttp.AmzRestore] = completedRestoreObj(time.Now().Add(time.Hour)).String()
 			}
-			oi := putConsistencyObject(t, z, bucket, object, 0, "data", ObjectOptions{Versioned: true, UserDefined: metadata})
+			oi := putConsistencyObject(t, z, bucket, object, 0, "data", ObjectOptions{Versioned: !test.unversioned, UserDefined: metadata})
 			secondaryMetadata := maps.Clone(metadata)
 			if test.differentRemote {
 				secondaryMetadata[ReservedMetadataPrefixLower+TransitionedObjectName] = "other-remote-object"
 			}
 			putConsistencyObject(t, z, bucket, object, 1, "data", ObjectOptions{
-				Versioned: true, VersionID: oi.VersionID, MTime: oi.ModTime, UserDefined: secondaryMetadata,
+				Versioned: !test.unversioned, VersionID: oi.VersionID, MTime: oi.ModTime, UserDefined: secondaryMetadata,
 			})
 			current, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: oi.VersionID})
 			if err != nil || current.TransitionedObject.Status != "complete" || current.IsRemote() == test.restored {
@@ -1113,7 +1123,11 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 				set := z.serverPools[0].getHashedSet(object)
 				getDisks := set.getDisks
 				faulty := append([]StorageAPI(nil), getDisks()...)
+				var failed, attempted atomic.Int32
 				for i := range faulty {
+					if test.bulk {
+						faulty[i] = bulkDeleteFaultDisk{StorageAPI: faulty[i], bucket: bucket, object: object, mode: "eio", fail: true, failed: &failed, attempted: &attempted}
+					}
 					faulty[i] = consistencyDeleteFaultDisk{StorageAPI: faulty[i], bucket: bucket, object: object, version: oi.VersionID}
 				}
 				set.getDisks = func() []StorageAPI { return faulty }
@@ -1121,13 +1135,20 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 			}
 			if test.deleting {
 				opts := ObjectOptions{
-					Versioned: true, VersionID: oi.VersionID, SkipFreeVersion: test.skipFreeVersion,
+					Versioned: !test.unversioned, VersionID: oi.VersionID, SkipFreeVersion: test.skipFreeVersion,
 					CheckPrecondFn: func(info ObjectInfo) bool { return info.ETag != current.ETag },
 				}
 				if test.unconditional {
 					opts.CheckPrecondFn = nil
 				}
-				_, err := z.DeleteObject(t.Context(), bucket, object, opts)
+				var err error
+				if test.bulk {
+					opts.CheckPrecondFn = nil
+					_, errs := z.DeleteObjects(t.Context(), bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: object, VersionID: oi.VersionID}}}, opts)
+					err = errs[0]
+				} else {
+					_, err = z.DeleteObject(t.Context(), bucket, object, opts)
+				}
 				if (err != nil) != test.failPrimaryDelete {
 					t.Fatalf("unexpected authoritative delete result: %v", err)
 				}
@@ -1145,7 +1166,7 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 			_, err = z.serverPools[0].GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: oi.VersionID})
 			primaryDeleted := test.deleting && !test.failPrimaryDelete
 			if primaryDeleted {
-				if !isErrVersionNotFound(err) {
+				if !isErrVersionNotFound(err) && (!test.unversioned || !isErrObjectNotFound(err)) {
 					t.Fatalf("authoritative copy survived successful delete: %v", err)
 				}
 			} else if err != nil {
@@ -1304,5 +1325,184 @@ func TestPoolsDeleteDirectoryMarker(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// An unconditional DELETE of an object without versions removes its copies in
+// every pool. When the delete fails in one pool, the latest copy must stay in
+// place: removing it anyway serves an older write of the object.
+func TestPoolsDeleteUnversionedReportsOtherPoolFailure(t *testing.T) {
+	for _, offline := range []bool{false, true} {
+		for latest := range 2 {
+			t.Run(fmt.Sprintf("offline=%v/latest=%d", offline, latest), func(t *testing.T) {
+				z, bucket := consistencyPools(t)
+				const object = "unversioned-failure"
+				older := 1 - latest
+				putConsistencyObject(t, z, bucket, object, older, "older", ObjectOptions{MaxParity: true, MTime: time.Now().Add(-time.Hour)})
+				oi := putConsistencyObject(t, z, bucket, object, latest, "latest", ObjectOptions{MaxParity: true})
+				set := z.serverPools[older].getHashedSet(object)
+				getDisks := set.getDisks
+				disks := append([]StorageAPI(nil), getDisks()...)
+				for i := range disks {
+					switch {
+					case !offline:
+						disks[i] = consistencyDeleteFaultDisk{StorageAPI: disks[i], bucket: bucket, object: object}
+					case i < len(disks)/2:
+						// An EC 8+8 copy stays readable, but a delete needs 9 drives.
+						disks[i] = nil
+					}
+				}
+				set.getDisks = func() []StorageAPI { return disks }
+				defer func() { set.getDisks = getDisks }()
+				if _, err := z.DeleteObject(t.Context(), bucket, object, ObjectOptions{}); err == nil {
+					t.Error("delete reported success despite the other pool's write failure")
+				}
+				set.getDisks = getDisks
+				if got, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{}); err != nil || got.ETag != oi.ETag {
+					t.Errorf("after the failed delete the object reads ETag %q, %v; want the latest write %q", got.ETag, err, oi.ETag)
+				}
+			})
+		}
+	}
+}
+
+// consistencyBulkDeleteFaultDisk fails the multi-object deletes of one object.
+type consistencyBulkDeleteFaultDisk struct {
+	StorageAPI
+	bucket, object string
+}
+
+func (d consistencyBulkDeleteFaultDisk) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions, opts DeleteOptions) []error {
+	errs := make([]error, len(versions))
+	var rest []FileInfoVersions
+	var restIdx []int
+	for i, v := range versions {
+		if volume == d.bucket && v.Name == d.object {
+			errs[i] = errDiskFull
+			continue
+		}
+		rest = append(rest, v)
+		restIdx = append(restIdx, i)
+	}
+	if len(rest) > 0 {
+		for i, err := range d.StorageAPI.DeleteVersions(ctx, volume, rest, opts) {
+			errs[restIdx[i]] = err
+		}
+	}
+	return errs
+}
+
+// A multi-object delete must not report an object or version as deleted while
+// a pool that failed to delete it still holds a copy.
+func TestPoolsDeleteObjectsReportsOtherPoolFailure(t *testing.T) {
+	for _, versioned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("versioned=%v", versioned), func(t *testing.T) {
+			z, bucket := consistencyPools(t)
+			const object = "bulk-delete-failure"
+			opts := ObjectOptions{Versioned: versioned}
+			oi := putConsistencyObject(t, z, bucket, object, 0, "latest", opts)
+			if versioned {
+				// The copy a data movement leaves until it removes the source.
+				putConsistencyObject(t, z, bucket, object, 1, "latest", ObjectOptions{Versioned: true, VersionID: oi.VersionID, MTime: oi.ModTime})
+			} else {
+				putConsistencyObject(t, z, bucket, object, 1, "older", ObjectOptions{MTime: time.Now().Add(-time.Hour)})
+			}
+			set := z.serverPools[1].getHashedSet(object)
+			getDisks := set.getDisks
+			faulty := append([]StorageAPI(nil), getDisks()...)
+			for i := range faulty {
+				faulty[i] = consistencyBulkDeleteFaultDisk{StorageAPI: faulty[i], bucket: bucket, object: object}
+			}
+			set.getDisks = func() []StorageAPI { return faulty }
+			defer func() { set.getDisks = getDisks }()
+			_, errs := z.DeleteObjects(t.Context(), bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: object, VersionID: oi.VersionID}}}, opts)
+			if errs[0] == nil {
+				t.Error("multi-object delete reported success despite the other pool's write failure")
+			}
+		})
+	}
+}
+
+// Pools delete a multi-object batch in parallel. With half the drives of the
+// older copy's set offline, an EC 8+8 copy stays readable but cannot be
+// deleted: the batch must fail the object and keep its latest copy, instead of
+// deleting it and serving the older write once the drives are back.
+func TestPoolsDeleteObjectsKeepsLatestWithoutDeleteQuorum(t *testing.T) {
+	for latest := range 2 {
+		t.Run(fmt.Sprintf("latest=%d", latest), func(t *testing.T) {
+			z, bucket := consistencyPools(t)
+			const object = "bulk-delete-quorum"
+			older := 1 - latest
+			putConsistencyObject(t, z, bucket, object, older, "older", ObjectOptions{MaxParity: true, MTime: time.Now().Add(-time.Hour)})
+			oi := putConsistencyObject(t, z, bucket, object, latest, "latest", ObjectOptions{MaxParity: true})
+			set := z.serverPools[older].getHashedSet(object)
+			getDisks := set.getDisks
+			disks := append([]StorageAPI(nil), getDisks()...)
+			for i := range len(disks) / 2 {
+				disks[i] = nil
+			}
+			set.getDisks = func() []StorageAPI { return disks }
+			defer func() { set.getDisks = getDisks }()
+			_, errs := z.DeleteObjects(t.Context(), bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: object}}}, ObjectOptions{})
+			if !errors.As(errs[0], &InsufficientWriteQuorum{}) {
+				t.Errorf("multi-object delete: got %v, want InsufficientWriteQuorum", errs[0])
+			}
+			set.getDisks = getDisks
+			if got, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{}); err != nil || got.ETag != oi.ETag {
+				t.Errorf("after the failed delete the object reads ETag %q, %v; want the latest write %q", got.ETag, err, oi.ETag)
+			}
+			// Nothing was deleted, so the retry removes every copy.
+			if _, errs = z.DeleteObjects(t.Context(), bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: object}}}, ObjectOptions{}); errs[0] != nil {
+				t.Fatal(errs[0])
+			}
+			for i, pool := range z.serverPools {
+				if _, err := pool.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{}); !isErrObjectNotFound(err) {
+					t.Errorf("pool %d retained the object after the retry: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
+// A delete marker hides the object in every pool. When the versions of an
+// object are in two pools and the set of one of them cannot take a write, the
+// marker goes to the other pool instead of failing the delete. The versions
+// stay below the marker.
+func TestPoolsDeleteMarkerSkipsSetWithoutQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		degraded int // pool whose set loses drives
+		offline  int
+	}{
+		{"older version readable", 0, 8},
+		{"older version unreadable", 0, 9},
+		{"latest version readable", 1, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			z, bucket := consistencyPools(t)
+			const object = "marker-quorum"
+			v1 := putConsistencyObject(t, z, bucket, object, 0, "v1", ObjectOptions{Versioned: true, MaxParity: true, MTime: time.Now().Add(-time.Hour)})
+			v2 := putConsistencyObject(t, z, bucket, object, 1, "v2", ObjectOptions{Versioned: true, MaxParity: true})
+			set := z.serverPools[tc.degraded].getHashedSet(object)
+			getDisks := set.getDisks
+			disks := append([]StorageAPI(nil), getDisks()...)
+			for i := range tc.offline {
+				disks[i] = nil
+			}
+			set.getDisks = func() []StorageAPI { return disks }
+			defer func() { set.getDisks = getDisks }()
+			if _, err := z.DeleteObject(t.Context(), bucket, object, ObjectOptions{Versioned: true}); err != nil {
+				t.Fatalf("delete with the set of pool %d without quorum: %v", tc.degraded, err)
+			}
+			set.getDisks = getDisks
+			if _, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{}); !isErrObjectNotFound(err) && !isErrMethodNotAllowed(err) {
+				t.Errorf("object still readable after the delete: %v", err)
+			}
+			for pool, v := range []ObjectInfo{v1, v2} {
+				if _, err := z.serverPools[pool].GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: v.VersionID}); err != nil {
+					t.Errorf("pool %d lost version %s: %v", pool, v.VersionID, err)
+				}
+			}
+		})
 	}
 }

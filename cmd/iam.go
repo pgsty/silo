@@ -717,7 +717,14 @@ func (sys *IAMSys) RevokeTokens(ctx context.Context, accessKey, tokenRevokeType 
 		return errServerNotInitialized
 	}
 
-	return sys.store.RevokeTokens(ctx, accessKey, tokenRevokeType)
+	keys, err := sys.store.RevokeTokens(ctx, accessKey, tokenRevokeType)
+	// Publish every committed tombstone even if another token failed to save.
+	for _, key := range keys {
+		sys.notifyForUser(ctx, key, true)
+		// Offline peers recover this same record through IAM deletion healing.
+		iamLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{Type: iamSTSDeleteType, Name: key}))
+	}
+	return err
 }
 
 // DeleteUser - delete user (only for long-term users not STS users).

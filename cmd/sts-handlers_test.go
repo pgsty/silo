@@ -36,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	goldap "github.com/go-ldap/ldap/v3"
 	"github.com/klauspost/compress/zip"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
@@ -1095,6 +1096,7 @@ func TestIAMWithLDAPServerSuite(t *testing.T) {
 				suite.TestLDAPSTSServiceAccountsWithGroups(c)
 				suite.TestLDAPAttributesLookup(c)
 				suite.TestLDAPCyrillicUser(c)
+				suite.TestLDAPLongNonASCIIDN(c)
 				suite.TestLDAPSlashDN(c)
 				suite.TearDownSuite(c)
 			},
@@ -3288,6 +3290,112 @@ func (s *TestSuiteIAM) TestLDAPCyrillicUser(c *check) {
 
 	if _, err = s.adm.DetachPolicyLDAP(ctx, userReq); err != nil {
 		c.Fatalf("Unable to detach user policy: %v", err)
+	}
+}
+
+// Normalized DNs hex-escape every non-ASCII byte, so a user in nested Cyrillic
+// OUs has a DN longer than NAME_MAX: 160 bytes of UTF-8 become 384 characters.
+// Records named after such a DN can never be stored by the object backend.
+// The user is entitled only through a group, as is typical for AD deployments.
+func (s *TestSuiteIAM) TestLDAPLongNonASCIIDN(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const (
+		username = "Сотрудник"
+		parentOU = "ou=Дирекция информационных технологий,ou=people,ou=swengg,dc=min,dc=io"
+		childOU  = "ou=Отдел разработки," + parentOU
+		userDN   = "uid=" + username + "," + childOU
+		groupDN  = "cn=long-dn-staff,ou=groups,ou=swengg,dc=min,dc=io"
+	)
+	normDN, err := ldap.NormalizeDN(userDN)
+	if err != nil {
+		c.Fatal(err)
+	}
+	if len(normDN) <= 255 {
+		c.Fatalf("normalized test DN must exceed 255 characters, got %d", len(normDN))
+	}
+
+	conn, err := globalIAMSys.LDAPConfig.LDAP.Connect()
+	if err != nil {
+		c.Fatalf("LDAP connect failed: %v", err)
+	}
+	defer conn.Close()
+	if err = conn.Bind("cn=admin,dc=min,dc=io", "admin"); err != nil {
+		c.Fatalf("LDAP admin bind failed: %v", err)
+	}
+	newEntry := func(dn string, attrs map[string]string) *goldap.AddRequest {
+		req := goldap.NewAddRequest(dn, nil)
+		for name, value := range attrs {
+			req.Attribute(name, []string{value})
+		}
+		return req
+	}
+	entries := []*goldap.AddRequest{
+		newEntry(parentOU, map[string]string{"objectClass": "organizationalUnit", "ou": "Дирекция информационных технологий"}),
+		newEntry(childOU, map[string]string{"objectClass": "organizationalUnit", "ou": "Отдел разработки"}),
+		newEntry(userDN, map[string]string{"objectClass": "inetOrgPerson", "uid": username, "cn": username, "sn": username, "userPassword": "example"}),
+		newEntry(groupDN, map[string]string{"objectClass": "groupOfNames", "cn": "long-dn-staff", "member": userDN}),
+	}
+	removeEntries := func() {
+		for i := len(entries) - 1; i >= 0; i-- {
+			err := conn.Del(goldap.NewDelRequest(entries[i].DN, nil))
+			if err != nil && !goldap.IsErrorWithCode(err, goldap.LDAPResultNoSuchObject) {
+				c.Errorf("Unable to remove LDAP entry %s: %v", entries[i].DN, err)
+			}
+		}
+	}
+	removeEntries() // left over from an interrupted run
+	defer removeEntries()
+	for _, entry := range entries {
+		if err = conn.Add(entry); err != nil {
+			c.Fatalf("Unable to add LDAP entry %s: %v", entry.DN, err)
+		}
+	}
+
+	groupReq := madmin.PolicyAssociationReq{
+		Policies: []string{"readwrite"},
+		Group:    groupDN,
+	}
+	if _, err = s.adm.AttachPolicyLDAP(ctx, groupReq); err != nil {
+		c.Fatalf("Unable to attach group policy: %v", err)
+	}
+	defer func() {
+		if _, err := s.adm.DetachPolicyLDAP(ctx, groupReq); err != nil {
+			c.Errorf("Unable to detach group policy: %v", err)
+		}
+	}()
+
+	bucket := getRandomBucketName()
+	if err = s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+		c.Fatalf("bucket create error: %v", err)
+	}
+
+	ldapID := cr.LDAPIdentity{
+		Client:       s.TestSuiteCommon.client,
+		STSEndpoint:  s.endPoint,
+		LDAPUsername: username,
+		LDAPPassword: "example",
+	}
+	value, err := ldapID.Retrieve()
+	if err != nil {
+		c.Fatalf("Expected to generate STS creds, got err: %#v", err)
+	}
+	u, ok := globalIAMSys.GetUser(ctx, value.AccessKeyID)
+	if !ok {
+		c.Fatalf("Expected to find user %s", value.AccessKeyID)
+	}
+	if u.Credentials.ParentUser != normDN {
+		c.Fatalf("unexpected parent user: %s", u.Credentials.ParentUser)
+	}
+	c.mustListObjects(ctx, s.getUserClient(c, value.AccessKeyID, value.SecretAccessKey, value.SessionToken), bucket)
+
+	// An access key created by this user inherits the same parent.
+	userAdmClient := s.getAdminClient(c, value.AccessKeyID, value.SecretAccessKey, value.SessionToken)
+	svc := c.mustCreateSvcAccount(ctx, value.AccessKeyID, userAdmClient)
+	c.assertSvcAccS3Access(ctx, s, svc, bucket)
+	if err = s.adm.DeleteServiceAccount(ctx, svc.AccessKey); err != nil {
+		c.Fatalf("Unable to delete service account: %v", err)
 	}
 }
 

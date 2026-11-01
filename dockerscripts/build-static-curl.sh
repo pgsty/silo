@@ -3,8 +3,8 @@ set -eu
 
 # Build both release architectures from the same verified upstream source.
 # The previous binary supplier stopped publishing current ARM64 builds.
-CURL_VERSION=8.22.0
-CURL_SHA256=f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
+CURL_VERSION=8.23.0
+CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
 
 case ${TARGETARCH:?TARGETARCH is required} in
 amd64) expected_arch=x86_64 ;;
@@ -16,9 +16,12 @@ esac
     exit 1
 }
 
+# Keep security fixes in statically linked libraries, including distro backports.
 apk add --no-cache --upgrade build-base curl ca-certificates \
-    openssl-libs-static nghttp2-static libpsl-static libidn2-static \
-    libunistring-static zlib-static brotli-static zstd-static libssh2-static
+    'musl-dev>=1.2.6-r3' 'openssl-libs-static>=3.5.9-r0' \
+    'nghttp2-static>=1.70.0-r0' libpsl-static libidn2-static \
+    libunistring-static 'zlib-static>=1.3.2-r1' 'brotli-static>=1.2.1-r0' \
+    zstd-static 'libssh2-static>=1.11.1-r4'
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

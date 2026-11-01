@@ -238,6 +238,8 @@ func (h *Target) init() error {
 	}
 
 	sconfig := sarama.NewConfig()
+	// Preserve SILO's default broker protocol when no version is configured.
+	sconfig.Version = sarama.V2_1_0_0
 	if h.kconfig.Version != "" {
 		kafkaVersion, err := sarama.ParseKafkaVersion(h.kconfig.Version)
 		if err != nil {

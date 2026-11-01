@@ -19,11 +19,17 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"net/http"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
@@ -243,5 +249,182 @@ func TestValidateTransitionTier(t *testing.T) {
 		if err != tc.expectedErr {
 			t.Fatalf("Test %d: Expected %v but got %v", i+1, tc.expectedErr, err)
 		}
+	}
+}
+
+// tierExpiryTestBackend is a remote tier held in memory.
+type tierExpiryTestBackend struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	removed []string
+}
+
+func (b *tierExpiryTestBackend) Put(ctx context.Context, object string, r io.Reader, length int64) (remoteVersionID, error) {
+	return b.PutWithMeta(ctx, object, r, length, nil)
+}
+
+func (b *tierExpiryTestBackend) PutWithMeta(_ context.Context, object string, r io.Reader, _ int64, _ map[string]string) (remoteVersionID, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.objects[object] = data
+	return "", nil
+}
+
+func (b *tierExpiryTestBackend) Get(_ context.Context, object string, _ remoteVersionID, opts WarmBackendGetOpts) (io.ReadCloser, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	data, ok := b.objects[object]
+	if !ok {
+		return nil, ObjectNotFound{Bucket: "tier", Object: object}
+	}
+	if opts.length > 0 {
+		data = data[opts.startOffset : opts.startOffset+opts.length]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (b *tierExpiryTestBackend) Remove(_ context.Context, object string, _ remoteVersionID) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.objects, object)
+	b.removed = append(b.removed, object)
+	return nil
+}
+
+func (b *tierExpiryTestBackend) InUse(context.Context) (bool, error) { return false, nil }
+
+// The expiry of a transitioned latest version that only puts a delete marker
+// on top of it must keep its remote object, so the version stays readable as
+// a noncurrent version. The remote object goes when the version is deleted.
+func TestExpireTransitionedObjectKeepsNoncurrentData(t *testing.T) {
+	z, _ := migrationTestPools(t)
+	ctx := t.Context()
+	tier := &tierExpiryTestBackend{objects: map[string][]byte{}}
+	prevTier := globalTierConfigMgr
+	globalTierConfigMgr = NewTierConfigMgr()
+	globalTierConfigMgr.drivercache["WARM"] = tier
+	t.Cleanup(func() { globalTierConfigMgr = prevTier })
+
+	const expire = `<LifecycleConfiguration><Rule><ID>exp</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter>` +
+		`<Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>`
+
+	testCases := []struct {
+		name       string
+		versioning string   // "", Enabled or Suspended
+		nullLatest bool     // the latest version is the null version
+		keep       bool     // the latest version survives as noncurrent
+		want       []string // versions after the expiry, newest first
+	}{
+		{name: "versioned", versioning: "Enabled", keep: true, want: []string{"DM", "v2", "v1"}},
+		{name: "suspended", versioning: "Suspended", keep: true, want: []string{"DM", "v2", "v1"}},
+		{name: "suspended-null", versioning: "Suspended", nullLatest: true, want: []string{"DM", "v1"}},
+		{name: "unversioned", nullLatest: true, want: nil},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			bucket := "tier-expiry-" + tc.name
+			if err := z.MakeBucket(ctx, bucket, MakeBucketOptions{VersioningEnabled: tc.versioning != ""}); err != nil {
+				t.Fatal(err)
+			}
+			meta, err := globalBucketMetadataSys.Get(bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.versioning == "Suspended" {
+				meta.VersioningConfigXML = []byte("<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>")
+			}
+			meta.LifecycleConfigXML = []byte(expire)
+			if err := meta.Save(ctx, z); err != nil {
+				t.Fatal(err)
+			}
+			globalBucketMetadataSys.Set(bucket, meta)
+
+			// tiered writes a version whose data is in the remote tier.
+			labels := map[string]string{}
+			tiered := func(label string, opts ObjectOptions) ObjectInfo {
+				t.Helper()
+				oi := putConsistencyObject(t, z, bucket, "obj", 0, "obj "+label, opts)
+				vid := migrationTestVersion(oi)
+				infos, errs := readAllFileInfo(ctx, z.serverPools[0].getHashedSet("obj").getDisks(), "", bucket, "obj", vid, false, false)
+				if errs[0] != nil {
+					t.Fatal(errs[0])
+				}
+				fi := infos[0]
+				fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName = lifecycle.TransitionComplete, "WARM", bucket+"/"+label
+				if _, err := tier.Put(ctx, fi.TransitionedObjName, strings.NewReader("obj "+label), -1); err != nil {
+					t.Fatal(err)
+				}
+				if err := z.serverPools[0].DecomTieredObject(ctx, bucket, "obj", fi, ObjectOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				labels[vid] = label
+				return oi
+			}
+			var latest ObjectInfo
+			if tc.versioning != "" {
+				tiered("v1", ObjectOptions{Versioned: true})
+			}
+			if tc.nullLatest {
+				latest = tiered("v2", ObjectOptions{})
+			} else {
+				latest = tiered("v2", ObjectOptions{Versioned: true})
+			}
+
+			// Expire the latest version as the expiry worker does for the scanner.
+			getOpts := ObjectOptions{Versioned: tc.versioning == "Enabled", VersionSuspended: tc.versioning == "Suspended"}
+			oi, err := z.GetObjectInfo(ctx, bucket, "obj", getOpts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lc, err := globalLifecycleSys.Get(bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evt := evalActionFromLifecycle(ctx, *lc, objectlock.Retention{}, nil, oi)
+			if evt.Action != lifecycle.DeleteAction || oi.TransitionedObject.Status != lifecycle.TransitionComplete {
+				t.Fatalf("fixture: action %v, transition status %q", evt.Action, oi.TransitionedObject.Status)
+			}
+			if err := expireTransitionedObject(ctx, z, &oi, evt, lcEventSrc_Scanner); err != nil {
+				t.Errorf("expiry: %v", err)
+			}
+
+			var got []string
+			for _, set := range z.serverPools[0].sets {
+				err := set.listObjectsToDecommission(ctx, decomBucketInfo{Name: bucket}, func(entry metaCacheEntry) {
+					fivs, err := entry.fileInfoVersions(bucket)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					for _, fi := range fivs.Versions {
+						if fi.Deleted {
+							got = append(got, "DM")
+						} else {
+							got = append(got, labels[migrationTestVersion(fi.ToObjectInfo(bucket, "obj", true))])
+						}
+					}
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("versions after expiry: got %v, want %v", got, tc.want)
+			}
+			remote := bucket + "/v2"
+			if removed := slices.Contains(tier.removed, remote); removed == tc.keep {
+				t.Errorf("remote object of the expired version removed: %v, want %v", removed, !tc.keep)
+			}
+			if tc.keep {
+				body := migrationTestBody(t, z.GetObjectNInfo, bucket, "obj", migrationTestVersion(latest))
+				if body != "obj v2" {
+					t.Errorf("v2 reads %q after the expiry, want %q", body, "obj v2")
+				}
+			}
+		})
 	}
 }

@@ -102,14 +102,9 @@ func TestGuardedStorageCoversEveryPathMethod(t *testing.T) {
 	}
 }
 
-// TestGuardChecksUnreachableFields pins the guard on path fields that exist on
-// the wire but that no handler currently reads, so an end-to-end test cannot
-// observe them. DeleteVersionHandler hardcodes `opts := DeleteOptions{}` and
-// discards p.Opts, which means DeleteOptions.OldDataDir - a value that reaches
-// renameAll() with no containment of its own - is unreachable by accident
-// rather than by design. If someone later plumbs p.Opts through, the guard is
-// already there; this test is what stops it from being removed as "dead".
-func TestGuardChecksUnreachableFields(t *testing.T) {
+// OldDataDir can reach renameAll during rollback. Guard it independently of
+// which handlers currently forward deletion options.
+func TestGuardChecksDeleteOptionPaths(t *testing.T) {
 	g := guardedStorage{poisonStorage{}}
 	ctx := context.Background()
 

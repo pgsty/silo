@@ -39,6 +39,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/bpool"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/config/storageclass"
 	xioutil "github.com/minio/minio/internal/ioutil"
@@ -1183,6 +1184,14 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		opts.CheckPrecondFn = nil
 	}
 
+	if opts.DataMovement {
+		resolve, err := z.checkDataMovementCopies(ctx, bucket, object, opts)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		opts.replicaObjectInfo = resolve
+	}
+
 	idx, err := z.getWritePoolIdx(ctx, bucket, object, data.Size(), true)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -1202,7 +1211,7 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	}
 	// Public overwrites need all pools for Object Lock. Unaddressed replica
 	// callbacks retain their set-local reads unless reconciliation is needed.
-	if opts.ReplicaLockReconcile || !opts.ReplicationRequest {
+	if opts.replicaObjectInfo == nil && (opts.ReplicaLockReconcile || !opts.ReplicationRequest) {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 	oi, err := z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
@@ -1241,6 +1250,25 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	if opts.DeletePrefix {
 		return ObjectInfo{}, z.deletePrefix(ctx, bucket, object)
+	}
+
+	if opts.DataMovement {
+		opts.NoLock = true
+		if _, err := z.checkDataMovementCopies(ctx, bucket, object, opts); err != nil {
+			return objInfo, err
+		}
+		// A marker still needs a destination when it is the only version of
+		// this key outside the draining pool.
+		idx, err := z.getPoolIdxNoLock(ctx, bucket, object, 0)
+		if err != nil {
+			return objInfo, err
+		}
+		if idx == opts.SrcPoolIdx {
+			return objInfo, DataMovementOverwriteErr{Bucket: bucket, Object: object, VersionID: opts.VersionID, Err: errDataMovementSrcDstPoolSame}
+		}
+		objInfo, err = z.serverPools[idx].DeleteObject(ctx, bucket, object, opts)
+		objInfo.Name = decodeDirObject(object)
+		return objInfo, err
 	}
 
 	// Resolve a physical purge by its addressed version even on a replica
@@ -1328,24 +1356,13 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return pinfo.ObjInfo, nil
 	}
 
-	// Datamovement must never be allowed on the same pool.
-	if opts.DataMovement && opts.SrcPoolIdx == pinfo.Index {
-		return pinfo.ObjInfo, DataMovementOverwriteErr{
-			Bucket:    bucket,
-			Object:    object,
-			VersionID: opts.VersionID,
-			Err:       errDataMovementSrcDstPoolSame,
-		}
-	}
-
-	if opts.DataMovement {
-		objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
-		objInfo.Name = decodeDirObject(object)
-		return objInfo, err
-	}
-
-	// Delete concurrently in all server pools with read quorum error for unversioned objects.
+	// Retire older copies before the newest copy for unversioned objects.
 	if len(noReadQuorumPools) > 0 && !opts.Versioned && !opts.VersionSuspended {
+		if pinfo.ObjInfo.TransitionedObject.Status == lifecycle.TransitionComplete {
+			// Restored and remote copies can share a tier object. Reuse the
+			// reconciliation which keeps that reference out of premature GC.
+			return z.deleteObjectReconciled(ctx, bucket, object, opts)
+		}
 		return z.deleteObjectFromAllPools(ctx, bucket, object, opts, noReadQuorumPools)
 	}
 
@@ -1354,6 +1371,21 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
 		objInfo.Name = decodeDirObject(object)
 		return objInfo, err
+	}
+
+	// A delete marker hides the object in every pool. When more than one pool
+	// holds the object, put the marker into the first one with a readable
+	// version whose set can take the write, so that a set without quorum does
+	// not fail the delete while another pool could take the marker.
+	if opts.VersionID == "" && len(noReadQuorumPools) > 1 {
+		for idx, pool := range z.serverPools {
+			if !poolReadable(noReadQuorumPools, idx) || deleteQuorumMissing(pool, object) {
+				continue
+			}
+			objInfo, err = pool.DeleteObject(ctx, bucket, object, opts)
+			objInfo.Name = decodeDirObject(object)
+			return objInfo, err
+		}
 	}
 
 	for _, pool := range z.serverPools {
@@ -1376,36 +1408,76 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 }
 
 func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucket string, object string, opts ObjectOptions, poolIndices []poolErrs) (objInfo ObjectInfo, err error) {
-	derrs := make([]error, len(poolIndices))
-	dobjects := make([]ObjectInfo, len(poolIndices))
-
-	// Delete concurrently in all server pools that reported no error or read quorum error
-	// where the read quorum issue is from metadata inconsistency.
-	var wg sync.WaitGroup
-	for idx, pe := range poolIndices {
-		if v, ok := pe.Err.(InsufficientReadQuorum); ok && v.Type != RQInconsistentMeta {
-			derrs[idx] = InsufficientWriteQuorum{}
-			continue
-		}
-		wg.Add(1)
-		pool := z.serverPools[pe.Index]
-		go func(idx int, pool *erasureSets) {
-			defer wg.Done()
-			dobjects[idx], derrs[idx] = pool.DeleteObject(ctx, bucket, object, opts)
-		}(idx, pool)
-	}
-	wg.Wait()
-
-	// the poolIndices array is pre-sorted in order of latest ModTime, we care only about pool with latest object though
-	// the delete call tries to clean up other pools during DeleteObject call.
-	objInfo = dobjects[0]
 	objInfo.Name = decodeDirObject(object)
-	for _, derr := range derrs {
+
+	// Delete in all server pools that reported no error or read quorum error
+	// where the read quorum issue is from metadata inconsistency. The
+	// poolIndices array is pre-sorted in order of latest ModTime. Retire the
+	// older copies first and stop at the first failure, as
+	// deleteObjectReconciled does: a failed delete then keeps the latest copy
+	// in place, instead of serving an older write of the object.
+	for idx := len(poolIndices) - 1; idx >= 0; idx-- {
+		pe := poolIndices[idx]
+		if v, ok := pe.Err.(InsufficientReadQuorum); ok && v.Type != RQInconsistentMeta {
+			return objInfo, InsufficientWriteQuorum{}
+		}
+		dobj, derr := z.serverPools[pe.Index].DeleteObject(ctx, bucket, object, opts)
+		if idx == 0 {
+			objInfo, err = dobj, derr
+			break
+		}
 		if derr != nil && !isErrObjectNotFound(derr) && !isErrVersionNotFound(derr) {
-			return objInfo, derr
+			dobj.Name = decodeDirObject(object)
+			return dobj, derr
 		}
 	}
-	return objInfo, derrs[0]
+	objInfo.Name = decodeDirObject(object)
+	return objInfo, err
+}
+
+// deleteQuorumMissing reports whether the set of object in pool has fewer
+// online drives than a delete needs (N/2+1, as in erasureObjects.DeleteObjects).
+func deleteQuorumMissing(pool *erasureSets, object string) bool {
+	disks := pool.getHashedSet(object).getDisks()
+	return countOnlineDisks(disks) < len(disks)/2+1
+}
+
+// poolReadable reports whether pools lists pool idx with a readable version.
+func poolReadable(pools []poolErrs, idx int) bool {
+	for _, pe := range pools {
+		if pe.Index == idx {
+			return pe.Err == nil
+		}
+	}
+	return false
+}
+
+// copyWithoutDeleteQuorum avoids starting a known unwritable cleanup. This
+// reduces partial deletion, but successful cleanup must still precede removing
+// the authoritative copy: drives can fail after this preflight.
+func (z *erasureServerPools) copyWithoutDeleteQuorum(ctx context.Context, bucket, object, versionID string) bool {
+	for _, pool := range z.serverPools {
+		if deleteQuorumMissing(pool, object) {
+			_, err := pool.GetObjectInfo(ctx, bucket, object, ObjectOptions{VersionID: versionID, NoLock: true})
+			if err == nil || isErrReadQuorum(err) || isErrMethodNotAllowed(err) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// deletesData reports whether deleting obj removes an object or a version, as
+// opposed to adding a delete marker (see erasureObjects.DeleteObjects).
+func deletesData(obj ObjectToDelete, opts ObjectOptions) bool {
+	if obj.VersionID != "" {
+		return true
+	}
+	versioned := opts.Versioned
+	if opts.PrefixEnabledFn != nil {
+		versioned = opts.PrefixEnabledFn(obj.ObjectName)
+	}
+	return !versioned && !opts.VersionSuspended
 }
 
 func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
@@ -1414,6 +1486,11 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	objSets := set.NewStringSet()
 	for i := range derrs {
 		objects[i].ObjectName = encodeDirObject(objects[i].ObjectName)
+		dobjects[i] = DeletedObject{
+			ObjectName:       decodeDirObject(objects[i].ObjectName),
+			VersionID:        objects[i].VersionID,
+			ReplicationState: objects[i].ReplicationState(),
+		}
 
 		derrs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
 		objSets.Add(objects[i].ObjectName)
@@ -1431,25 +1508,64 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	ctx = lkctx.Context()
 	defer multiDeleteLock.Unlock(lkctx)
 
+	// Removing data needs the same authoritative-copy protection as a single
+	// DELETE. An online-drive preflight cannot protect against later I/O errors.
+	// Keep marker creation after data removal, including when the same request
+	// explicitly removes a null version and creates its replacement marker.
+	batch, batchIdx := objects, []int(nil)
+	if !z.SinglePool() {
+		batch = make([]ObjectToDelete, 0, len(objects))
+		batchIdx = make([]int, 0, len(objects))
+		data, dataIdx := make([]ObjectToDelete, 0, len(objects)), make([]int, 0, len(objects))
+		for i, obj := range objects {
+			if derrs[i] != nil {
+				continue
+			}
+			if deletesData(obj, opts) {
+				if z.copyWithoutDeleteQuorum(ctx, bucket, obj.ObjectName, obj.VersionID) {
+					derrs[i] = InsufficientWriteQuorum{}
+					continue
+				}
+				data = append(data, obj)
+				dataIdx = append(dataIdx, i)
+				continue
+			}
+			batch = append(batch, obj)
+			batchIdx = append(batchIdx, i)
+		}
+		if len(data) > 0 {
+			deleted, errs := z.deleteObjectsReconciled(ctx, bucket, data, opts)
+			for j, i := range dataIdx {
+				dobjects[i], derrs[i] = deleted[j], errs[j]
+			}
+		}
+	}
+
 	dObjectsByPool := make([][]DeletedObject, len(z.serverPools))
 	dErrsByPool := make([][]error, len(z.serverPools))
 
-	eg := errgroup.WithNErrs(len(z.serverPools)).WithConcurrency(len(z.serverPools))
-	for i, pool := range z.serverPools {
-		pool := pool
-		eg.Go(func() error {
-			dObjectsByPool[i], dErrsByPool[i] = pool.DeleteObjects(ctx, bucket, objects, opts)
-			return nil
-		}, i)
+	if len(batch) > 0 {
+		eg := errgroup.WithNErrs(len(z.serverPools)).WithConcurrency(len(z.serverPools))
+		for i, pool := range z.serverPools {
+			pool := pool
+			eg.Go(func() error {
+				dObjectsByPool[i], dErrsByPool[i] = pool.DeleteObjects(ctx, bucket, batch, opts)
+				return nil
+			}, i)
+		}
+		eg.Wait() // wait to check all the pools.
 	}
-	eg.Wait() // wait to check all the pools.
 
-	for i := range dobjects {
+	for j := range batch {
+		i := j
+		if batchIdx != nil {
+			i = batchIdx[j]
+		}
 		// Iterate over pools
 		for pool := range z.serverPools {
-			if dErrsByPool[pool][i] == nil && dObjectsByPool[pool][i].found {
+			if dErrsByPool[pool][j] == nil && dObjectsByPool[pool][j].found {
 				// A fast exit when the object is found and removed
-				dobjects[i] = dObjectsByPool[pool][i]
+				dobjects[i] = dObjectsByPool[pool][j]
 				derrs[i] = nil
 				break
 			}
@@ -1457,8 +1573,8 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 				// No error related to this object is found, assign this pool result
 				// whether it is nil because there is no object found or because of
 				// some other errors such erasure quorum errors.
-				dobjects[i] = dObjectsByPool[pool][i]
-				derrs[i] = dErrsByPool[pool][i]
+				dobjects[i] = dObjectsByPool[pool][j]
+				derrs[i] = dErrsByPool[pool][j]
 			}
 		}
 	}
@@ -2248,6 +2364,13 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 			}
 			opts.CheckPrecondFn = nil
 		}
+		if opts.DataMovement {
+			resolve, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(object), opts)
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			opts.replicaObjectInfo = resolve
+		}
 	}
 
 	// Hold write locks to verify uploaded parts, also disallows any
@@ -2267,7 +2390,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 	if opts.ReplicaLockReconcile || opts.DataMovement {
 		opts.ReplicaLockReconcile = true
 	}
-	if opts.ReplicaLockReconcile || !opts.ReplicationRequest {
+	if opts.replicaObjectInfo == nil && (opts.ReplicaLockReconcile || !opts.ReplicationRequest) {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 
@@ -2745,7 +2868,7 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 				return nil
 			}
 		}
-		fivs, err := entry.fileInfoVersions(bucket)
+		fivs, err := entry.allFileInfoVersions(bucket)
 		if err != nil {
 			return healObjectFn(bucket, entry.name, "", scanMode)
 		}
@@ -3257,6 +3380,11 @@ func (z *erasureServerPools) DecomTieredObject(ctx context.Context, bucket, obje
 		ctx = lkctx.Context()
 		defer ns.Unlock(lkctx)
 		opts.NoLock = true
+	}
+	if opts.DataMovement {
+		if _, err := z.checkDataMovementCopies(ctx, bucket, object, opts); err != nil {
+			return err
+		}
 	}
 	idx, err := z.getPoolIdxNoLock(ctx, bucket, object, fi.Size)
 	if err != nil {
