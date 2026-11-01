@@ -2027,9 +2027,11 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 				if !checkedSingleNull {
 					singleNull = singleNullVersionStreams(originalVersions, false)
 					// Availability-optimized writes can change EC while a drive
-					// is offline. Only latest-only non-strict reads may recount
-					// these ordinary null versions across separate modern EC groups.
-					mixedECNull = !singleNull && !strict && requestedVersions == 1 &&
+					// is offline. Only non-strict reads may recount these
+					// ordinary null versions across separate modern EC groups.
+					// Each stream holds just this version, so listing all
+					// versions (decommission, rebalance) must recount too.
+					mixedECNull = !singleNull && !strict &&
 						singleNullVersionStreams(originalVersions, true)
 					checkedSingleNull = true
 				}
