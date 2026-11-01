@@ -2868,7 +2868,7 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 				return nil
 			}
 		}
-		fivs, err := entry.fileInfoVersions(bucket)
+		fivs, err := entry.allFileInfoVersions(bucket)
 		if err != nil {
 			return healObjectFn(bucket, entry.name, "", scanMode)
 		}

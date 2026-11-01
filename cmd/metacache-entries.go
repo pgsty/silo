@@ -177,14 +177,12 @@ func (e metaCacheEntry) isInDir(dir, separator string) bool {
 }
 
 // isLatestDeletemarker returns whether the latest version is a delete marker.
+// Free versions are not versions of the object and are skipped.
 // If metadata is NOT versioned false will always be returned.
 // If v2 and UNABLE to load metadata true will be returned.
 func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	if e.cached != nil {
-		if len(e.cached.versions) == 0 {
-			return true
-		}
-		return e.cached.versions[0].header.Type == DeleteType
+		return e.cached.isLatestDeleteMarker()
 	}
 	if !isXL2V1Format(e.metadata) {
 		return false
@@ -196,10 +194,10 @@ func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	}
 	// Fall back...
 	xlMeta, err := e.xlmeta()
-	if err != nil || len(xlMeta.versions) == 0 {
+	if err != nil {
 		return true
 	}
-	return xlMeta.versions[0].header.Type == DeleteType
+	return xlMeta.isLatestDeleteMarker()
 }
 
 // isAllFreeVersions returns if all objects are free versions.
@@ -287,9 +285,21 @@ func (e *metaCacheEntry) xlmeta() (*xlMetaV2, error) {
 	return e.cached, nil
 }
 
-// fileInfoVersions returns the metadata as FileInfoVersions.
+// fileInfoVersions returns the metadata as FileInfoVersions. The free
+// versions of deleted tiered versions are not versions of the object; they
+// are in FreeVersions.
 // If entry is a directory it is returned as that.
 func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, error) {
+	return e.getFileInfoVersions(bucket, false)
+}
+
+// allFileInfoVersions returns the metadata as FileInfoVersions with the free
+// versions among the versions, for healing.
+func (e *metaCacheEntry) allFileInfoVersions(bucket string) (FileInfoVersions, error) {
+	return e.getFileInfoVersions(bucket, true)
+}
+
+func (e *metaCacheEntry) getFileInfoVersions(bucket string, inclFreeVersions bool) (FileInfoVersions, error) {
 	if e.isDir() {
 		return FileInfoVersions{
 			Volume: bucket,
@@ -304,7 +314,7 @@ func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, erro
 		}, nil
 	}
 	// Too small gains to reuse cache here.
-	return getFileInfoVersions(e.metadata, bucket, e.name, true)
+	return getFileInfoVersions(e.metadata, bucket, e.name, inclFreeVersions)
 }
 
 // metaCacheEntries is a slice of metacache entries.

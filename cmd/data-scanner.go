@@ -776,7 +776,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 					}
 
 					// We got an entry which we should be able to heal.
-					fiv, err := entry.fileInfoVersions(bucket)
+					fiv, err := entry.allFileInfoVersions(bucket)
 					if err != nil {
 						err := bgSeq.queueHealTask(healSource{
 							bucket:    bucket,
