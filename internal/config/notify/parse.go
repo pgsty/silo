@@ -309,6 +309,7 @@ func TestWebhookTargets(ctx context.Context, cfg config.Config, list *event.Targ
 			if err := live.CheckUpdate(arg); err != nil {
 				return err
 			}
+			arg.QueueDir = ""
 		}
 		t, err := target.NewWebhookTarget(ctx, id, arg, logOnceIf, transport)
 		if err != nil {

@@ -1084,3 +1084,41 @@ func TestParseTargetPkgStringConsts(t *testing.T) {
 		t.Error("target.NATSSubject resolved to empty string")
 	}
 }
+
+func TestWebhookValidationRejectsUnusableNewQueue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	queue := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(queue, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := webhookReloadConfig(server.URL, queue)
+	list := event.NewTargetList(t.Context())
+	if err := TestWebhookTargets(t.Context(), cfg, list, http.DefaultTransport.(*http.Transport)); err == nil {
+		t.Fatal("validation accepted an unusable queue directory")
+	}
+}
+
+func TestWebhookValidationDoesNotReopenChangedQueue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	queue := filepath.Join(t.TempDir(), "queue")
+	cfg := webhookReloadConfig(server.URL, queue)
+	list := event.NewTargetList(t.Context())
+	transport := http.DefaultTransport.(*http.Transport)
+	if err := UpdateWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatal(err)
+	}
+	defer list.Remove(event.NewTargetIDSet(list.List()...))
+	if err := os.Rename(queue, queue+"-saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queue, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	kvs := cfg[config.NotifyWebhookSubSys]["live"]
+	kvs.Set(target.WebhookAuthToken, "changed")
+	if err := TestWebhookTargets(t.Context(), cfg, list, transport); err != nil {
+		t.Fatalf("validation reopened live queue: %v", err)
+	}
+}

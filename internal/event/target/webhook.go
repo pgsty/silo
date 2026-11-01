@@ -109,6 +109,8 @@ type webhookClient struct {
 	manager    *certs.Manager
 	ctx        context.Context
 	cancel     context.CancelFunc
+	refs       int
+	retired    bool
 }
 
 func newWebhookClient(ctx context.Context, args WebhookArgs, transport *http.Transport) *webhookClient {
@@ -175,6 +177,24 @@ func (target *WebhookTarget) currentClient() *webhookClient {
 	return target.client
 }
 
+func (target *WebhookTarget) acquireClient() *webhookClient {
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	client := target.client
+	client.refs++
+	return client
+}
+
+func (target *WebhookTarget) releaseClient(client *webhookClient) {
+	target.mu.Lock()
+	client.refs--
+	closeClient := client.retired && client.refs == 0
+	target.mu.Unlock()
+	if closeClient {
+		client.close()
+	}
+}
+
 // Args returns the currently installed settings.
 func (target *WebhookTarget) Args() WebhookArgs { return target.currentClient().args }
 
@@ -188,7 +208,8 @@ func (target *WebhookTarget) CheckUpdate(args WebhookArgs) error {
 
 // IsActive checks connectivity without holding the target lock during network I/O.
 func (target *WebhookTarget) IsActive() (bool, error) {
-	client := target.currentClient()
+	client := target.acquireClient()
+	defer target.releaseClient(client)
 	if err := client.init(); err != nil {
 		return false, err
 	}
@@ -230,7 +251,8 @@ func (target *WebhookTarget) Save(eventData event.Event) error {
 }
 
 func (target *WebhookTarget) send(eventData event.Event) error {
-	client := target.currentClient()
+	client := target.acquireClient()
+	defer target.releaseClient(client)
 	if err := client.init(); err != nil {
 		return err
 	}
@@ -289,13 +311,17 @@ func (target *WebhookTarget) SendFromStore(key store.Key) error {
 
 // Close cancels outstanding HTTP requests before waiting for replay to stop.
 func (target *WebhookTarget) Close() error {
-	target.mu.Lock()
 	target.cancel()
+	target.mu.Lock()
 	client := target.client
+	client.retired = true
+	closeClient := client.refs == 0
 	target.mu.Unlock()
 	target.startMu.Lock()
 	defer target.startMu.Unlock()
-	client.close()
+	if closeClient {
+		client.close()
+	}
 	if target.replayDone != nil {
 		<-target.replayDone
 	}
@@ -318,11 +344,15 @@ func (target *WebhookTarget) Update(args WebhookArgs, transport *http.Transport)
 	target.mu.Lock()
 	previous := target.client
 	target.client = client
+	previous.retired = true
+	closePrevious := previous.refs == 0
 	target.mu.Unlock()
 	if queue, ok := target.store.(*store.QueueStore[event.Event]); ok {
 		queue.SetLimit(args.QueueLimit)
 	}
-	previous.close()
+	if closePrevious {
+		previous.close()
+	}
 }
 
 // NewWebhookTarget creates a target with lazy TLS initialization. Call Start to replay.

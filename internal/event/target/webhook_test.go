@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/store"
 	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
@@ -116,4 +117,93 @@ func TestWebhookReloadClientCertificate(t *testing.T) {
 	if got := <-received; got != "second" {
 		t.Fatalf("client certificate after reload = %q", got)
 	}
+}
+
+func TestWebhookUpdateRetiresClientAfterInFlightPOST(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { close(started); <-release }))
+	defer server.Close()
+	endpoint, err := xnet.ParseHTTPURL(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := WebhookArgs{Enable: true, Endpoint: *endpoint}
+	cert, key := webhookClientCertificate(t, "in-flight")
+	dir := t.TempDir()
+	args.ClientCert, args.ClientKey = filepath.Join(dir, "cert"), filepath.Join(dir, "key")
+	if err := os.Symlink(cert, args.ClientCert); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(key, args.ClientKey); err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewWebhookTarget(t.Context(), "test", args, nil, http.DefaultTransport.(*http.Transport))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	old := target.currentClient()
+	done := make(chan error, 1)
+	go func() { done <- target.Save(event.Event{}) }()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("POST did not start: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("POST did not start")
+	}
+	target.Update(args, http.DefaultTransport.(*http.Transport))
+	if old.ctx.Err() != nil {
+		close(release)
+		<-done
+		t.Fatal("old client retired before POST finished")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if old.ctx.Err() == nil {
+		t.Fatal("old client was not retired after POST")
+	}
+}
+
+type blockingWebhookStore struct {
+	store.Store[event.Event]
+	started, release chan struct{}
+}
+
+func (s *blockingWebhookStore) Put(event.Event) (store.Key, error) {
+	close(s.started)
+	<-s.release
+	return store.Key{}, nil
+}
+
+func TestWebhookCloseCancelsWhilePutIsBlocked(t *testing.T) {
+	target, err := NewWebhookTarget(t.Context(), "test", WebhookArgs{}, nil, http.DefaultTransport.(*http.Transport))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &blockingWebhookStore{started: make(chan struct{}), release: make(chan struct{})}
+	target.store = s
+	putDone := make(chan struct{})
+	go func() { defer close(putDone); target.Save(event.Event{}) }()
+	<-s.started
+	closed := make(chan struct{})
+	go func() { target.Close(); close(closed) }()
+	select {
+	case <-target.ctx.Done():
+	case <-time.After(time.Second):
+		close(s.release)
+		<-putDone
+		<-closed
+		t.Fatal("Close did not cancel while Put was blocked")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close did not wait for the pending write")
+	default:
+	}
+	close(s.release)
+	<-putDone
+	<-closed
 }
