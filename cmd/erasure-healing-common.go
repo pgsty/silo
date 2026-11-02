@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -384,14 +385,14 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
 		}
 	}
 
-	for i, onlineDisk := range onlineDisks {
+	checkDisk := func(i int, onlineDisk StorageAPI) {
 		if metaErrs[i] != nil {
-			continue
+			return
 		}
 
 		meta := partsMetadata[i]
 		if meta.Deleted || meta.IsRemote() {
-			continue
+			return
 		}
 
 		// Always check data, if we got it.
@@ -403,7 +404,7 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
 				checksumInfo.Algorithm,
 				checksumInfo.Hash, meta.Erasure.ShardSize())
 			dataErrsByPart[0][i] = convPartErrToInt(verifyErr)
-			continue
+			return
 		}
 
 		var (
@@ -429,6 +430,21 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
 			}
 		}
 	}
+
+	var wg sync.WaitGroup
+	for i, onlineDisk := range onlineDisks {
+		if scanMode != madmin.HealDeepScan {
+			checkDisk(i, onlineDisk)
+			continue
+		}
+		// Each worker owns one disk column; transpose only after all finish.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			checkDisk(i, onlineDisk)
+		}()
+	}
+	wg.Wait()
 
 	// Build dataErrs by disk from dataErrs by part
 	for part, disks := range dataErrsByPart {
