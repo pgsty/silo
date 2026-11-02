@@ -467,6 +467,7 @@ func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toD
 		deletedObjs, errs := o.DeleteObjects(ctx, bucket, toDel, ObjectOptions{
 			PrefixEnabledFn:  vc.PrefixEnabled,
 			VersionSuspended: vc.Suspended(),
+			Expiration:       ExpirationOptions{Expire: true},
 		})
 
 		for i, dobj := range deletedObjs {

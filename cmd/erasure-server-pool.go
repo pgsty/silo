@@ -1248,6 +1248,16 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
 
+	// An ILM expiry is decided on the versions in one pool. Under the lock,
+	// check it with the versions in all pools; the sets then take it as
+	// decided, without a recheck by the versions each one holds.
+	if z.expiryNeedsAllPools(opts) {
+		if err = z.checkExpiryAllPools(ctx, bucket, object, opts); err != nil {
+			return ObjectInfo{Name: decodeDirObject(object), VersionID: opts.VersionID}, err
+		}
+		opts.Expiration.CheckedAllPools = true
+	}
+
 	if opts.DeletePrefix {
 		return ObjectInfo{}, z.deletePrefix(ctx, bucket, object)
 	}
@@ -1517,9 +1527,27 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 		batch = make([]ObjectToDelete, 0, len(objects))
 		batchIdx = make([]int, 0, len(objects))
 		data, dataIdx := make([]ObjectToDelete, 0, len(objects)), make([]int, 0, len(objects))
+		ilm := make(map[string]lifecycleAllPools)
 		for i, obj := range objects {
 			if derrs[i] != nil {
 				continue
+			}
+			// A version that ILM expires is checked with the versions of
+			// its object in all pools, see checkExpiryAllPools. When the
+			// expiry no longer applies, nothing is deleted and nothing is
+			// left to replicate.
+			vopts := ObjectOptions{Expiration: opts.Expiration, VersionID: obj.VersionID}
+			if obj.VersionID != "" && z.expiryNeedsAllPools(vopts) {
+				all, ok := ilm[obj.ObjectName]
+				if !ok {
+					all.versions, all.events, all.err = z.lifecycleEventsAllPools(ctx, bucket, obj.ObjectName)
+					ilm[obj.ObjectName] = all
+				}
+				if err := all.expiryApplies(bucket, obj.ObjectName, vopts); err != nil {
+					dobjects[i] = DeletedObject{ObjectName: obj.ObjectName, VersionID: obj.VersionID}
+					derrs[i] = err
+					continue
+				}
 			}
 			if deletesData(obj, opts) {
 				if z.copyWithoutDeleteQuorum(ctx, bucket, obj.ObjectName, obj.VersionID) {

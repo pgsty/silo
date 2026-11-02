@@ -159,6 +159,10 @@ type WalkOptions struct {
 // ExpirationOptions represents object options for object expiration at objectLayer.
 type ExpirationOptions struct {
 	Expire bool
+	// CheckedAllPools: the expiry was checked with the versions of the
+	// object in all pools (checkExpiryAllPools). A set does not check it
+	// again with the versions it holds alone.
+	CheckedAllPools bool
 }
 
 // TransitionOptions represents object options for transition ObjectLayer operation
