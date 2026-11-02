@@ -250,3 +250,32 @@ func (z *erasureServerPools) expiryNeedsAllPools(opts ObjectOptions) bool {
 	}
 	return opts.DeletePrefix || opts.VersionID != "" || opts.Versioned || opts.VersionSuspended
 }
+
+// migrationExpiryApplies reports whether the ILM expiry evt, which a
+// decommission or rebalance decided for oi on the versions of the pool it
+// walks, applies with the versions of the object in all pools too. Only then
+// may the walk leave the version to the expiry instead of moving it. A
+// version that is the latest in the walked pool can be a noncurrent version
+// of the object, and a delete marker alone in that pool can hide versions in
+// another one. Such a version is moved like any other, and the scanner
+// applies the rule in the pool that holds the object then.
+func (z *erasureServerPools) migrationExpiryApplies(ctx context.Context, oi ObjectInfo, evt lifecycle.Event) bool {
+	// The options the expiry deletes with, see
+	// applyExpiryOnNonTransitionedObjects and expireTransitionedObject.
+	opts := ObjectOptions{
+		Expiration:       ExpirationOptions{Expire: true},
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+	}
+	if evt.Action.DeleteVersioned() {
+		opts.VersionID = oi.VersionID
+	}
+	if evt.Action.DeleteAll() {
+		opts.DeletePrefix = true
+	}
+	opts.Transition.ExpireRestored = evt.Action.DeleteRestored()
+	if !z.expiryNeedsAllPools(opts) {
+		return true
+	}
+	return z.checkExpiryAllPools(ctx, oi.Bucket, encodeDirObject(oi.Name), opts) == nil
+}

@@ -29,8 +29,8 @@ import (
 	"github.com/minio/minio/internal/bucket/versioning"
 )
 
-// The scanner, the drive heal and a GET or HEAD of a version evaluate ILM on
-// the versions of a key in one pool: IsLatest, NumVersions and SuccessorModTime
+// The scanner and the walks of decommission and rebalance evaluate ILM on the
+// versions of a key in one pool: IsLatest, NumVersions and SuccessorModTime
 // count only these. A key can have versions in several pools: two concurrent
 // first writes, overwrites that went to another pool. The expiry they decide
 // runs in every pool.
@@ -413,4 +413,89 @@ func TestPoolsLifecycleSplitObject(t *testing.T) {
 			}
 		}
 	})
+}
+
+// walk moves pool 0 out with a decommission or a rebalance pass, as move
+// does, but reports a decommission that did not complete instead of stopping
+// the test, so the reads are still checked.
+func (s *splitILM) walk(kind string) {
+	s.t.Helper()
+	ctx := s.t.Context()
+	if kind == "rebalance" {
+		migrationTestWalk(s.t, s.z, s.bucket, 0, kind)
+		s.z.rebalMu.Lock()
+		s.z.rebalMeta.PoolStats[0].Info.Status = rebalCompleted
+		s.z.rebalMu.Unlock()
+		return
+	}
+	if err := s.z.StartDecommission(ctx, 0); err != nil {
+		s.t.Fatal(err)
+	}
+	s.z.doDecommissionInRoutine(ctx, 0)
+	s.z.poolMetaMutex.RLock()
+	info := *s.z.poolMeta.Pools[0].Decommission
+	s.z.poolMetaMutex.RUnlock()
+	if !info.Complete || info.Failed || info.ItemsDecommissionFailed > 0 {
+		s.t.Errorf("decommission did not complete: complete=%t failed=%t itemsFailed=%d; pool 0 holds %v",
+			info.Complete, info.Failed, info.ItemsDecommissionFailed, s.view(0))
+	}
+}
+
+// Rules that expire a whole object (DelMarkerExpiration,
+// ExpiredObjectAllVersions) or a delete marker without noncurrent versions
+// (ExpiredObjectDeleteMarker) depend on every version of the object. A walk
+// sees the versions in its own pool only.
+func TestPoolsMigrationLifecycleWholeObject(t *testing.T) {
+	recent := 1.0 / 24
+	objects := []struct {
+		name     string
+		versions []splitVersion // oldest first
+		before   string         // what a GET reads before the walk
+		after    string         // what a GET reads once ILM caught up
+		want     []string       // versions in pool 1 once ILM caught up, newest first
+	}{
+		// The marker expires and takes v1 with it.
+		{"dme-one-pool", []splitVersion{splitAt("v1", 5, 0), splitMarker("dm", 3, 0)}, "-", "-", nil},
+		{"dme-older-in-pool-1", []splitVersion{splitAt("v1", 5, 1), splitMarker("dm", 3, 0)}, "-", "-", nil},
+		// v2 is the current version, the marker does not expire.
+		{"dme-newer-in-pool-1", []splitVersion{splitMarker("dm", 3, 0), splitAt("v2", recent, 1)}, "v2", "v2", []string{"v2", "dm"}},
+		// v2 expires and takes v1 with it.
+		{"eav-one-pool", []splitVersion{splitAt("v1", 5, 0), splitAt("v2", 4, 0)}, "v2", "-", nil},
+		{"eav-older-in-pool-1", []splitVersion{splitAt("v1", 5, 1), splitAt("v2", 4, 0)}, "v2", "-", nil},
+		// v2 is the current version and does not expire.
+		{"eav-newer-in-pool-1", []splitVersion{splitAt("v1", 5, 0), splitAt("v2", recent, 1)}, "v2", "v2", []string{"v2", "v1"}},
+		// The marker hides v1, it is not a marker without noncurrent versions.
+		{"edm-older-in-pool-1", []splitVersion{splitAt("v1", 5, 1), splitMarker("dm", 3, 0)}, "-", "-", []string{"dm", "v1"}},
+		{"keep-marker", []splitVersion{splitAt("v1", 5, 0), splitMarker("dm", 3, 0)}, "-", "-", []string{"dm", "v1"}},
+		{"keep-versions", []splitVersion{splitAt("v1", 5, 0), splitAt("v2", 4, 0)}, "v2", "v2", []string{"v2", "v1"}},
+	}
+	for _, kind := range []string{"decommission", "rebalance"} {
+		t.Run(kind, func(t *testing.T) {
+			s := newSplitILM(t, versioning.Enabled, splitILMRules)
+			for _, o := range objects {
+				for _, v := range o.versions {
+					s.write(o.name, v)
+				}
+				if got := s.get(o.name); got != o.before {
+					t.Fatalf("%s: fixture reads %s, want %s", o.name, got, o.before)
+				}
+			}
+			s.walk(kind)
+			for _, o := range objects {
+				if got := s.get(o.name); got != o.before && got != o.after {
+					t.Errorf("%s: reads %s after the %s, before ILM caught up; want %s or %s", o.name, got, kind, o.before, o.after)
+				}
+			}
+			s.runQueue()
+			s.scan(1)
+			want := map[string][]string{}
+			for _, o := range objects {
+				want[o.name] = o.want
+				if got := s.get(o.name); got != o.after {
+					t.Errorf("%s: reads %s once ILM caught up, want %s", o.name, got, o.after)
+				}
+			}
+			s.check(want)
+		})
+	}
 }
