@@ -542,6 +542,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 	var vc *versioning.Versioning
 	var lc *lifecycle.Lifecycle
+	var lifecycleUpdatedAt time.Time
 	var lr objectlock.Retention
 	var rcfg *replication.Config
 	if bucket != minioMetaBucket {
@@ -551,7 +552,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 		}
 
 		// Check if the current bucket has a configured lifecycle policy
-		lc, err = globalLifecycleSys.Get(bucket)
+		lc, lifecycleUpdatedAt, err = globalBucketMetadataSys.GetLifecycleConfig(bucket)
 		if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
 			return err
 		}
@@ -587,8 +588,8 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 	}
 
 	for setIdx, set := range pool.sets {
-		// filterLifecycle returns the action of an ILM deletion it queued
-		// for the version, which is then not moved, or NoneAction.
+		// filterLifecycle returns an ILM deletion that migration must handle
+		// before retiring the source copy, or NoneAction.
 		filterLifecycle := func(bucket, object string, fi FileInfo) lifecycle.Action {
 			if lc == nil {
 				return lifecycle.NoneAction
@@ -605,7 +606,6 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				// scanner applies the expiry once it lives in another pool.
 				return lifecycle.NoneAction
 			case evt.Action.Delete():
-				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Rebal)
 				return evt.Action
 			}
 			return lifecycle.NoneAction
@@ -633,7 +633,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			versionsSorter(fivs.Versions).reverse()
 
 			var rebalanced int
-			var expired []FileInfo
+			var expired []migrationExpiredVersion
 			for _, version := range fivs.Versions {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 
@@ -650,8 +650,13 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					// goes with them when ILM deletes it alone; any other
 					// version stays until the expiry has run.
 					rebalanced++
-					if ilmDeletesVersionOnly(action) {
-						expired = append(expired, version)
+					if ilmDeletesVersionOnly(action) || action.DeleteAll() {
+						expired = append(expired, migrationExpiredVersion{
+							version:            version,
+							event:              lifecycle.Event{Action: action},
+							lifecycleUpdatedAt: lifecycleUpdatedAt,
+							source:             lcEventSrc_Rebal,
+						})
 					}
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue

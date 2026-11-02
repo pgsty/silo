@@ -18,6 +18,9 @@
 package cmd
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -26,6 +29,7 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/bucket/versioning"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -234,16 +238,6 @@ func (m *migrationILM) catchUp() {
 	}
 }
 
-// latest returns the label of the version a read of object returns.
-func (m *migrationILM) latest(object string) string {
-	m.t.Helper()
-	oi, err := m.z.GetObjectInfo(m.t.Context(), m.bucket, object, ObjectOptions{})
-	if err != nil && (!oi.DeleteMarker || !isErrObjectNotFound(err) && !isErrMethodNotAllowed(err)) {
-		m.t.Fatal(err)
-	}
-	return m.label(object, oi.VersionID, oi.DeleteMarker)
-}
-
 // view returns the versions of each object in a pool, newest first. Delete
 // markers and versions the test did not write are "DM" and "?".
 func (m *migrationILM) view(pool int) map[string][]string {
@@ -384,12 +378,14 @@ func testMigrationLifecycleExpiry(t *testing.T, kind string) {
 		m.check(map[string][]string{"obj-top": {"dm", "v1"}, "keep-dm": {"dm"}})
 	})
 
-	// ILM deletes every version of obj-01 with v3, and of obj-dm with its
-	// marker. Until the queued expiry does, the moved older versions must
-	// stay hidden.
-	for _, tc := range []struct{ name, rule, object, latest string }{
-		{"expire-all-versions", "<Expiration><Days>1</Days><ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration>", "obj-01", "v3"},
-		{"expire-marker-all-versions", "<DelMarkerExpiration><Days>1</Days></DelMarkerExpiration>", "obj-dm", "dm"},
+	// Each rule deletes every version of one object. Migration must execute the
+	// logical DeleteAll action before it retires the source pool, so the object
+	// selected by the rule is gone from both pools before any later scan.
+	for _, tc := range []struct {
+		name, rule, deleted string
+	}{
+		{"expire-all-versions", "<Expiration><Days>1</Days><ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration>", "obj-01"},
+		{"expire-marker-all-versions", "<DelMarkerExpiration><Days>1</Days></DelMarkerExpiration>", "obj-dm"},
 	} {
 		t.Run("versioned/"+tc.name, func(t *testing.T) {
 			m := newMigrationILM(t, versioning.Enabled, false, migrationILMRule(tc.rule))
@@ -397,13 +393,17 @@ func testMigrationLifecycleExpiry(t *testing.T, kind string) {
 			m.put("obj-dm", "v1", ObjectOptions{Versioned: true, MTime: UTCNow().AddDate(0, 0, -5)})
 			m.marker("obj-dm", "dm", UTCNow().AddDate(0, 0, -3))
 			m.move(kind)
-			if got := m.latest(tc.object); got != tc.latest {
-				t.Errorf("%s reads as %s before ILM deletes it, want %s; pool 0 holds %v, pool 1 holds %v",
-					tc.object, got, tc.latest, m.view(0), m.view(1))
+			if len(m.queue) != 0 {
+				t.Fatalf("migration left stale expiry tasks queued: %d", len(m.queue))
 			}
+			want := map[string][]string{
+				"obj-01":  {"v3", "v2", "v1"},
+				"keep-01": {"v3", "v2", "v1"},
+				"obj-dm":  {"dm", "v1"},
+			}
+			delete(want, tc.deleted)
+			m.check(want)
 			m.catchUp()
-			want := map[string][]string{"obj-01": {"v3", "v2", "v1"}, "keep-01": {"v3", "v2", "v1"}, "obj-dm": {"dm", "v1"}}
-			delete(want, tc.object)
 			m.check(want)
 		})
 	}
@@ -415,6 +415,138 @@ func testMigrationLifecycleExpiry(t *testing.T, kind string) {
 		m.migrate(kind)
 		m.check(map[string][]string{"keep-01": {"null"}})
 	})
+}
+
+// A lifecycle action found during the migration walk must not be applied
+// after the bucket's lifecycle configuration changes. The source copy stays
+// available for a fresh scan under the new policy.
+func TestPoolsMigrationLifecycleChangePreservesSource(t *testing.T) {
+	m := newMigrationILM(t, versioning.Enabled, false, migrationILMExpireCurrent())
+	oi := m.put("obj-01", "v1", ObjectOptions{Versioned: true})
+	_, updatedAt, err := globalBucketMetadataSys.GetLifecycleConfig(m.bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := globalBucketMetadataSys.Get(m.bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.LifecycleConfigXML = []byte(`<LifecycleConfiguration><Rule><ID>changed</ID><Status>Enabled</Status><Filter><Prefix>other-</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`)
+	meta.LifecycleConfigUpdatedAt = updatedAt.Add(time.Second)
+	if err := meta.Save(t.Context(), m.z); err != nil {
+		t.Fatal(err)
+	}
+	globalBucketMetadataSys.Set(m.bucket, meta)
+
+	err = m.z.applyMigrationExpiry(t.Context(), m.bucket, oi.Name, 0, []migrationExpiredVersion{{
+		version: FileInfo{
+			Name:      oi.Name,
+			VersionID: oi.VersionID,
+			ModTime:   oi.ModTime,
+		},
+		event:              lifecycle.Event{Action: lifecycle.DeleteAction},
+		lifecycleUpdatedAt: updatedAt,
+		source:             lcEventSrc_Decom,
+	}})
+	if err == nil {
+		t.Fatal("migration expiry succeeded after lifecycle configuration changed")
+	}
+	if _, err := m.z.serverPools[0].GetObjectInfo(t.Context(), m.bucket, oi.Name, ObjectOptions{VersionID: oi.VersionID}); err != nil {
+		t.Fatalf("source version was removed after lifecycle configuration changed: %v", err)
+	}
+}
+
+// A migration must route an ILM version purge through the normal delete
+// replication path before it can retire the source copy. Otherwise the
+// source pool can disappear while the replica still retains the version.
+func TestPoolsMigrationLifecycleExpiryReplication(t *testing.T) {
+	m := newMigrationILM(t, versioning.Enabled, false,
+		migrationILMRule("<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>"))
+	m.aged(0, "obj-01")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stats := NewReplicationStats(ctx, nil)
+	oldStats := globalReplicationStats.Swap(stats)
+	defer globalReplicationStats.Store(oldStats)
+
+	target := newILMTestTarget(t)
+	registerILMTestTarget(t, m.z, m.bucket, target, func(w http.ResponseWriter, r *http.Request) {
+		opts := ObjectOptions{VersionID: r.URL.Query().Get("versionId"), Versioned: true}
+		switch r.Method {
+		case http.MethodHead:
+			oi, err := m.z.GetObjectInfo(r.Context(), target.bucket, "obj-01", opts)
+			if err != nil {
+				writeErrorResponseHeadersOnly(w, toAPIError(r.Context(), err))
+				return
+			}
+			if oi.DeleteMarker {
+				w.Header().Set(xhttp.AmzDeleteMarker, "true")
+				w.Header().Set(xhttp.AmzVersionID, oi.VersionID)
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			target.deletes.Add(1)
+			opts.DeleteMarker = r.Header.Get(xhttp.MinIOSourceDeleteMarker) == "true"
+			opts.ReplicationRequest = true
+			opts.SetReplicaStatus(replication.Replica)
+			if _, err := m.z.DeleteObject(r.Context(), target.bucket, "obj-01", opts); err != nil && !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
+				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected remote method %s", r.Method)
+		}
+	})
+	setILMTestReplicationConfig(t, m.bucket, target.arn, target.bucket)
+	restorePool, receive := newILMTestReplicationPool(ctx, m.z, stats)
+	defer restorePool()
+
+	if err := m.z.StartDecommission(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.z.doDecommissionInRoutine(ctx, 0)
+	m.z.poolMetaMutex.RLock()
+	info := *m.z.poolMeta.Pools[0].Decommission
+	m.z.poolMetaMutex.RUnlock()
+	if info.Complete || !info.Failed {
+		t.Fatalf("decommission completed before ILM purge replication: complete=%t failed=%t", info.Complete, info.Failed)
+	}
+
+	deletion := receive()
+	if deletion.ObjectName != "obj-01" || deletion.VersionID == "" || deletion.VersionPurgeStatus() != replication.VersionPurgePending {
+		t.Fatalf("unexpected migration purge: %+v", deletion)
+	}
+	if result := replicateDelete(ctx, deletion, m.z); result.VersionPurgeStatus() != replication.VersionPurgeComplete {
+		t.Fatalf("migration purge replication result: %+v", result)
+	}
+	if target.deletes.Load() != 1 {
+		t.Fatalf("replication target saw %d deletes, want 1", target.deletes.Load())
+	}
+
+	// A failed decommission may already have moved the source pool's bucket
+	// metadata. Recreate the metadata directory before the resumable retry,
+	// as the server's scanner would do in production.
+	for _, set := range m.z.serverPools[0].sets {
+		for _, disk := range set.getDisks() {
+			if err := disk.MakeVol(ctx, pathJoin(minioMetaBucket, bucketMetaPrefix)); err != nil && !errors.Is(err, errVolumeExists) {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if err := m.z.StartDecommission(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.z.doDecommissionInRoutine(ctx, 0)
+	m.z.poolMetaMutex.RLock()
+	info = *m.z.poolMeta.Pools[0].Decommission
+	m.z.poolMetaMutex.RUnlock()
+	if !info.Complete || info.Failed {
+		t.Fatalf("decommission did not complete after ILM purge replication: complete=%t failed=%t", info.Complete, info.Failed)
+	}
 }
 
 func TestPoolsDecommissionLifecycleExpiry(t *testing.T) {
