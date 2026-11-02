@@ -130,7 +130,12 @@ func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket
 // removeMovedVersions retires only the source versions in the walker's
 // snapshot. A concurrent delete can create a new marker in the source pool;
 // deleting the whole prefix would remove that marker and expose moved data.
-func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo) error {
+// Versions in expired were not moved because ILM deletes them. They are
+// removed from the source without a moved copy, as the queued expiry would
+// remove them. Left behind, such a version can become the latest one in the
+// source pool once the moved versions are gone, and the expiry, which
+// re-evaluates the rule there, would no longer delete it.
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions, expired []FileInfo) error {
 	object = encodeDirObject(object)
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -168,7 +173,7 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		}
 		// Successful movement is not enough if the destination changed again.
 		// Keep the source unless another copy still preserves its read result.
-		if len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime) {
+		if !isExpiredVersion(expired, version) && (len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime)) {
 			return PreConditionFailed{}
 		}
 		_, err = z.serverPools[source].DeleteObject(ctx, bucket, object, ObjectOptions{
@@ -180,6 +185,23 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		}
 	}
 	return nil
+}
+
+// ilmDeletesVersionOnly reports whether the ILM action queued for a version
+// that data movement skipped deletes that version and nothing else, rather
+// than every version of the object or only the restored copy of a
+// transitioned version. Such a version is passed to removeMovedVersions.
+func ilmDeletesVersionOnly(action lifecycle.Action) bool {
+	return action == lifecycle.DeleteAction || action == lifecycle.DeleteVersionAction
+}
+
+func isExpiredVersion(expired []FileInfo, version FileInfo) bool {
+	for _, fi := range expired {
+		if fi.VersionID == version.VersionID && fi.ModTime.Equal(version.ModTime) && fi.Deleted == version.Deleted {
+			return true
+		}
+	}
+	return false
 }
 
 // Healing also commits object metadata. Both queued healing and drive healing
