@@ -127,15 +127,119 @@ func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket
 	}, nil
 }
 
+type migrationExpiredVersion struct {
+	version            FileInfo
+	event              lifecycle.Event
+	lifecycleUpdatedAt time.Time
+	source             lcEventSrc
+}
+
+// applyMigrationExpiry runs the logical expiry path before migration retires
+// any remaining source copies. This keeps replication and tier cleanup under
+// their normal ownership and makes lifecycle configuration changes fail safe.
+func (z *erasureServerPools) applyMigrationExpiry(ctx context.Context, bucket, object string, source int, expired []migrationExpiredVersion) error {
+	if len(expired) == 0 {
+		return nil
+	}
+
+	lc, lifecycleUpdatedAt, err := globalBucketMetadataSys.GetLifecycleConfig(bucket)
+	if err != nil {
+		return PreConditionFailed{}
+	}
+	for _, pending := range expired {
+		if !pending.lifecycleUpdatedAt.Equal(lifecycleUpdatedAt) {
+			return PreConditionFailed{}
+		}
+	}
+	lr, err := globalBucketObjectLockSys.Get(bucket)
+	if err != nil {
+		return err
+	}
+	rcfg, err := getReplicationConfig(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	encodedObject := encodeDirObject(object)
+	seenDeleteAll := false
+	eventSource := lcEventSrc_Decom
+	for _, pending := range expired {
+		if pending.source != lcEventSrc_None {
+			eventSource = pending.source
+			break
+		}
+	}
+
+	for _, pending := range expired {
+		if pending.event.Action.DeleteAll() {
+			if seenDeleteAll {
+				continue
+			}
+			seenDeleteAll = true
+		}
+
+		versionID := pending.version.VersionID
+		if versionID == "" {
+			versionID = nullVersionID
+		}
+		copies, err := z.objectPoolInfos(ctx, bucket, encodedObject, ObjectOptions{
+			VersionID:  versionID,
+			NoAuditLog: true,
+		})
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+
+		current := copies[0].ObjInfo
+		for _, copy := range copies {
+			if copy.Index == source {
+				current = copy.ObjInfo
+				break
+			}
+		}
+		current.Bucket = bucket
+		current.Name = object
+		currentEvent := evalActionFromLifecycle(ctx, *lc, lr, rcfg, current)
+		if currentEvent.Action != pending.event.Action {
+			return PreConditionFailed{}
+		}
+
+		var ok bool
+		if current.TransitionedObject.Status != "" && !pending.event.Action.DeleteAll() {
+			ok = applyExpiryOnTransitionedObject(ctx, z, current, pending.event, eventSource)
+		} else {
+			ok = applyExpiryOnNonTransitionedObjects(ctx, z, current, pending.event, eventSource)
+		}
+		if ok {
+			continue
+		}
+
+		// A concurrent expiry may have removed the addressed version after
+		// the first lookup. Anything still present means the logical delete
+		// was not committed and migration must stop before purging its source.
+		if _, err := z.objectPoolInfos(ctx, bucket, encodedObject, ObjectOptions{VersionID: versionID, NoAuditLog: true}); err == nil {
+			return PreConditionFailed{}
+		} else if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // removeMovedVersions retires only the source versions in the walker's
 // snapshot. A concurrent delete can create a new marker in the source pool;
 // deleting the whole prefix would remove that marker and expose moved data.
-// Versions in expired were not moved because ILM deletes them. They are
-// removed from the source without a moved copy, as the queued expiry would
-// remove them. Left behind, such a version can become the latest one in the
-// source pool once the moved versions are gone, and the expiry, which
-// re-evaluates the rule there, would no longer delete it.
-func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions, expired []FileInfo) error {
+// Versions in expired were not moved because ILM deletes them. They must stay
+// in the source until the ordinary expiry path has deleted them: that path
+// owns replication state and tier cleanup, and it re-evaluates the current
+// lifecycle rule. A migration cleanup must never turn an asynchronous ILM
+// decision into an unconditional physical purge.
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) error {
+	if err := z.applyMigrationExpiry(ctx, bucket, object, source, expired); err != nil {
+		return err
+	}
 	object = encodeDirObject(object)
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -171,9 +275,14 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		if !src.ModTime.Equal(version.ModTime) || src.DeleteMarker != version.Deleted {
 			return PreConditionFailed{}
 		}
+		if isExpiredVersion(expired, version) {
+			// The logical expiry path owns this version. Keeping the source is
+			// also the retry point if that path failed or the pool check races it.
+			continue
+		}
 		// Successful movement is not enough if the destination changed again.
 		// Keep the source unless another copy still preserves its read result.
-		if !isExpiredVersion(expired, version) && (len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime)) {
+		if len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime) {
 			return PreConditionFailed{}
 		}
 		_, err = z.serverPools[source].DeleteObject(ctx, bucket, object, ObjectOptions{
@@ -195,8 +304,9 @@ func ilmDeletesVersionOnly(action lifecycle.Action) bool {
 	return action == lifecycle.DeleteAction || action == lifecycle.DeleteVersionAction
 }
 
-func isExpiredVersion(expired []FileInfo, version FileInfo) bool {
-	for _, fi := range expired {
+func isExpiredVersion(expired []migrationExpiredVersion, version FileInfo) bool {
+	for _, pending := range expired {
+		fi := pending.version
 		if fi.VersionID == version.VersionID && fi.ModTime.Equal(version.ModTime) && fi.Deleted == version.Deleted {
 			return true
 		}

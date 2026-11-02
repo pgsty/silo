@@ -2062,6 +2062,8 @@ const (
 	ReplicateIncoming = "replicate:incoming"
 	// ReplicateIncomingDelete - audit trail of inline replication of deletes.
 	ReplicateIncomingDelete = "replicate:incoming:delete"
+	// ReplicateILMDelete - audit trail of delete replication triggered by ILM expiry.
+	ReplicateILMDelete = "replicate:ilm:delete"
 
 	// ReplicateHeal - audit trail for healing of failed/pending replications
 	ReplicateHeal = "replicate:heal"

@@ -37,6 +37,7 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -631,31 +632,63 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		return err
 	}
 
-	// Delete remote object from warm-tier
-	//
-	// Unless the expiry only puts a delete marker on top of the version, as
-	// for an object that is not transitioned: with versioning enabled, or
-	// suspended and the version is not the null version, the version stays
-	// as a noncurrent version and must remain readable. Its remote object is
-	// removed later, through the free version added when the version itself
-	// is deleted.
+	// Recheck the lifecycle decision and create the hot-tier tombstone before
+	// touching the remote tier. If the lifecycle configuration changed after
+	// the scanner queued this task, DeleteObject rejects the stale action while
+	// the remote object is still protected.
 	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name)
 	keepRemote := opts.VersionID == "" &&
 		(opts.Versioned || (opts.VersionSuspended && oi.VersionID != "" && oi.VersionID != nullVersionID))
+	if lcEvent.Action == lifecycle.DeleteAction || lcEvent.Action == lifecycle.DeleteVersionAction {
+		opts.SetEvalMetadataFn(func(goi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
+			return checkReplicateDelete(ctx, oi.Bucket, ObjectToDelete{
+				ObjectV: ObjectV{
+					ObjectName: goi.Name,
+					VersionID:  opts.VersionID,
+				},
+			}, *goi, opts, gerr), nil
+		})
+	}
+
+	// Delete the hot-tier namespace first. For a transitioned version this
+	// leaves a durable free-version record until the remote delete succeeds;
+	// that record is the retry point if the process stops between the two
+	// operations.
+	delInfo, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
+	if err != nil {
+		return err
+	}
+
 	if !keepRemote {
-		err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
-		if err == nil {
-			// Skip adding free version since we successfully deleted the
-			// remote object
-			opts.SkipFreeVersion = true
-		} else {
+		if err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier); err != nil {
 			transitionLogIf(ctx, err)
 		}
 	}
 
-	// Now, delete object from hot-tier namespace
-	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
-		return err
+	// Queue replication of the ILM-created delete marker or version purge,
+	// mirroring the DELETE handler's post-delete scheduling.
+	if delInfo.ReplicationStatus == replication.Pending || delInfo.VersionPurgeStatus == replication.VersionPurgePending {
+		dmVersionID, versionID := "", ""
+		if delInfo.DeleteMarker && delInfo.VersionPurgeStatus.Empty() {
+			dmVersionID = delInfo.VersionID
+		} else {
+			versionID = delInfo.VersionID
+		}
+		if delInfo.Name == "" {
+			delInfo.Name = oi.Name
+		}
+		scheduleReplicationDelete(ctx, DeletedObjectReplicationInfo{
+			DeletedObject: DeletedObject{
+				ObjectName:            delInfo.Name,
+				VersionID:             versionID,
+				DeleteMarkerVersionID: dmVersionID,
+				DeleteMarkerMTime:     DeleteMarkerMTime{delInfo.ModTime},
+				DeleteMarker:          delInfo.DeleteMarker,
+				ReplicationState:      delInfo.ReplicationState(),
+			},
+			Bucket:    oi.Bucket,
+			EventType: ReplicateILMDelete,
+		}, objectAPI)
 	}
 
 	// Send audit for the lifecycle delete operation
