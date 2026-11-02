@@ -25,6 +25,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -903,6 +904,88 @@ func TestPoolsMigrationRetiresSupersededCopy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPoolsMigrationAfterCompleteRemoval(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	dirs, err := getRandomDisks(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousEndpoints := globalEndpoints
+	endpoints := mustGetPoolEndpoints(0, dirs[:16]...)
+	endpoints = append(endpoints, mustGetPoolEndpoints(1, dirs[16:]...)...)
+	globalEndpoints = endpoints
+	obj, _, err := initObjectLayer(ctx, endpoints)
+	if err != nil {
+		globalEndpoints = previousEndpoints
+		removeRoots(dirs)
+		t.Fatal(err)
+	}
+	z := obj.(*erasureServerPools)
+	previous := newObjectLayerFn()
+	setObjectLayer(z)
+	var reopened *erasureServerPools
+	oldShutdown := false
+	t.Cleanup(func() {
+		if reopened != nil {
+			_ = reopened.Shutdown(context.Background())
+		}
+		if !oldShutdown {
+			_ = z.Shutdown(context.Background())
+		}
+		removeRoots(dirs)
+		globalEndpoints = previousEndpoints
+		setObjectLayer(previous)
+	})
+
+	bucket, _, err := initAPIHandlerTest(ctx, z, nil, MakeBucketOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const object = "object"
+	mtime := time.Now().UTC().Add(-time.Hour)
+	oldBody := bytes.Repeat([]byte{'a'}, 64<<10)
+	newBody := bytes.Repeat([]byte{'b'}, 256<<10)
+	nullQuorumCrossParityOverwrite(t, z, 0, bucket, object, oldBody, newBody, mtime, ObjectOptions{})
+
+	z.poolMetaMutex.Lock()
+	z.poolMeta.Pools[0].Decommission = &PoolDecommissionInfo{}
+	z.poolMetaMutex.Unlock()
+	if err := z.decommissionPool(ctx, 0, z.serverPools[0], decomBucketInfo{Name: bucket}); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.CompleteDecommission(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	oldShutdown = true
+
+	globalEndpoints = mustGetPoolEndpoints(0, dirs[16:]...)
+	reopenedObj, _, err := initObjectLayer(t.Context(), globalEndpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened = reopenedObj.(*erasureServerPools)
+	setObjectLayer(reopened)
+	_, router, err := initAPIHandlerTest(t.Context(), reopened, nil, MakeBucketOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	get := nullQuorumRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object))
+	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), newBody) {
+		t.Fatalf("GET after pool removal: status=%d bytes=%d", get.Code, get.Body.Len())
+	}
+	if code, keys := nullQuorumListV2Keys(t, router, bucket); code != http.StatusOK || !slices.Equal(keys, []string{object}) {
+		t.Fatalf("ListObjectsV2 after pool removal: status=%d keys=%v", code, keys)
+	}
+	if code, versions := nullQuorumListVersions(t, router, bucket); code != http.StatusOK || len(versions) != 1 || versions[0].Key != object || versions[0].VersionID != nullVersionID || versions[0].Size != int64(len(newBody)) {
+		t.Fatalf("ListObjectVersions after pool removal: status=%d versions=%+v", code, versions)
 	}
 }
 
