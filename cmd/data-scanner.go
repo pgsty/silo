@@ -1130,15 +1130,9 @@ eventLoop:
 			applyExpiryRule(event, lcEventSrc_Scanner, oi)
 
 		case lifecycle.DeleteVersionAction: // noncurrent versions expiration
-			opts := objOpts[idx]
 			remainingVersions--
 			size = 0
-			toDel = append(toDel, ObjectToDelete{
-				ObjectV: ObjectV{
-					ObjectName: opts.Name,
-					VersionID:  opts.VersionID,
-				},
-			})
+			toDel = append(toDel, ilmPurgeToDelete(ctx, i.bucket, oi, i.replication.Config != nil))
 			noncurrentEvents = append(noncurrentEvents, event)
 
 		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
@@ -1240,6 +1234,24 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		// use prefix delete on exact object (this is an optimization to avoid fan-out calls)
 		opts.DeletePrefixObject = true
 	}
+
+	// ILM-created deletions must replicate like API-created ones. The S3
+	// DELETE path evaluates the delete replication decision while deleting,
+	// ILM expiry must do the same so the delete marker (or version purge)
+	// carries replication state and is queued to the targets below.
+	// DeleteVersionAction reaches here from the decommission/heal paths in
+	// addition to the scanner's bulk noncurrent expiry. Deletes of restored
+	// copies and of all versions stay local by design.
+	if lcEvent.Action == lifecycle.DeleteAction || lcEvent.Action == lifecycle.DeleteVersionAction {
+		opts.SetEvalMetadataFn(func(oi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
+			return checkReplicateDelete(ctx, obj.Bucket, ObjectToDelete{
+				ObjectV: ObjectV{
+					ObjectName: oi.Name,
+					VersionID:  opts.VersionID,
+				},
+			}, *oi, opts, gerr), nil
+		})
+	}
 	var (
 		dobj ObjectInfo
 		err  error
@@ -1276,6 +1288,29 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		dobj = obj
 	}
 
+	// Queue replication of the ILM-created delete marker or version purge,
+	// mirroring what the DELETE handler does for API-originated deletes.
+	if dobj.ReplicationStatus == replication.Pending || dobj.VersionPurgeStatus == replication.VersionPurgePending {
+		dmVersionID, versionID := "", ""
+		if dobj.DeleteMarker && dobj.VersionPurgeStatus.Empty() {
+			dmVersionID = dobj.VersionID
+		} else {
+			versionID = dobj.VersionID
+		}
+		scheduleReplicationDelete(ctx, DeletedObjectReplicationInfo{
+			DeletedObject: DeletedObject{
+				ObjectName:            dobj.Name,
+				VersionID:             versionID,
+				DeleteMarkerVersionID: dmVersionID,
+				DeleteMarkerMTime:     DeleteMarkerMTime{dobj.ModTime},
+				DeleteMarker:          dobj.DeleteMarker,
+				ReplicationState:      dobj.ReplicationState(),
+			},
+			Bucket:    obj.Bucket,
+			EventType: ReplicateILMDelete,
+		}, objLayer)
+	}
+
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
 	tags["version-id"] = dobj.VersionID
 
@@ -1307,6 +1342,34 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 // Apply object, object version, restored object or restored object version action on the given object
 func applyExpiryRule(event lifecycle.Event, src lcEventSrc, obj ObjectInfo) {
 	globalExpiryState.enqueueByDays(obj, event, src)
+}
+
+// ilmPurgeToDelete builds the bulk delete entry for an ILM-initiated removal
+// of a noncurrent version. Like the DELETE API path, the entry carries the
+// delete replication decision so the version is removed with a pending purge
+// state and the purge is queued to the replication targets.
+func ilmPurgeToDelete(ctx context.Context, bucket string, oi ObjectInfo, replicate bool) ObjectToDelete {
+	otd := ObjectToDelete{
+		ObjectV: ObjectV{
+			ObjectName: oi.Name,
+			VersionID:  oi.VersionID,
+		},
+	}
+	if !replicate {
+		return otd
+	}
+	delOpts := ObjectOptions{
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, oi.Name),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, oi.Name),
+	}
+	dsc := checkReplicateDelete(ctx, bucket, otd, oi, delOpts, nil)
+	if !dsc.ReplicateAny() {
+		return otd
+	}
+	otd.VersionPurgeStatus = replication.VersionPurgePending
+	otd.VersionPurgeStatuses = dsc.PendingStatus()
+	otd.ReplicateDecisionStr = dsc.String()
+	return otd
 }
 
 // objectPath returns the prefix and object name.

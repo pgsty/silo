@@ -28,6 +28,7 @@ import (
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
@@ -499,6 +500,20 @@ func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toD
 				}
 			}
 			sendEvent(evArgs)
+
+			// ILM purges carry a delete replication decision; queue
+			// replication of the purge when it is still pending, mirroring
+			// what the multi-object DELETE handler does.
+			if errs[i] == nil || isErrObjectNotFound(errs[i]) || isErrVersionNotFound(errs[i]) {
+				if dobj.VersionPurgeStatus() == replication.VersionPurgePending ||
+					dobj.DeleteMarkerReplicationStatus() == replication.Pending {
+					scheduleReplicationDelete(ctx, DeletedObjectReplicationInfo{
+						DeletedObject: dobj,
+						Bucket:        bucket,
+						EventType:     ReplicateILMDelete,
+					}, o)
+				}
+			}
 		}
 	}
 }

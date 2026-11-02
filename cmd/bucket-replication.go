@@ -2067,6 +2067,9 @@ const (
 	ReplicateHeal = "replicate:heal"
 	// ReplicateHealDelete - audit trail of healing of failed/pending delete replications.
 	ReplicateHealDelete = "replicate:heal:delete"
+
+	// ReplicateILMDelete - audit trail of delete replication triggered by ILM expiry.
+	ReplicateILMDelete = "replicate:ilm:delete"
 )
 
 var (
