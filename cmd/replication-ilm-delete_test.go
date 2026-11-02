@@ -211,7 +211,7 @@ func testReplicateILMExpiryDeleteMarker(obj ObjectLayer, instanceType, bucket st
 	// composite ReplicationStatus field is unreliable on read-back for
 	// markers carrying a replication timestamp, so assert the raw state.
 	moi, merr = obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: markerVID})
-	if !isErrMethodNotAllowed(merr) || !strings.Contains(string(moi.ReplicationStatusInternal), "=COMPLETED;") {
+	if !isErrMethodNotAllowed(merr) || !strings.Contains(moi.ReplicationStatusInternal, "=COMPLETED;") {
 		t.Fatalf("%s: source marker state = %q (err %v), want COMPLETED", instanceType, moi.ReplicationStatusInternal, merr)
 	}
 }

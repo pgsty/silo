@@ -238,16 +238,6 @@ func (m *migrationILM) catchUp() {
 	}
 }
 
-// latest returns the label of the version a read of object returns.
-func (m *migrationILM) latest(object string) string {
-	m.t.Helper()
-	oi, err := m.z.GetObjectInfo(m.t.Context(), m.bucket, object, ObjectOptions{})
-	if err != nil && (!oi.DeleteMarker || !isErrObjectNotFound(err) && !isErrMethodNotAllowed(err)) {
-		m.t.Fatal(err)
-	}
-	return m.label(object, oi.VersionID, oi.DeleteMarker)
-}
-
 // view returns the versions of each object in a pool, newest first. Delete
 // markers and versions the test did not write are "DM" and "?".
 func (m *migrationILM) view(pool int) map[string][]string {
