@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"sort"
 	"strings"
@@ -769,6 +770,11 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 			deleteOpts.Versioned = opts.PrefixEnabledFn(obj.ObjectName)
 		}
 		_, err := z.deleteObjectReconciled(ctx, bucket, obj.ObjectName, deleteOpts)
+		if errors.Is(err, errLifecycleNotApplicable) {
+			// A later lifecycle rejection did not commit a local purge. Do
+			// not let the worker replicate the request's pending decision.
+			deleted[i].ReplicationState = ReplicationState{}
+		}
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			errs[i] = err
 		} else {

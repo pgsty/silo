@@ -2045,6 +2045,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	// expiration attempted on a bucket with no lifecycle
 	// rules shall be rejected.
 	if lc == nil && opts.Expiration.Expire {
+		if !opts.Transition.ExpireRestored {
+			return objInfo, errLifecycleNotApplicable
+		}
 		if opts.VersionID != "" {
 			return objInfo, VersionNotFound{
 				Bucket:    bucket,
@@ -2089,6 +2092,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 					isErr = true
 				}
 				if isErr {
+					if !opts.Transition.ExpireRestored {
+						return goi, errLifecycleNotApplicable
+					}
 					if goi.VersionID != "" {
 						return goi, VersionNotFound{
 							Bucket:    bucket,
@@ -2164,6 +2170,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 				isErr = true
 			}
 			if isErr {
+				if !opts.Transition.ExpireRestored {
+					return goi, errLifecycleNotApplicable
+				}
 				if goi.VersionID != "" {
 					return goi, VersionNotFound{
 						Bucket:    bucket,
