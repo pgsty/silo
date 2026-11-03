@@ -214,3 +214,11 @@ otherwise it generates a random value.
     {{- include "silo.getValueFromSecret" (dict "Namespace" .Release.Namespace "Name" (include "silo.fullname" .) "Length" 40 "Key" "rootPassword") }}
   {{- end }}
 {{- end -}}
+
+{{/* Internal API hostname, optionally qualified for certificate validation. */}}
+{{- define "silo.serviceHost" -}}
+{{- include "silo.fullname" . -}}
+{{- if .Values.useFQDN -}}
+{{- printf ".%s.svc.%s" .Release.Namespace (trimSuffix "." .Values.clusterDomain) -}}
+{{- end -}}
+{{- end -}}

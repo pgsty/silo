@@ -1,3 +1,4 @@
+{{- if .Values.consoleService.enabled }}
 {{ $scheme := .Values.tls.enabled | ternary "https" "http" }}
 apiVersion: v1
 kind: Service
@@ -43,3 +44,4 @@ spec:
   selector:
     app: {{ template "silo.name" . }}
     release: {{ .Release.Name }}
+{{- end }}

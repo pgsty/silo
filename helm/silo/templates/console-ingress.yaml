@@ -1,3 +1,6 @@
+{{- if and .Values.consoleIngress.enabled (not .Values.consoleService.enabled) }}
+{{- fail "consoleIngress.enabled requires consoleService.enabled" }}
+{{- end }}
 {{- if .Values.consoleIngress.enabled -}}
 {{- $fullName := printf "%s-console" (include "silo.fullname" .) -}}
 {{- $servicePort := .Values.consoleService.port -}}

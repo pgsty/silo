@@ -119,6 +119,21 @@ helm upgrade --install silo ./helm/silo \
 
 Additional trusted CAs can be supplied through `trustedCertsSecret`.
 
+Set `useFQDN: true` to use the existing `clusterDomain` in peer and provisioning
+hostnames. Certificates must cover `<fullname>.<namespace>.svc.<clusterDomain>`
+and the distributed peers `<fullname>-<ordinal>.<fullname>-svc.<namespace>.svc.<clusterDomain>`.
+Changing peer addresses requires coordinated restarts. Short names remain the
+default for compatibility. Provisioning scripts retain their existing TLS behavior.
+
+`startupProbe`, `readinessProbe`, and `livenessProbe` accept complete Kubernetes
+probe specifications; empty maps omit them. For HTTP probes, use port `http`
+and scheme `HTTP`, or port `https` and scheme `HTTPS` when TLS is enabled.
+`terminationGracePeriodSeconds` sets the server Pod shutdown grace period.
+
+Set `consoleService.enabled: false` to omit the Console Service (also disable
+`consoleIngress`). Set `postJob.ttlSecondsAfterFinished` for Job cleanup. Both
+timeout settings accept zero; null preserves the Kubernetes default.
+
 ## Existing Secrets and post-install resources
 
 Set `existingSecret` to a Secret containing `rootUser` and `rootPassword`.
