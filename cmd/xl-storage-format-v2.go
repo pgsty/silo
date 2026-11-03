@@ -1498,6 +1498,11 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		}
 		switch {
 		case fi.ExpireRestored:
+			// Only a completed transition has a remote copy. Trust the selected
+			// stored version, not the transition status supplied by the caller.
+			if string(ver.ObjectV2.MetaSys[metaTierStatus]) != lifecycle.TransitionComplete {
+				return "", nil
+			}
 			ver.ObjectV2.RemoveRestoreHdrs()
 			err = x.setIdx(i, *ver)
 		case fi.TransitionStatus == lifecycle.TransitionComplete:

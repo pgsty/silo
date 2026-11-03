@@ -270,6 +270,7 @@ func TestExpireRestoredCopy(t *testing.T) {
 		{name: "suspended", versioning: versioning.Suspended, versions: []version{{label: "v1", null: true}, {label: "v2", restored: true}}},
 		{name: "suspended-no-null", versioning: versioning.Suspended, versions: []version{{label: "v1"}, {label: "v2", restored: true}}},
 		{name: "suspended-null", versioning: versioning.Suspended, versions: []version{{label: "v1"}, {label: "v2", null: true, restored: true}}},
+		{name: "suspended-null-noncurrent", versioning: versioning.Suspended, versions: []version{{label: "v1", null: true, restored: true}, {label: "v2"}}},
 		{name: "unversioned", versions: []version{{label: "v1", null: true, restored: true}}},
 	}
 
@@ -334,6 +335,7 @@ func TestExpireRestoredCopy(t *testing.T) {
 				t.Fatal(err)
 			}
 			z := obj.(*erasureServerPools)
+			t.Cleanup(func() { z.Shutdown(context.Background()) })
 			// After initObjectLayer, which sets up a new tier config.
 			tier := &restoreTestTier{tierExpiryTestBackend: &tierExpiryTestBackend{objects: map[string][]byte{}}}
 			globalTierConfigMgr = NewTierConfigMgr()
