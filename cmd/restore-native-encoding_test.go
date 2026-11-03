@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +103,10 @@ func TestNativeRestoreEncodedObjects(t *testing.T) {
 					if beforeGet.Code != http.StatusOK || !bytes.Equal(beforeGet.Body.Bytes(), want) {
 						t.Fatalf("fixture GET: %d bytes=%d want=%d", beforeGet.Code, beforeGet.Body.Len(), len(want))
 					}
+					beforeETags := beforeGet.Header()[xhttp.ETag]
+					if len(beforeETags) != 1 || beforeETags[0] == "" {
+						t.Fatal("fixture GET must expose a nonempty ETag")
+					}
 					beforeRaw := nativeRestoreSnapshot(t, r)
 					topts := r.opts(before.VersionID)
 					topts.MTime = before.ModTime
@@ -176,7 +181,8 @@ func TestNativeRestoreEncodedObjects(t *testing.T) {
 					if got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), want) {
 						t.Errorf("restored GET: %d bytes=%d want=%d", got.Code, got.Body.Len(), len(want))
 					}
-					if got.Header().Get(xhttp.ETag) != beforeGet.Header().Get(xhttp.ETag) {
+					afterETags := got.Header()[xhttp.ETag]
+					if len(afterETags) != 1 || afterETags[0] == "" || afterETags[0] != beforeETags[0] {
 						t.Error("restore changed client ETag")
 					}
 					for i, number := range partNumbers {
@@ -191,5 +197,52 @@ func TestNativeRestoreEncodedObjects(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// XL metadata predating compression has no ActualSize. Conversion and healing
+// preserve those zero values; a plain multipart restore must derive the size.
+func TestNativeRestoreLegacyPartSizes(t *testing.T) {
+	r := newRestoreSafetyTest(t, 1, "")
+	oi, body := nativeRestoreSeed(t, r, 0, true, true)
+	for _, disk := range r.z.serverPools[0].getHashedSet(r.object).getDisks() {
+		fi, err := disk.ReadVersion(t.Context(), r.bucket, r.bucket, r.object, oi.VersionID, ReadOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range fi.Parts {
+			fi.Parts[i].ActualSize = 0
+		}
+		delete(fi.Metadata, ReservedMetadataPrefix+"actual-size")
+		if err := disk.WriteMetadata(t.Context(), "", r.bucket, r.object, fi); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, r.opts(oi.VersionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range before.Parts {
+		if part.ActualSize != 0 {
+			t.Fatal("legacy fixture was normalized")
+		}
+	}
+	_, got, err := r.read(oi.VersionID)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("legacy fixture read: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if err := r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID)); err != nil {
+		t.Fatal(err)
+	}
+	tier := globalTierConfigMgr.drivercache["WARM"].(*restoreTestTier)
+	reads := tier.gets.Load()
+	_, got, err = r.read(oi.VersionID)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("legacy restored read: %v", err)
+	}
+	if tier.gets.Load() != reads {
+		t.Error("legacy restored read used the remote tier")
 	}
 }

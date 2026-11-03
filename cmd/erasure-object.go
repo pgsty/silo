@@ -2728,8 +2728,14 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 
 	// rehydrate the parts back on disk as per the original xl.meta prior to transition
 	for _, partInfo := range oi.Parts {
-		// Stored and logical lengths differ for compressed/encrypted data.
-		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.ActualSize)
+		// Old uncompressed parts may not record ActualSize. Encrypted parts
+		// derive it from the written ciphertext in PutObjectPart; compressed
+		// parts need their recorded logical length, including valid zero sizes.
+		actualSize := partInfo.Size
+		if oi.IsCompressed() {
+			actualSize = partInfo.ActualSize
+		}
+		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", actualSize)
 		if err != nil {
 			return setRestoreHeaderFn(oi, err)
 		}
