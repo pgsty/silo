@@ -723,16 +723,19 @@ func TestMultipartCompletionLockAlias(t *testing.T) {
 					ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 					_, err := r.z.CompleteMultipartUpload(ctx, bucket, r.object, id, nil, ObjectOptions{})
 					cancel()
-					if id != "" {
+					switch {
+					case id != "":
 						if !errors.As(err, &MalformedUploadID{}) {
 							t.Errorf("malformed upload: %v", err)
 						}
-					} else if missingBucket {
+					case missingBucket:
 						if !isErrBucketNotFound(err) {
 							t.Errorf("missing bucket: %v", err)
 						}
-					} else if !errors.As(err, &InvalidUploadID{}) {
-						t.Errorf("invalid upload: %v", err)
+					default:
+						if !errors.As(err, &InvalidUploadID{}) {
+							t.Errorf("invalid upload: %v", err)
+						}
 					}
 				}
 			})
