@@ -2687,14 +2687,23 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
 	ropts.NoLock = opts.NoLock
-	if len(oi.Parts) == 1 {
+	// Rehydration copies encoded bytes without changing their content identity.
+	ropts.PreserveETag = oi.ETag
+	// Even a one-part multipart upload must retain its original part number:
+	// encrypted multipart data uses that number to derive its decryption key.
+	if len(oi.Parts) == 1 && !oi.isMultipart() {
+		actualSize, err := oi.GetActualSize()
+		if err != nil {
+			return setRestoreHeaderFn(oi, err)
+		}
+		ropts.IndexCB = func() []byte { return oi.Parts[0].Index }
 		var rs *HTTPRangeSpec
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
 		if err != nil {
 			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
 		}
 		defer gr.Close()
-		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", gr.ObjInfo.Size)
+		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", actualSize)
 		if err != nil {
 			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
 		}
@@ -2719,11 +2728,14 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 
 	// rehydrate the parts back on disk as per the original xl.meta prior to transition
 	for _, partInfo := range oi.Parts {
-		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.Size)
+		// Stored and logical lengths differ for compressed/encrypted data.
+		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.ActualSize)
 		if err != nil {
 			return setRestoreHeaderFn(oi, err)
 		}
-		pInfo, err := er.PutObjectPart(ctx, bucket, object, res.UploadID, partInfo.Number, NewPutObjReader(hr), ObjectOptions{})
+		pInfo, err := er.PutObjectPart(ctx, bucket, object, res.UploadID, partInfo.Number, NewPutObjReader(hr), ObjectOptions{
+			IndexCB: func() []byte { return partInfo.Index },
+		})
 		if err != nil {
 			return setRestoreHeaderFn(oi, err)
 		}
