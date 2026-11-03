@@ -156,7 +156,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		if dstOpts.replicaObjectInfo != nil {
 			getObjectInfo = dstOpts.replicaObjectInfo
 		}
-		if err := checkObjectLockedForOverwrite(ctx, dstBucket, dstObject, getObjectInfo); err != nil {
+		if err := checkObjectLockedForOverwrite(ctx, dstBucket, dstObject, getObjectInfo, dstOpts.Transition); err != nil {
 			return oi, toObjectErr(err, dstBucket, dstObject)
 		}
 	}
@@ -1673,7 +1673,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		if opts.replicaObjectInfo != nil {
 			getObjectInfo = opts.replicaObjectInfo
 		}
-		if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
+		if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo, opts.Transition); err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 	}
@@ -2655,9 +2655,10 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 		VersionID:  oi.VersionID,
 		Transition: opts.Transition,
 	}, ObjectOptions{
-		VersionID: oi.VersionID,
-		MTime:     oi.ModTime,
-		NoLock:    opts.NoLock,
+		VersionID:  oi.VersionID,
+		MTime:      oi.ModTime,
+		NoLock:     opts.NoLock,
+		Transition: opts.Transition,
 	}); err != nil {
 		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
 		return err
@@ -2699,6 +2700,7 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
 	ropts.NoLock = opts.NoLock
+	ropts.Transition = opts.Transition
 	// Rehydration copies encoded bytes without changing their content identity.
 	ropts.PreserveETag = oi.ETag
 	// Even a one-part multipart upload must retain its original part number:

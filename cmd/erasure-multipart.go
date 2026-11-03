@@ -1694,7 +1694,7 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			getObjectInfo = opts.replicaObjectInfo
 		}
 		if fi.VersionID == "" || fi.VersionID == nullVersionID {
-			if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
+			if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo, opts.Transition); err != nil {
 				return oi, toObjectErr(err, bucket, object)
 			}
 		} else {
@@ -1702,6 +1702,7 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 				VersionID:        fi.VersionID,
 				Versioned:        opts.Versioned,
 				VersionSuspended: opts.VersionSuspended,
+				Transition:       opts.Transition,
 				NoLock:           true,
 			})
 			switch {

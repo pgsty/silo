@@ -57,7 +57,7 @@ func TestObjectLockOverwriteConfigUnavailable(t *testing.T) {
 	err := checkObjectLockedForOverwrite(t.Context(), "lock-config-unavailable", "object", func(context.Context, string, string, ObjectOptions) (ObjectInfo, error) {
 		t.Fatal("object must not be read without a bucket configuration")
 		return ObjectInfo{}, nil
-	})
+	}, TransitionOptions{})
 	if !errors.Is(err, errServerNotInitialized) {
 		t.Fatalf("unavailable lock configuration must fail closed, got %v", err)
 	}

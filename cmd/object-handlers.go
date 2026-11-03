@@ -3951,6 +3951,8 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		return
 	}
 
+	// Preserve a failed restore read even before the request body is parsed.
+	opts.Transition.RestoreRequest = &RestoreObjectRequest{}
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -3976,6 +3978,7 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		writeErrorResponse(ctx, w, apiErr, r.URL)
 		return
 	}
+	opts.Transition.RestoreRequest = rreq
 	statusCode := http.StatusOK
 	alreadyRestored := false
 	if err == nil {
@@ -4004,9 +4007,11 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		}
 		objInfo.UserDefined = metadata
 		if _, err := objectAPI.CopyObject(GlobalContext, bucket, object, bucket, object, objInfo, ObjectOptions{
-			VersionID: objInfo.VersionID,
+			VersionID:  objInfo.VersionID,
+			Transition: opts.Transition,
 		}, ObjectOptions{
 			VersionID:   objInfo.VersionID,
+			Transition:  opts.Transition,
 			MTime:       objInfo.ModTime,
 			MetadataChg: true,
 		}); err != nil {

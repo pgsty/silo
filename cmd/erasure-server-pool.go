@@ -1630,8 +1630,12 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		// Restore status updates address an existing version. Keep ordinary
 		// copy/write allocation unchanged, including its latest-version lookup.
 		poolIdx, err = z.getPoolIdxExistingWithOpts(ctx, dstBucket, dstObject, ObjectOptions{
-			VersionID: dstOpts.VersionID, MetadataChg: true, NoLock: true,
-			SkipDecommissioned: true, SkipRebalancing: true,
+			VersionID:          dstOpts.VersionID,
+			MetadataChg:        true,
+			NoLock:             true,
+			Transition:         dstOpts.Transition,
+			SkipDecommissioned: true,
+			SkipRebalancing:    true,
 		})
 	} else {
 		poolIdx, err = z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
