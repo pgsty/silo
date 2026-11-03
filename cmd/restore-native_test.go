@@ -28,9 +28,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -737,6 +739,196 @@ func TestMultipartCompletionLockAlias(t *testing.T) {
 							t.Errorf("invalid upload: %v", err)
 						}
 					}
+				}
+			})
+		}
+	}
+}
+
+type nativeRestoreReadHook struct {
+	io.ReadCloser
+	remaining int
+	mutate    func()
+}
+
+func (r *nativeRestoreReadHook) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.remaining -= n
+	if r.remaining == 0 && r.mutate != nil {
+		f := r.mutate
+		r.mutate = nil
+		f()
+	}
+	return n, err
+}
+
+type nativeRestoreReadHookTier struct {
+	WarmBackend
+	size   int
+	mutate func()
+}
+
+func (b nativeRestoreReadHookTier) Get(ctx context.Context, object string, version remoteVersionID, opts WarmBackendGetOpts) (io.ReadCloser, error) {
+	rd, err := b.WarmBackend.Get(ctx, object, version, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &nativeRestoreReadHook{rd, b.size, b.mutate}, nil
+}
+
+// Remove only the addressed entry from a majority of disks, keeping shards
+// and the healthy newer version. Return errors to the synchronous caller.
+func nativeRestoreLoseMetadata(ctx context.Context, disks []StorageAPI, bucket, object, id string) error {
+	for _, disk := range disks[1:] {
+		raw, err := disk.ReadXL(ctx, bucket, object, true)
+		if err != nil {
+			return err
+		}
+		var meta xlMetaV2
+		if err := meta.Load(raw.Buf); err != nil {
+			return err
+		}
+		del := FileInfo{VersionID: id}
+		del.SetSkipTierFreeVersion()
+		if _, err := meta.DeleteVersion(del); err != nil {
+			return err
+		}
+		data, err := meta.AppendTo(nil)
+		if err != nil {
+			return err
+		}
+		if err := disk.WriteAll(ctx, bucket, filepath.Join(object, xlStorageFormatFile), data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A target can lose metadata quorum after the restore snapshot. Nested
+// completion/retention reads must not turn rehydration into remote GC.
+func TestNativeRestoreCompletionReadSafety(t *testing.T) {
+	for _, null := range []bool{false, true} {
+		for _, multipart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("null=%v/multipart=%v", null, multipart), func(t *testing.T) {
+				r := newRestoreSafetyTest(t, 1, versioning.Enabled)
+				oi, body := nativeRestoreSeed(t, r, 0, null, multipart)
+				latest := r.put("newer", false, false)
+				enableBucketObjectLock(t, r.bucket)
+				disks := r.z.serverPools[0].getHashedSet(r.object).getDisks()
+				var mutationErr error
+				mutated := false
+				mutate := func() {
+					mutated = true
+					mutationErr = nativeRestoreLoseMetadata(t.Context(), disks, r.bucket, r.object, oi.VersionID)
+				}
+				tier := globalTierConfigMgr.drivercache["WARM"].(*restoreTestTier)
+				globalTierConfigMgr.drivercache["WARM"] = nativeRestoreReadHookTier{tier, len(body), mutate}
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				defer cancel()
+				err := r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
+				if ctx.Err() != nil {
+					t.Fatalf("restore timed out: %v", err)
+				}
+				if !mutated || mutationErr != nil {
+					t.Fatalf("invalid injection: mutated=%v err=%v", mutated, mutationErr)
+				}
+				t.Logf("restore after addressed metadata lost: %v", err)
+				for i, disk := range disks {
+					raw, e := disk.ReadXL(t.Context(), r.bucket, r.object, true)
+					if e != nil {
+						t.Fatal(e)
+					}
+					versions, e := getFileInfoVersions(raw.Buf, r.bucket, r.object, false)
+					if e != nil {
+						t.Fatal(e)
+					}
+					if len(versions.FreeVersions) > 0 {
+						t.Errorf("disk %d restore manufactured %d remote GC entries", i, len(versions.FreeVersions))
+					}
+				}
+				if err == nil {
+					reads := tier.gets.Load()
+					_, got, readErr := r.read(oi.VersionID)
+					if readErr != nil || !bytes.Equal(got, body) || tier.gets.Load() != reads {
+						t.Errorf("successful restore did not rehydrate its own content: %v", readErr)
+					}
+				}
+				_, got, readErr := r.read(latest.VersionID)
+				if readErr != nil || !bytes.Equal(got, r.bodies["newer"]) {
+					t.Errorf("restore changed the other version: %v", readErr)
+				}
+			})
+		}
+	}
+}
+
+type nativeRestoreStatusHook struct {
+	ObjectLayer
+	beforeCopy       func()
+	copyCalled       bool
+	backgroundCalled atomic.Bool
+}
+
+func (h *nativeRestoreStatusHook) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, info ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
+	h.copyCalled = true
+	h.beforeCopy()
+	return h.ObjectLayer.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, info, srcOpts, dstOpts)
+}
+
+func (h *nativeRestoreStatusHook) RestoreTransitionedObject(context.Context, string, string, ObjectOptions) error {
+	h.backgroundCalled.Store(true)
+	return errors.New("unexpected background restore after failed status update")
+}
+
+func TestNativeRestorePOSTReadSafety(t *testing.T) {
+	for _, pools := range []int{1, 2} {
+		for _, stage := range []string{"initial", "status-copy"} {
+			t.Run(fmt.Sprintf("pools=%d/%s", pools, stage), func(t *testing.T) {
+				r := newRestoreSafetyTest(t, pools, versioning.Enabled)
+				initConfigSubsystem(t.Context(), r.z)
+				oi, _ := nativeRestoreSeed(t, r, 0, false, false)
+				metaOpts := r.opts(oi.VersionID)
+				metaOpts.MTime = oi.ModTime
+				metaOpts.EvalMetadataFn = func(o *ObjectInfo, _ error) (ReplicateDecision, error) {
+					o.UserDefined[xhttp.AmzRestore] = ""
+					return ReplicateDecision{}, nil
+				}
+				if _, err := r.z.PutObjectMetadata(t.Context(), r.bucket, r.object, metaOpts); err != nil {
+					t.Fatal(err)
+				}
+				r.put("newer", false, false)
+				disks := r.z.serverPools[0].getHashedSet(r.object).getDisks()
+				var before [][]byte
+				mutate := func() {
+					if err := nativeRestoreLoseMetadata(t.Context(), disks, r.bucket, r.object, oi.VersionID); err != nil {
+						t.Fatal(err)
+					}
+					before = restoreBoundarySnapshot(t, r)
+				}
+				hook := &nativeRestoreStatusHook{ObjectLayer: r.z, beforeCopy: mutate}
+				if stage == "initial" {
+					mutate()
+				}
+				api := objectAPIHandlers{ObjectAPI: func() ObjectLayer { return hook }}
+				body := []byte(`<RestoreRequest xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Days>1</Days></RestoreRequest>`)
+				req, err := newTestSignedRequestV4(http.MethodPost, "/"+r.bucket+"/"+r.object+"?restore&versionId="+url.QueryEscape(oi.VersionID), int64(len(body)), bytes.NewReader(body), globalActiveCred.AccessKey, globalActiveCred.SecretKey, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := req.ParseForm(); err != nil {
+					t.Fatal(err)
+				}
+				req = mux.SetURLVars(req, map[string]string{"bucket": r.bucket, "object": r.object})
+				rec := httptest.NewRecorder()
+				api.PostRestoreObjectHandler(rec, req)
+				if rec.Code < 400 {
+					t.Fatalf("POST acknowledged failed read: %d %s", rec.Code, rec.Body.String())
+				}
+				if hook.copyCalled != (stage == "status-copy") || hook.backgroundCalled.Load() {
+					t.Fatal("request followed the wrong failure path")
+				}
+				if !reflect.DeepEqual(before, restoreBoundarySnapshot(t, r)) {
+					t.Error("failed POST read changed stored metadata or free versions")
 				}
 			})
 		}
