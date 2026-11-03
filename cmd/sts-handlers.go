@@ -101,7 +101,10 @@ const (
 )
 
 var (
-	errLDAPAuthenticationFailed   = errors.New("LDAP authentication failed")
+	// One message for unknown users and wrong passwords. The console tries
+	// the built-in login (root, access keys) only when the LDAP error says
+	// "not found", so the message keeps those words.
+	errLDAPAuthenticationFailed   = errors.New("LDAP authentication failed: user not found or invalid password")
 	globalSTSLDAPLoginRateLimiter = newSTSLDAPLoginRateLimiter(time.Minute/time.Duration(stsLDAPLoginBurst), stsLDAPLoginBurst, stsLDAPLoginEntryTTL)
 )
 

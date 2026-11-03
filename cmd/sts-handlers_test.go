@@ -2048,6 +2048,17 @@ func TestLDAPBindErrorToSTS(t *testing.T) {
 	}
 }
 
+// The console falls back from LDAP to the built-in identity provider (root,
+// access keys) only when the LDAP STS error says "not found"
+// (pgsty/silo-console api/client.go, NewConsoleCredentials). The uniform
+// failure for unknown users and wrong passwords must keep those words.
+func TestLDAPAuthFailureKeepsConsoleFallback(t *testing.T) {
+	_, err := ldapBindErrorToSTS(matchingAuthError{})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "not found") {
+		t.Fatalf("the console would not try the built-in login after %q", err)
+	}
+}
+
 func TestSTSLDAPLoginRateLimiterCleanup(t *testing.T) {
 	set := newSTSLDAPLoginKeyLimiterSet(time.Hour, 1, time.Minute)
 	start := time.Unix(0, 0)
