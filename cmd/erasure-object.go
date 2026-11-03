@@ -2644,6 +2644,8 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 		VersionID: oi.VersionID,
 	}, ObjectOptions{
 		VersionID: oi.VersionID,
+		MTime:     oi.ModTime,
+		NoLock:    opts.NoLock,
 	}); err != nil {
 		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
 		return err
@@ -2654,6 +2656,19 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 // restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
 // as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
 func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
+	if !opts.NoLock {
+		// Single-pool and direct callers must protect the metadata snapshot
+		// through download, rehydration and failure cleanup, just like pools.
+		lk := er.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
+		if err != nil {
+			return err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+		opts.NoLock = true
+	}
+
 	setRestoreHeaderFn := func(oi ObjectInfo, rerr error) error {
 		if rerr == nil {
 			return nil // nothing to do; restore object was successful
@@ -2665,11 +2680,13 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	// get the file info on disk for transitioned object
 	actualfi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts, false)
 	if err != nil {
-		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+		// No version was read, so there is no restore metadata to update.
+		return toObjectErr(err, bucket, object)
 	}
 
 	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
+	ropts.NoLock = opts.NoLock
 	if len(oi.Parts) == 1 {
 		var rs *HTTPRangeSpec
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
@@ -2719,7 +2736,11 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		})
 	}
 	_, err = er.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{
-		MTime: oi.ModTime,
+		MTime:            oi.ModTime,
+		NoLock:           opts.NoLock,
+		Versioned:        opts.Versioned,
+		VersionSuspended: opts.VersionSuspended,
+		Transition:       opts.Transition,
 	})
 	return setRestoreHeaderFn(oi, err)
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/klauspost/readahead"
 	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
@@ -1697,13 +1698,18 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 				return oi, toObjectErr(err, bucket, object)
 			}
 		} else {
-			_, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
+			current, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
 				VersionID:        fi.VersionID,
 				Versioned:        opts.Versioned,
 				VersionSuspended: opts.VersionSuspended,
 				NoLock:           true,
 			})
 			switch {
+			case gerr == nil && opts.Transition.RestoreRequest != nil &&
+				current.TransitionedObject.Status == lifecycle.TransitionComplete &&
+				current.ETag == fi.Metadata["etag"] && current.Size == fi.Size && current.ModTime.Equal(fi.ModTime):
+				// The internal restore path rehydrates this same tiered version.
+				// Ordinary multipart completion must still reject a version overwrite.
 			case gerr == nil, errors.As(gerr, &MethodNotAllowed{}):
 				return oi, toObjectErr(errAuthentication, bucket, object)
 			case isErrVersionNotFound(gerr) || isErrObjectNotFound(gerr):

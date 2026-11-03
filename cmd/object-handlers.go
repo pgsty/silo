@@ -4006,8 +4006,9 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		if _, err := objectAPI.CopyObject(GlobalContext, bucket, object, bucket, object, objInfo, ObjectOptions{
 			VersionID: objInfo.VersionID,
 		}, ObjectOptions{
-			VersionID: objInfo.VersionID,
-			MTime:     objInfo.ModTime,
+			VersionID:   objInfo.VersionID,
+			MTime:       objInfo.ModTime,
+			MetadataChg: true,
 		}); err != nil {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidObjectState), r.URL)
 			return
@@ -4080,14 +4081,16 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 			rreq.SelectParameters.Close()
 			return
 		}
-		opts := ObjectOptions{
+		restoreOpts := ObjectOptions{
 			Transition: TransitionOptions{
 				RestoreRequest: rreq,
 				RestoreExpiry:  restoreExpiry,
 			},
-			VersionID: objInfo.VersionID,
+			VersionID:        objInfo.VersionID,
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
 		}
-		if err := objectAPI.RestoreTransitionedObject(rctx, bucket, object, opts); err != nil {
+		if err := objectAPI.RestoreTransitionedObject(rctx, bucket, object, restoreOpts); err != nil {
 			s3LogIf(ctx, fmt.Errorf("Unable to restore transitioned bucket/object %s/%s: %w", bucket, object, err))
 			return
 		}

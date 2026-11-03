@@ -1625,7 +1625,17 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		return oi, err
 	}
 
-	poolIdx, err := z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
+	var poolIdx int
+	if dstOpts.MetadataChg && cpSrcDstSame && srcInfo.metadataOnly && srcOpts.VersionID == dstOpts.VersionID {
+		// Restore status updates address an existing version. Keep ordinary
+		// copy/write allocation unchanged, including its latest-version lookup.
+		poolIdx, err = z.getPoolIdxExistingWithOpts(ctx, dstBucket, dstObject, ObjectOptions{
+			VersionID: dstOpts.VersionID, MetadataChg: true, NoLock: true,
+			SkipDecommissioned: true, SkipRebalancing: true,
+		})
+	} else {
+		poolIdx, err = z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
+	}
 	if err != nil {
 		return objInfo, err
 	}
@@ -2312,18 +2322,24 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		}
 	}()
 
-	if !z.SinglePool() {
-		if !opts.NoLock {
-			lk := z.NewNSLock(bucket, encodeDirObject(object))
-			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-			if err != nil {
-				return objInfo, err
-			}
-			ctx = lkctx.Context()
-			defer lk.Unlock(lkctx)
+	// Keep object -> upload lock ordering for single-pool completion too:
+	// native restore holds the object lock while publishing upload parts.
+	if !opts.NoLock {
+		lk := z.NewNSLock(bucket, encodeDirObject(object))
+		if z.SinglePool() {
+			// Preserve the set-local lock domain used by single-pool writes.
+			lk = z.serverPools[0].getHashedSet(object).NewNSLock(bucket, encodeDirObject(object))
 		}
-		opts.NoLock = true
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return objInfo, err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+	opts.NoLock = true
 
+	if !z.SinglePool() {
 		// A conditional completion must be evaluated against the logical
 		// latest object across pools, under the object write lock held for
 		// this operation. The pool hosting the upload may only hold a stale
@@ -3330,7 +3346,10 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 	// Avoid restoring object from a pool being decommissioned.
 	opts.SkipDecommissioned = true
 	opts.NoLock = true
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
+	// Restore an existing version, not the latest version's write location.
+	lookupOpts := opts
+	lookupOpts.MetadataChg = true
+	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, lookupOpts)
 	if err != nil {
 		return err
 	}
