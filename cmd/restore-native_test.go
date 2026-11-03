@@ -481,7 +481,7 @@ func (b *nativeRestoreBlockedTier) Get(ctx context.Context, object string, versi
 	return b.WarmBackend.Get(ctx, object, version, opts)
 }
 
-func nativeRestoreLockRequest(t *testing.T, ctx context.Context, r *restoreTest, id, kind string, body []byte) *httptest.ResponseRecorder {
+func nativeRestoreLockRequest(ctx context.Context, t *testing.T, r *restoreTest, id, kind string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	sum := md5.Sum(body)
 	req, err := newTestSignedRequestV4(http.MethodPut, "/"+r.bucket+"/"+r.object+"?"+kind+"&versionId="+url.QueryEscape(id), int64(len(body)), bytes.NewReader(body), globalActiveCred.AccessKey, globalActiveCred.SecretKey, map[string]string{xhttp.ContentMD5: base64.StdEncoding.EncodeToString(sum[:])})
@@ -518,7 +518,7 @@ func TestNativeRestoreSerializesObjectLock(t *testing.T) {
 					updated = retentionBody("COMPLIANCE", UTCNow().Add(48*time.Hour))
 					keys = []string{strings.ToLower(xhttp.AmzObjectLockMode), strings.ToLower(xhttp.AmzObjectLockRetainUntilDate), ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp}
 				}
-				if rec := nativeRestoreLockRequest(t, t.Context(), r, oi.VersionID, kind, initial); rec.Code != http.StatusOK {
+				if rec := nativeRestoreLockRequest(t.Context(), t, r, oi.VersionID, kind, initial); rec.Code != http.StatusOK {
 					t.Fatalf("initial protection: %d %s", rec.Code, rec.Body.String())
 				}
 				before, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, r.opts(oi.VersionID))
@@ -545,7 +545,7 @@ func TestNativeRestoreSerializesObjectLock(t *testing.T) {
 					t.Fatal("restore never started download")
 				}
 				updateCtx, updateCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-				rec := nativeRestoreLockRequest(t, updateCtx, r, oi.VersionID, kind, updated)
+				rec := nativeRestoreLockRequest(updateCtx, t, r, oi.VersionID, kind, updated)
 				updateCancel()
 				if rec.Code == http.StatusOK {
 					t.Error("Object Lock update committed during restore's metadata snapshot")
@@ -579,7 +579,7 @@ func TestNativeRestoreSerializesObjectLock(t *testing.T) {
 						t.Errorf("restore changed protection %s: %q -> %q", key, before.UserDefined[key], after.UserDefined[key])
 					}
 				}
-				if rec := nativeRestoreLockRequest(t, t.Context(), r, oi.VersionID, kind, updated); rec.Code != http.StatusOK {
+				if rec := nativeRestoreLockRequest(t.Context(), t, r, oi.VersionID, kind, updated); rec.Code != http.StatusOK {
 					t.Fatalf("protection update after restore: %d %s", rec.Code, rec.Body.String())
 				}
 				final, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, r.opts(oi.VersionID))
