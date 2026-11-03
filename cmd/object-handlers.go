@@ -492,9 +492,10 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 				return
 			}
 			event := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, objInfo)
+			expiryInfo, event := recheckReadExpiry(ctx, objectAPI, objInfo, event)
 			if event.Action.Delete() {
 				// apply whatever the expiry rule is.
-				applyExpiryRule(event, lcEventSrc_s3GetObject, objInfo)
+				applyExpiryRule(event, lcEventSrc_s3GetObject, expiryInfo)
 				if !event.Action.DeleteRestored() {
 					// If the ILM action is not on restored object return error.
 					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNoSuchKey), r.URL)
@@ -972,9 +973,10 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 				return
 			}
 			event := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, objInfo)
+			expiryInfo, event := recheckReadExpiry(ctx, objectAPI, objInfo, event)
 			if event.Action.Delete() {
 				// apply whatever the expiry rule is.
-				applyExpiryRule(event, lcEventSrc_s3HeadObject, objInfo)
+				applyExpiryRule(event, lcEventSrc_s3HeadObject, expiryInfo)
 				if !event.Action.DeleteRestored() {
 					// If the ILM action is not on restored object return error.
 					writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrNoSuchKey))
