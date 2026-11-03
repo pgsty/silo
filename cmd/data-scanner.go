@@ -1204,7 +1204,7 @@ func applyTransitionRule(event lifecycle.Event, src lcEventSrc, obj ObjectInfo) 
 func applyExpiryOnTransitionedObject(ctx context.Context, objLayer ObjectLayer, obj ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) (ok bool) {
 	timeILM := globalScannerMetrics.timeILM(lcEvent.Action)
 	if err := expireTransitionedObject(ctx, objLayer, &obj, lcEvent, src); err != nil {
-		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+		if errors.Is(err, errLifecycleNotApplicable) || isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			return false
 		}
 		ilmLogIf(ctx, fmt.Errorf("expireTransitionedObject(%s, %s): %w", obj.Bucket, obj.Name, err))
@@ -1271,7 +1271,7 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 
 	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, encodeDirObject(obj.Name), opts)
 	if err != nil {
-		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+		if errors.Is(err, errLifecycleNotApplicable) || isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			traceFn(ILMExpiry, nil, nil)
 			return false
 		}

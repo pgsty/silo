@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -118,7 +119,7 @@ func TestPoolsLifecycleTieredBatchReplication(t *testing.T) {
 			if result.errs[0] != nil {
 				t.Errorf("eligible delete: %v", result.errs[0])
 			}
-			if !isErrVersionNotFound(result.errs[1]) {
+			if !errors.Is(result.errs[1], errLifecycleNotApplicable) {
 				t.Errorf("retained version result: %v", result.errs[1])
 			}
 			if result.deleted[1].VersionPurgeStatus() != "" || result.deleted[1].ReplicationState.ReplicateDecisionStr != "" {
@@ -192,7 +193,11 @@ func TestPoolsLifecycleTieredBatchIdentity(t *testing.T) {
 			}
 			vc, _ := globalBucketVersioningSys.Get(s.bucket)
 			_, errs := s.z.DeleteObjects(t.Context(), s.bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: key, VersionID: vid}}}, ObjectOptions{PrefixEnabledFn: vc.PrefixEnabled, Expiration: ExpirationOptions{Expire: tc.expire}})
-			if errs[0] != nil {
+			if tc.expire && !tc.wantGone {
+				if !errors.Is(errs[0], errLifecycleNotApplicable) {
+					t.Fatalf("ineligible expiry: %v", errs[0])
+				}
+			} else if errs[0] != nil {
 				t.Fatalf("delete: %v", errs[0])
 			}
 			query := vid
