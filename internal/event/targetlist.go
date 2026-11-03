@@ -167,10 +167,17 @@ func (list *TargetList) Add(targets ...Target) error {
 	list.Lock()
 	defer list.Unlock()
 
+	seen := NewTargetIDSet()
 	for _, target := range targets {
 		if _, ok := list.targets[target.ID()]; ok {
 			return fmt.Errorf("target %v already exists", target.ID())
 		}
+		if _, ok := seen[target.ID()]; ok {
+			return fmt.Errorf("target %v already exists", target.ID())
+		}
+		seen[target.ID()] = struct{}{}
+	}
+	for _, target := range targets {
 		list.targets[target.ID()] = target
 	}
 
@@ -198,15 +205,20 @@ type TargetIDResult struct {
 // Remove - closes and removes targets by given target IDs.
 func (list *TargetList) Remove(targetIDSet TargetIDSet) {
 	list.Lock()
-	defer list.Unlock()
-
+	var removed []Target
 	for id := range targetIDSet {
 		target, ok := list.targets[id]
 		if ok {
-			target.Close()
 			delete(list.targets, id)
+			removed = append(removed, target)
 		}
 	}
+	list.Unlock()
+	var wg sync.WaitGroup
+	for _, target := range removed {
+		wg.Go(func() { target.Close() })
+	}
+	wg.Wait()
 }
 
 // Targets - list all targets
@@ -239,14 +251,6 @@ func (list *TargetList) List() []TargetID {
 	return keys
 }
 
-func (list *TargetList) get(id TargetID) (Target, bool) {
-	list.RLock()
-	defer list.RUnlock()
-
-	target, ok := list.targets[id]
-	return target, ok
-}
-
 // TargetMap - returns available targets.
 func (list *TargetList) TargetMap() map[TargetID]Target {
 	list.RLock()
@@ -269,18 +273,20 @@ func (list *TargetList) Send(event Event, targetIDset TargetIDSet, sync bool) {
 func (list *TargetList) sendSync(event Event, targetIDset TargetIDSet) {
 	var wg sync.WaitGroup
 	for id := range targetIDset {
-		target, ok := list.get(id)
-		if !ok {
-			continue
-		}
 		wg.Add(1)
-		go func(id TargetID, target Target) {
+		go func(id TargetID) {
+			defer wg.Done()
+			list.RLock()
+			target, ok := list.targets[id]
+			list.RUnlock()
+			if !ok {
+				return
+			}
 			list.currentSendCalls.Add(1)
 			list.incCurrentSendCalls(id)
 			list.incTotalEvents(id)
 			defer list.decCurrentSendCalls(id)
 			defer list.currentSendCalls.Add(-1)
-			defer wg.Done()
 
 			if err := target.Save(event); err != nil {
 				list.eventsErrorsTotal.Add(1)
@@ -289,7 +295,7 @@ func (list *TargetList) sendSync(event Event, targetIDset TargetIDSet) {
 				reqInfo.AppendTags("targetID", id.String())
 				logger.LogOnceIf(logger.SetReqInfo(context.Background(), reqInfo), logSubsys, err, id.String())
 			}
-		}(id, target)
+		}(id)
 	}
 	wg.Wait()
 	list.totalEvents.Add(1)
