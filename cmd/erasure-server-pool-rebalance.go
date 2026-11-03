@@ -826,6 +826,10 @@ func (z *erasureServerPools) saveRebalanceStats(ctx context.Context, poolIdx int
 	// if not found, we store the memory metadata back
 	// when rebalance status changed, will notify all nodes update status to memory, we can treat the memory metadata is the latest status
 	if errors.Is(err, errConfigNotFound) {
+		if z.rebalMeta == nil {
+			// No rebalance has run, e.g. a rebalance stop without one.
+			return errRebalanceNotStarted
+		}
 		r = z.rebalMeta
 	}
 

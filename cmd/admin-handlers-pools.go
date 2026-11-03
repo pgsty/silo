@@ -373,7 +373,9 @@ func (a adminAPIHandlers) RebalanceStop(w http.ResponseWriter, r *http.Request) 
 	// Cancel any ongoing rebalance operation
 	globalNotificationSys.StopRebalance(r.Context())
 	writeSuccessResponseHeadersOnly(w)
-	adminLogIf(ctx, pools.saveRebalanceStats(GlobalContext, 0, rebalSaveStoppedAt))
+	if err := pools.saveRebalanceStats(GlobalContext, 0, rebalSaveStoppedAt); !errors.Is(err, errRebalanceNotStarted) {
+		adminLogIf(ctx, err)
+	}
 	globalNotificationSys.LoadRebalanceMeta(ctx, false)
 }
 
