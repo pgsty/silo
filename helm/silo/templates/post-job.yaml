@@ -15,6 +15,9 @@ metadata:
       {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  {{- if ne .Values.postJob.ttlSecondsAfterFinished nil }}
+  ttlSecondsAfterFinished: {{ .Values.postJob.ttlSecondsAfterFinished }}
+  {{- end }}
   template:
     metadata:
       labels:
@@ -103,7 +106,7 @@ spec:
           {{- end }}
           env:
             - name: MINIO_ENDPOINT
-              value: {{ template "silo.fullname" . }}
+              value: {{ include "silo.serviceHost" . | quote }}
             - name: MINIO_PORT
               value: {{ .Values.service.port | quote }}
           volumeMounts:
@@ -137,7 +140,7 @@ spec:
           {{- end }}
           env:
             - name: MINIO_ENDPOINT
-              value: {{ template "silo.fullname" . }}
+              value: {{ include "silo.serviceHost" . | quote }}
             - name: MINIO_PORT
               value: {{ .Values.service.port | quote }}
           volumeMounts:
@@ -170,7 +173,7 @@ spec:
           {{- end }}
           env:
             - name: MINIO_ENDPOINT
-              value: {{ template "silo.fullname" . }}
+              value: {{ include "silo.serviceHost" . | quote }}
             - name: MINIO_PORT
               value: {{ .Values.service.port | quote }}
           volumeMounts:
@@ -203,7 +206,7 @@ spec:
           {{- end }}
           env:
             - name: MINIO_ENDPOINT
-              value: {{ template "silo.fullname" . }}
+              value: {{ include "silo.serviceHost" . | quote }}
             - name: MINIO_PORT
               value: {{ .Values.service.port | quote }}
           volumeMounts:
@@ -239,7 +242,7 @@ spec:
           {{- end }}
           env:
             - name: MINIO_ENDPOINT
-              value: {{ template "silo.fullname" . }}
+              value: {{ include "silo.serviceHost" . | quote }}
             - name: MINIO_PORT
               value: {{ .Values.service.port | quote }}
           volumeMounts:
