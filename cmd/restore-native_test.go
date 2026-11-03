@@ -707,3 +707,35 @@ func (r *nativeRestorePartGateReader) Read(p []byte) (int, error) {
 	}
 	return r.ReadCloser.Read(p)
 }
+
+// Invalid upload paths must retain the backend's normal error precedence,
+// rather than reacquiring the object lock as the upload lock.
+func TestMultipartCompletionLockAlias(t *testing.T) {
+	for _, pools := range []int{1, 2} {
+		for _, id := range []string{"", ".", "./"} {
+			t.Run(fmt.Sprintf("pools=%d/id=%q", pools, id), func(t *testing.T) {
+				r := newRestoreSafetyTest(t, pools, versioning.Enabled)
+				for _, missingBucket := range []bool{false, true} {
+					bucket := r.bucket
+					if missingBucket {
+						bucket = "missing-bucket"
+					}
+					ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+					_, err := r.z.CompleteMultipartUpload(ctx, bucket, r.object, id, nil, ObjectOptions{})
+					cancel()
+					if id != "" {
+						if !errors.As(err, &MalformedUploadID{}) {
+							t.Errorf("malformed upload: %v", err)
+						}
+					} else if missingBucket {
+						if !isErrBucketNotFound(err) {
+							t.Errorf("missing bucket: %v", err)
+						}
+					} else if !errors.As(err, &InvalidUploadID{}) {
+						t.Errorf("invalid upload: %v", err)
+					}
+				}
+			})
+		}
+	}
+}

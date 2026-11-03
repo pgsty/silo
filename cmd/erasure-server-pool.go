@@ -2391,13 +2391,17 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	// Hold write locks to verify uploaded parts, also disallows any
 	// parallel PutObjectPart() requests.
-	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
-	wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return objInfo, err
+	// An empty upload ID aliases the object lock already held above.
+	// Let the storage layer return its normal missing bucket/upload error.
+	if uploadID != "" {
+		uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+		wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return objInfo, err
+		}
+		ctx = wlkctx.Context()
+		defer uploadIDLock.Unlock(wlkctx)
 	}
-	ctx = wlkctx.Context()
-	defer uploadIDLock.Unlock(wlkctx)
 
 	if z.SinglePool() {
 		return z.serverPools[0].CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
