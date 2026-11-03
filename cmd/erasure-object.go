@@ -2151,7 +2151,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
-	if opts.Expiration.Expire {
+	if opts.Expiration.Expire && !opts.Expiration.CheckedAllPools {
 		if gerr == nil {
 			evt := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, goi)
 			var isErr bool

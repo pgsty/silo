@@ -79,10 +79,13 @@ func (z BucketOptions) Msgsize() (s int) {
 // MarshalMsg implements msgp.Marshaler
 func (z ExpirationOptions) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 1
+	// map header, size 2
 	// string "Expire"
-	o = append(o, 0x81, 0xa6, 0x45, 0x78, 0x70, 0x69, 0x72, 0x65)
+	o = append(o, 0x82, 0xa6, 0x45, 0x78, 0x70, 0x69, 0x72, 0x65)
 	o = msgp.AppendBool(o, z.Expire)
+	// string "CheckedAllPools"
+	o = append(o, 0xaf, 0x43, 0x68, 0x65, 0x63, 0x6b, 0x65, 0x64, 0x41, 0x6c, 0x6c, 0x50, 0x6f, 0x6f, 0x6c, 0x73)
+	o = msgp.AppendBool(o, z.CheckedAllPools)
 	return
 }
 
@@ -110,6 +113,12 @@ func (z *ExpirationOptions) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "Expire")
 				return
 			}
+		case "CheckedAllPools":
+			z.CheckedAllPools, bts, err = msgp.ReadBoolBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "CheckedAllPools")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -124,7 +133,7 @@ func (z *ExpirationOptions) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z ExpirationOptions) Msgsize() (s int) {
-	s = 1 + 7 + msgp.BoolSize
+	s = 1 + 7 + msgp.BoolSize + 16 + msgp.BoolSize
 	return
 }
 

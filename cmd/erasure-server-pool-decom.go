@@ -819,6 +819,10 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				// a noncurrent version and has to be moved like any other. The
 				// scanner applies the expiry once it lives in another pool.
 				return lifecycle.NoneAction
+			case evt.Action.Delete() && !z.migrationExpiryApplies(ctx, objInfo, evt):
+				// Another pool holds versions with which the rule does not
+				// apply. The version moves like any other.
+				return lifecycle.NoneAction
 			case evt.Action.Delete():
 				return evt.Action
 			default:
