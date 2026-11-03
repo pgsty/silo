@@ -251,6 +251,43 @@ func (z *erasureServerPools) expiryNeedsAllPools(opts ObjectOptions) bool {
 	return opts.DeletePrefix || opts.VersionID != "" || opts.Versioned || opts.VersionSuspended
 }
 
+// recheckReadExpiry only rechecks a local ordinary-delete candidate. The
+// global latest expiring does not authorize hiding a different version that
+// GET/HEAD has already read. On an incomplete or rejected recheck, keep that
+// successful read and do not queue an expiry. Leave response metadata intact.
+func recheckReadExpiry(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo, evt lifecycle.Event) (ObjectInfo, lifecycle.Event) {
+	z, ok := objectAPI.(*erasureServerPools)
+	if !ok || !evt.Action.Delete() || evt.Action.DeleteRestored() || !z.expiryNeedsAllPools(ObjectOptions{
+		Expiration:       ExpirationOptions{Expire: true},
+		VersionID:        oi.VersionID,
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		DeletePrefix:     evt.Action.DeleteAll(),
+	}) {
+		return oi, evt
+	}
+	versions, events, err := z.lifecycleEventsAllPools(ctx, oi.Bucket, encodeDirObject(oi.Name))
+	if err == nil {
+		versionID := oi.VersionID
+		if versionID == "" {
+			versionID = nullVersionID
+		}
+		for i, version := range versions {
+			id := version.VersionID
+			if id == "" {
+				id = nullVersionID
+			}
+			if id == versionID {
+				if events[i].Action.Delete() && !events[i].Action.DeleteRestored() {
+					return version, events[i]
+				}
+				break
+			}
+		}
+	}
+	return oi, lifecycle.Event{Action: lifecycle.NoneAction}
+}
+
 // migrationExpiryApplies reports whether the ILM expiry evt, which a
 // decommission or rebalance decided for oi on the versions of the pool it
 // walks, applies with the versions of the object in all pools too. Only then
