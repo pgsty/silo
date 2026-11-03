@@ -208,6 +208,9 @@ func (lc Lifecycle) HasActiveRules(prefix string) bool {
 		if rule.Expiration.DeleteMarker.val {
 			return true
 		}
+		if !rule.DelMarkerExpiration.Empty() {
+			return true
+		}
 		if !rule.Transition.IsDateNull() && rule.Transition.Date.Before(time.Now().UTC()) {
 			return true
 		}
