@@ -27,6 +27,10 @@ import (
 	"github.com/minio/minio/internal/bucket/lifecycle"
 )
 
+// An ordinary ILM rejection is not evidence that the version is absent. In
+// particular it must not acknowledge a pending replication purge.
+var errLifecycleNotApplicable = errors.New("lifecycle expiry no longer applies")
+
 // ILM decides on the versions of an object that one pool holds: the scanner
 // and the drive heal read the drives of one set, decommission and rebalance
 // walk one pool, and a GET or HEAD of a version reads the pool that holds it.
@@ -113,7 +117,7 @@ func (z *erasureServerPools) lifecycleEventsAllPools(ctx context.Context, bucket
 	lc, err := globalLifecycleSys.Get(bucket)
 	if err != nil {
 		if errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
-			return nil, nil, nil
+			return nil, nil, errLifecycleNotApplicable
 		}
 		return nil, nil, err
 	}
@@ -143,37 +147,45 @@ func (z *erasureServerPools) lifecycleEventsAllPools(ctx context.Context, bucket
 		}
 	}
 
-	var all []FileInfo
-	for _, versions := range poolVersions {
-		all = append(all, versions...)
+	vc, _ := globalBucketVersioningSys.Get(bucket)
+	versioned := vc != nil && vc.Versioned(decodeDirObject(object))
+	var all []PoolObjInfo
+	for pool, versions := range poolVersions {
+		for _, fi := range versions {
+			all = append(all, PoolObjInfo{Index: pool, ObjInfo: fi.ToObjectInfo(bucket, object, versioned)})
+		}
 	}
 	// Each pool lists its versions newest first. On equal times the lower
 	// pool comes first, as reads choose it.
-	sort.SliceStable(all, func(i, j int) bool { return all[i].ModTime.After(all[j].ModTime) })
-	seen := make(map[string]struct{}, len(all))
-	versions := all[:0]
-	for _, fi := range all {
-		if _, ok := seen[fi.VersionID]; ok {
+	sort.SliceStable(all, func(i, j int) bool { return all[i].ObjInfo.ModTime.After(all[j].ObjInfo.ModTime) })
+	seen := make(map[string]int, len(all))
+	var versions [][]PoolObjInfo
+	for _, copy := range all {
+		if i, ok := seen[copy.ObjInfo.VersionID]; ok {
+			versions[i] = append(versions[i], copy)
 			continue
 		}
-		seen[fi.VersionID] = struct{}{}
-		versions = append(versions, fi)
+		seen[copy.ObjInfo.VersionID] = len(versions)
+		versions = append(versions, []PoolObjInfo{copy})
 	}
 
-	vc, _ := globalBucketVersioningSys.Get(bucket)
-	versioned := vc != nil && vc.Versioned(decodeDirObject(object))
 	objInfos := make([]ObjectInfo, len(versions))
 	objOpts := make([]lifecycle.ObjectOpts, len(versions))
-	for i := range versions {
-		fi := versions[i]
-		fi.IsLatest = i == 0
-		fi.NumVersions = len(versions)
-		fi.SuccessorModTime = time.Time{}
-		if i > 0 {
-			fi.SuccessorModTime = versions[i-1].ModTime
+	for i, copies := range versions {
+		oi := copies[0].ObjInfo
+		if len(copies) > 1 {
+			// Count the version once, but retain independently ordered lock
+			// and tag revisions, including explicit removals, from every copy.
+			oi = mergedPoolObjectInfo(copies)
 		}
-		objInfos[i] = fi.ToObjectInfo(bucket, object, versioned)
-		objOpts[i] = objInfos[i].ToLifecycleOpts()
+		oi.IsLatest = i == 0
+		oi.NumVersions = len(versions)
+		oi.SuccessorModTime = time.Time{}
+		if i > 0 {
+			oi.SuccessorModTime = objInfos[i-1].ModTime
+		}
+		objInfos[i] = oi
+		objOpts[i] = oi.ToLifecycleOpts()
 	}
 	events, err := lifecycle.NewEvaluator(*lc).WithLockRetention(&lr).WithReplicationConfig(rcfg).Eval(objOpts)
 	if err != nil {
@@ -200,8 +212,7 @@ func (z *erasureServerPools) checkExpiryAllPools(ctx context.Context, bucket, ob
 }
 
 // expiryApplies returns nil when the ILM expiry that opts describe applies
-// to the versions, and otherwise the error a set returns for an expiry that
-// no longer applies:
+// to the versions. A missing version and a rejected expiry remain distinct:
 //   - an expiry of all versions (DeletePrefix) needs the latest version to
 //     expire with all versions;
 //   - a delete marker (no VersionID) hides the latest version, which has to
@@ -231,10 +242,13 @@ func (all lifecycleAllPools) expiryApplies(bucket, object string, opts ObjectOpt
 				if all.events[i].Action == lifecycle.DeleteVersionAction {
 					return nil
 				}
-				break
+				return errLifecycleNotApplicable
 			}
 		}
 		return VersionNotFound{Bucket: bucket, Object: name, VersionID: opts.VersionID}
+	}
+	if len(all.versions) > 0 {
+		return errLifecycleNotApplicable
 	}
 	return ObjectNotFound{Bucket: bucket, Object: name}
 }
