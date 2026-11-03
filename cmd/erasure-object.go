@@ -509,6 +509,11 @@ func joinErrs(errs []error) string {
 }
 
 func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrsByPart map[int][]int, opts ObjectOptions) (FileInfo, error) {
+	// Restore and restored-copy cleanup must preserve the version on read
+	// failure, including lookups and failure cleanup that reread metadata.
+	if opts.Transition.ExpireRestored || opts.Transition.RestoreRequest != nil {
+		return FileInfo{}, errErasureReadQuorum
+	}
 	m, ok := isObjectDangling(metaArr, errs, dataErrsByPart)
 	if !ok {
 		// We only come here if we cannot figure out if the object
@@ -2136,6 +2141,12 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	// A queued null restore may now address a replacement delete marker.
+	// Such errors carry ObjectInfo, but never authorize cache cleanup.
+	if opts.Transition.ExpireRestored && (gerr != nil || goi.DeleteMarker) {
+		return objInfo, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
+	}
+
 	if opts.EvalMetadataFn != nil {
 		dsc, err := opts.EvalMetadataFn(&goi, gerr)
 		if err != nil {
@@ -2641,7 +2652,8 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 	delete(oi.UserDefined, xhttp.AmzRestore)
 
 	if _, err := er.CopyObject(ctx, bucket, object, bucket, object, oi, ObjectOptions{
-		VersionID: oi.VersionID,
+		VersionID:  oi.VersionID,
+		Transition: opts.Transition,
 	}, ObjectOptions{
 		VersionID: oi.VersionID,
 		MTime:     oi.ModTime,
