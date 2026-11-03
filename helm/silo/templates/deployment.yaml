@@ -47,6 +47,9 @@ spec:
           {{- toYaml .Values.podAnnotations | trimSuffix "\n" | nindent 8 }}
         {{- end }}
     spec:
+      {{- if ne .Values.terminationGracePeriodSeconds nil }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
       {{- if .Values.priorityClassName }}
       priorityClassName: "{{ .Values.priorityClassName }}"
       {{- end }}
@@ -68,6 +71,15 @@ spec:
             - "/bin/sh"
             - "-ce"
             - "/usr/bin/docker-entrypoint.sh silo server {{ $bucketRoot }} -S {{ .Values.certsPath }} --address :{{ .Values.minioAPIPort }} --console-address :{{ .Values.minioConsolePort }} {{- template "silo.extraArgs" . }}"
+          {{- with .Values.startupProbe }}
+          startupProbe: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe: {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: silo-user
               mountPath: "/tmp/credentials"

@@ -27,7 +27,7 @@ spec:
           secret:
             name: {{ .Values.tls.certSecret }}
             key: {{ .Values.tls.publicCrt }}
-        serverName: {{ template "silo.fullname" . }}
+        serverName: {{ include "silo.serviceHost" . }}
     {{- else }}
     - port: http
       scheme: http
@@ -81,7 +81,7 @@ spec:
       secret:
         name: {{ .Values.tls.certSecret }}
         key: {{ .Values.tls.publicCrt }}
-    serverName: {{ template "silo.fullname" . }}
+    serverName: {{ include "silo.serviceHost" . }}
   {{- end }}
   prober:
     url: {{ template "silo.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.port }}
