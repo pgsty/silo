@@ -2114,7 +2114,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	tryDel := false
 	if gerr != nil && goi.Name == "" {
 		if _, ok := gerr.(InsufficientReadQuorum); ok {
-			if opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
+			// A restored-copy expiry needs fresh metadata to confirm its target
+			// and deadline; ordinary unversioned DELETE may still try a blind delete.
+			if opts.Transition.ExpireRestored || opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
 				// Add an MRF heal for next time.
 				er.addPartial(bucket, object, opts.VersionID)
 				return objInfo, InsufficientWriteQuorum{}

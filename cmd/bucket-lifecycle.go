@@ -611,8 +611,9 @@ func enqueueTransitionImmediate(obj ObjectInfo, src lcEventSrc) {
 func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) error {
 	traceFn := globalLifecycleSys.trace(*oi)
 	opts := ObjectOptions{
-		Versioned:  globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
-		Expiration: ExpirationOptions{Expire: true},
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		Expiration:       ExpirationOptions{Expire: true},
 	}
 	if lcEvent.Action.DeleteVersioned() {
 		opts.VersionID = oi.VersionID
@@ -622,6 +623,17 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		// delete locally restored copy of object or object version
 		// from the source, while leaving metadata behind. The data on
 		// transitioned tier lies untouched and still accessible
+		//
+		// The restored copy belongs to this version, also when it is the
+		// latest one (DeleteRestoredAction). Without its version ID the
+		// delete applies to the object: a versioned bucket gets a delete
+		// marker that hides it, a suspended one strips the null version.
+		// An empty version ID is the null version, as callers that read
+		// it without the versioning of the bucket leave it.
+		opts.VersionID = oi.VersionID
+		if opts.VersionID == "" {
+			opts.VersionID = nullVersionID
+		}
 		opts.Transition.ExpireRestored = true
 		_, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
 		if err == nil {
@@ -636,7 +648,6 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	// touching the remote tier. If the lifecycle configuration changed after
 	// the scanner queued this task, DeleteObject rejects the stale action while
 	// the remote object is still protected.
-	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name)
 	keepRemote := opts.VersionID == "" &&
 		(opts.Versioned || (opts.VersionSuspended && oi.VersionID != "" && oi.VersionID != nullVersionID))
 	if lcEvent.Action == lifecycle.DeleteAction || lcEvent.Action == lifecycle.DeleteVersionAction {
