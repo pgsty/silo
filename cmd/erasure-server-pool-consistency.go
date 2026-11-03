@@ -760,6 +760,10 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 		}
 		deleteOpts := opts
 		deleteOpts.VersionID, deleteOpts.NoLock = obj.VersionID, true
+		// DeleteObjects already checked ordinary ILM UUID/explicit null
+		// versions against all pools. Empty IDs and user deletes have no such
+		// authorization; restored-copy expiry uses the single-object path.
+		deleteOpts.Expiration.CheckedAllPools = opts.Expiration.Expire && obj.VersionID != ""
 		deleteOpts.DeleteReplication = obj.ReplicationState()
 		if opts.PrefixEnabledFn != nil {
 			deleteOpts.Versioned = opts.PrefixEnabledFn(obj.ObjectName)
