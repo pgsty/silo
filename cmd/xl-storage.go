@@ -1371,6 +1371,9 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 	}
 
 	if legacyJSON {
+		if fi.ExpireRestored {
+			return nil // Legacy objects cannot contain a completed transition.
+		}
 		// Delete the meta file, if there are no more versions the
 		// top level parent is automatically removed.
 		return s.deleteFile(volumeDir, pathJoin(volumeDir, path), true, false)
