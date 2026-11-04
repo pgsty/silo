@@ -262,7 +262,13 @@ func (o *ObjectOptions) SetEvalRetentionBypassFn(f EvalRetentionBypassFn) {
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
 	// Locking operations on object.
+	// NewNSLock locks names in one stable domain. It is for names that are
+	// not objects, such as bucket and IAM metadata locks.
 	NewNSLock(bucket string, objects ...string) RWLocker
+	// NewObjectNSLock locks one object in the lock domain of its writes.
+	NewObjectNSLock(bucket, object string) RWLocker
+	// lockObjects locks several objects together, see erasureServerPools.
+	lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error)
 
 	// Storage operations.
 	Shutdown(context.Context) error

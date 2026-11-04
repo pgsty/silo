@@ -1239,8 +1239,26 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		object = encodeDirObject(object)
 	}
 
-	// Serialize logical deletion with pooled writes and metadata updates.
-	lk := z.NewNSLock(bucket, object)
+	// Serialize logical deletion with the writes and metadata updates of the
+	// object: take the lock they take (see NewObjectNSLock). With one pool
+	// that is the object's own erasure set, which is where PutObject,
+	// multipart commit and the metadata updates lock, so a pool whose sets
+	// use different hosts still excludes them. With several pools it is the
+	// pools lock, as before. Exact-key deletes that use prefix deletion
+	// (DeletePrefixObject) are deletes of one object. A true prefix deletion
+	// keeps the pools lock on the prefix name, which never covered the
+	// objects below it.
+	//
+	// Nodes that still run a release before this routing lock single-pool
+	// deletes and copies in the first set. In a pool whose sets use different
+	// hosts they do not exclude the deletes and copies of updated nodes, nor
+	// their writes, so such a pool must not run mixed versions.
+	var lk RWLocker
+	if opts.DeletePrefix && !opts.DeletePrefixObject {
+		lk = z.NewNSLock(bucket, object)
+	} else {
+		lk = z.NewObjectNSLock(bucket, object)
+	}
 	lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -1322,10 +1340,10 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	// Evaluate the conditional (If-Match) precondition while the write lock
 	// acquired above is held, before the delete-marker short-circuit and before
-	// any version is removed, so the object cannot change between the check and
-	// the delete. This is scoped to a single erasure set (see the note at the
-	// lock above): only there do the delete lock and the write path share the
-	// same lock namespace, making the check-then-delete atomic.
+	// any version is removed. The object's writers take the same lock (see the
+	// note at the lock above), so the object cannot change between the check
+	// and the delete. Multi-pool conditional deletes return above, through
+	// deleteObjectReconciled, under the same pools lock.
 	if opts.CheckPrecondFn != nil {
 		// pinfo.ObjInfo is the current latest version. getPoolInfoExistingWithOpts
 		// intentionally strips VersionID, so for a version-scoped delete read the
@@ -1509,6 +1527,18 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 		objSets.Add(objects[i].ObjectName)
 	}
 
+	// A single pool locks each name in the set its writers lock it in, one
+	// set at a time. A single node keeps one lock table for all sets, so it
+	// keeps the one bulk lock below: its local lock takes the names one by
+	// one and holds the earlier names while it waits.
+	if z.SinglePool() && !z.serverPools[0].sharesLocalNSLock() {
+		z.deleteObjectsInSets(ctx, bucket, objects, opts, dobjects, derrs, globalOperationTimeout)
+		for i := range dobjects {
+			dobjects[i].ObjectName = decodeDirObject(dobjects[i].ObjectName)
+		}
+		return dobjects, derrs
+	}
+
 	// Acquire a bulk write lock across 'objects'
 	multiDeleteLock := z.NewNSLock(bucket, objSets.ToSlice()...)
 	lkctx, err := multiDeleteLock.GetLock(ctx, globalOperationTimeout)
@@ -1633,8 +1663,10 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
 
+	// A caller that also locks the source takes both with lockObjects, before
+	// it reads the source, and passes NoLock.
 	if !dstOpts.NoLock {
-		ns := z.NewNSLock(dstBucket, dstObject)
+		ns := z.NewObjectNSLock(dstBucket, dstObject)
 		lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return ObjectInfo{}, err
@@ -2231,7 +2263,7 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 		return MultipartInfo{}, err
 	}
 
-	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
 	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return MultipartInfo{}, err
@@ -2272,7 +2304,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 		return ListPartsInfo{}, err
 	}
 
-	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
 	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return ListPartsInfo{}, err
@@ -2323,7 +2355,7 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 		}
 	}(ctx)
 
-	lk := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	lk := z.uploadIDNSLock(bucket, object, uploadID)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return err
@@ -2363,12 +2395,10 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	// Keep object -> upload lock ordering for single-pool completion too:
 	// native restore holds the object lock while publishing upload parts.
+	// Both locks are in the object's lock domain, the set-local one of
+	// single-pool writes.
 	if !opts.NoLock {
-		lk := z.NewNSLock(bucket, encodeDirObject(object))
-		if z.SinglePool() {
-			// Preserve the set-local lock domain used by single-pool writes.
-			lk = z.serverPools[0].getHashedSet(object).NewNSLock(bucket, encodeDirObject(object))
-		}
+		lk := z.NewObjectNSLock(bucket, encodeDirObject(object))
 		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return objInfo, err
@@ -2433,7 +2463,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 	// An empty upload ID aliases the object lock already held above.
 	// Let the storage layer return its normal missing bucket/upload error.
 	if uploadID != "" {
-		uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+		uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
 		wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return objInfo, err

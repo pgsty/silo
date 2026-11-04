@@ -265,9 +265,12 @@ func (z *erasureServerPools) listPathShortcutEOF(ctx context.Context, bucket str
 }
 
 // listingRLock covers the lock domains used by normal same-key mutations.
-// Multi-pool writes use the pools lock. In a single pool, DELETE/COPY use the
-// first set while PUT and metadata updates use the destination set, so recovery
-// takes both in that order. No writer routing or wire protocol changes here.
+// Multi-pool writes use the pools lock. In a single pool every object write,
+// DELETE and COPY included, locks the object's own set (see NewObjectNSLock),
+// which is the source set here. Releases before that routing locked
+// single-pool DELETE and COPY in the first set, so recovery still takes the
+// first set too, in that order, while nodes of those releases may run. It can
+// drop that lock only behind a version boundary that keeps such nodes out.
 func (z *erasureServerPools) listingRLock(ctx context.Context, bucket, object string, source *erasureObjects) (LockContext, func(), error) {
 	firstSet := z.serverPools[0].sets[0]
 	first := z.NewNSLock(bucket, object)

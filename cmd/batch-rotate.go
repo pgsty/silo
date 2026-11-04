@@ -180,7 +180,7 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	versioned := globalBucketVersioningSys.PrefixEnabled(srcBucket, srcObject)
 	versionSuspended := globalBucketVersioningSys.PrefixSuspended(srcBucket, srcObject)
 
-	lock := api.NewNSLock(r.Bucket, objInfo.Name)
+	lock := api.NewObjectNSLock(r.Bucket, objInfo.Name)
 	lkctx, err := lock.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return err
