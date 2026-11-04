@@ -603,6 +603,86 @@ func TestNativeRestoreSerializesObjectLock(t *testing.T) {
 	}
 }
 
+// The POST handler marks a version ongoing before its background restore
+// takes the object lock, and only that restore clears the marker. A restore
+// queued behind another version's download must keep waiting: one that gave up
+// after a lock timeout would leave the marker for every later POST to refuse.
+// The wait still ends with its context.
+func TestNativeRestoreQueuedBehindDownload(t *testing.T) {
+	for _, pools := range []int{1, 2} {
+		t.Run(fmt.Sprintf("pools=%d", pools), func(t *testing.T) {
+			r := newRestoreSafetyTest(t, pools, versioning.Enabled)
+			first, _ := nativeRestoreSeed(t, r, 0, false, false)
+			queued, body := nativeRestoreSeed(t, r, pools-1, false, false)
+			prev := globalRestoreLockTimeout
+			globalRestoreLockTimeout = newDynamicTimeout(50*time.Millisecond, 50*time.Millisecond)
+			t.Cleanup(func() { globalRestoreLockTimeout = prev })
+			tier := globalTierConfigMgr.drivercache["WARM"].(*restoreTestTier)
+			blocked := &nativeRestoreBlockedTier{WarmBackend: tier, entered: make(chan struct{}), release: make(chan struct{})}
+			globalTierConfigMgr.drivercache["WARM"] = blocked
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(blocked.release) }) }
+			defer unblock()
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			firstDone := make(chan error, 1)
+			go func() {
+				firstDone <- r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, first.VersionID))
+			}()
+			select {
+			case <-blocked.entered:
+			case <-ctx.Done():
+				t.Fatal("first restore never reached the tier")
+			}
+			short, shortCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer shortCancel()
+			ended := make(chan error, 1)
+			go func() {
+				ended <- r.z.RestoreTransitionedObject(short, r.bucket, r.object, nativeRestoreOptions(r, queued.VersionID))
+			}()
+			select {
+			case err := <-ended:
+				if err == nil {
+					t.Fatal("restore finished without the object lock")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("restore kept waiting for the lock after its context ended")
+			}
+			queuedDone := make(chan error, 1)
+			go func() {
+				queuedDone <- r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, queued.VersionID))
+			}()
+			select {
+			case err := <-queuedDone:
+				t.Fatalf("queued restore gave up behind the download: %v", err)
+			case <-time.After(10 * 50 * time.Millisecond):
+			}
+			unblock()
+			for _, done := range []chan error{firstDone, queuedDone} {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("restore: %v", err)
+					}
+				case <-ctx.Done():
+					t.Fatal("restore did not finish")
+				}
+			}
+			info, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, r.opts(queued.VersionID))
+			if err != nil || info.RestoreOngoing {
+				t.Fatalf("queued version still ongoing after restore: %q, %v", info.UserDefined[xhttp.AmzRestore], err)
+			}
+			reads := tier.gets.Load()
+			if _, got, err := r.read(queued.VersionID); err != nil || !bytes.Equal(got, body) {
+				t.Fatalf("queued restore contents: %v", err)
+			}
+			if tier.gets.Load() != reads {
+				t.Error("queued version was not restored locally")
+			}
+		})
+	}
+}
+
 func TestNativeRestoreConcurrentCompletion(t *testing.T) {
 	for _, separateSets := range []bool{false, true} {
 		t.Run(fmt.Sprintf("separate-set-locks=%v", separateSets), func(t *testing.T) {

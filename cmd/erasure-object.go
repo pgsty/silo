@@ -2675,6 +2675,19 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 	return nil
 }
 
+// getRestoreLock waits for a restore's object lock for as long as ctx lives.
+// The POST handler has already marked the version ongoing, and only the
+// restore clears that marker. A restore queued behind another version's
+// download must therefore keep waiting rather than give up after one timeout.
+func getRestoreLock(ctx context.Context, lk RWLocker) (LockContext, error) {
+	for {
+		lkctx, err := lk.GetLock(ctx, globalRestoreLockTimeout)
+		if !errors.As(err, &OperationTimedOut{}) || ctx.Err() != nil {
+			return lkctx, err
+		}
+	}
+}
+
 // restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
 // as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
 func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
@@ -2682,7 +2695,7 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		// Single-pool and direct callers must protect the metadata snapshot
 		// through download, rehydration and failure cleanup, just like pools.
 		lk := er.NewNSLock(bucket, object)
-		lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
+		lkctx, err := getRestoreLock(ctx, lk)
 		if err != nil {
 			return err
 		}

@@ -3371,7 +3371,7 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 	if !opts.NoLock {
 		// Acquire write lock before restoring transitioned object
 		lk := z.NewNSLock(bucket, object)
-		lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
+		lkctx, err := getRestoreLock(ctx, lk)
 		if err != nil {
 			return err
 		}
