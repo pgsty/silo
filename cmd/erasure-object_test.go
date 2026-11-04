@@ -1302,3 +1302,129 @@ func TestJoinErrs(t *testing.T) {
 		}
 	}
 }
+
+type stagedDataGoneDisk struct {
+	StorageAPI
+}
+
+func (d stagedDataGoneDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (RenameDataResp, error) {
+	if err := d.Delete(ctx, srcVolume, srcPath, DeleteOptions{Recursive: true, Immediate: true}); err != nil {
+		return RenameDataResp{}, err
+	}
+	return d.StorageAPI.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, opts)
+}
+
+// stagedDataGoneDisks makes every drive of the only set lose the staged data
+// of a write right before RenameData, as when the caller has already given up
+// and removed it. It returns a function that restores the drives.
+func stagedDataGoneDisks(z *erasureServerPools) func() {
+	xl := z.serverPools[0].sets[0]
+	getDisks := xl.getDisks
+	disks := getDisks()
+	wrapped := make([]StorageAPI, len(disks))
+	for i, disk := range disks {
+		wrapped[i] = stagedDataGoneDisk{StorageAPI: disk}
+	}
+	z.serverPools[0].erasureDisksMu.Lock()
+	xl.getDisks = func() []StorageAPI { return wrapped }
+	z.serverPools[0].erasureDisksMu.Unlock()
+	return func() {
+		z.serverPools[0].erasureDisksMu.Lock()
+		xl.getDisks = getDisks
+		z.serverPools[0].erasureDisksMu.Unlock()
+	}
+}
+
+// A write whose staged data is gone before the drives rename it fails. The
+// object directory the drives create for it must not stay behind: it is
+// invisible while its parent holds other objects, but once they are deleted
+// the parent can no longer be removed and is listed as an empty prefix.
+func TestRenameDataStagedDataGoneLeavesNoPrefix(t *testing.T) {
+	ctx := t.Context()
+	obj, dirs, err := prepareErasure16(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obj.Shutdown(context.Background())
+	defer removeRoots(dirs)
+	z := obj.(*erasureServerPools)
+	const bucket = "bucket"
+	const sibling, putObject, mpuObject = "day=1/b=9/sibling", "day=1/b=9/put", "day=1/b=9/mpu"
+	if err := z.MakeBucket(ctx, bucket, MakeBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte{'a'}, 8<<20) // above the inline limit: data goes to a data dir
+	if _, err := z.PutObject(ctx, bucket, sibling, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := z.NewMultipartUpload(ctx, bucket, mpuObject, ObjectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pi, err := z.PutObjectPart(ctx, bucket, mpuObject, res.UploadID, 1, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restore := stagedDataGoneDisks(z)
+	if _, err := z.PutObject(ctx, bucket, putObject, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{}); err == nil {
+		t.Error("PutObject succeeded without its staged data")
+	}
+	if _, err := z.CompleteMultipartUpload(ctx, bucket, mpuObject, res.UploadID, []CompletePart{{PartNumber: 1, ETag: pi.ETag}}, ObjectOptions{}); err == nil {
+		t.Error("CompleteMultipartUpload succeeded without its staged data")
+	}
+	restore()
+
+	if _, err := z.DeleteObject(ctx, bucket, sibling, ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"", "day=1/", "day=1/b=9/"} {
+		res, err := z.ListObjectsV2(ctx, bucket, prefix, "", "/", 1000, false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Objects) != 0 || len(res.Prefixes) != 0 {
+			t.Errorf("ListObjectsV2 %q: %d objects, prefixes %v, want none", prefix, len(res.Objects), res.Prefixes)
+		}
+	}
+	for _, dir := range dirs {
+		if _, err := os.Stat(filepath.Join(dir, bucket, "day=1")); !os.IsNotExist(err) {
+			t.Errorf("%s: day=1 is still on the drive (%v)", dir, err)
+		}
+	}
+}
+
+// A failed overwrite whose staged data is gone must keep the existing object.
+func TestRenameDataStagedDataGoneKeepsExistingObject(t *testing.T) {
+	ctx := t.Context()
+	obj, dirs, err := prepareErasure16(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obj.Shutdown(context.Background())
+	defer removeRoots(dirs)
+	z := obj.(*erasureServerPools)
+	const bucket, object = "bucket", "day=1/b=9/object"
+	if err := z.MakeBucket(ctx, bucket, MakeBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte{'a'}, 8<<20) // above the inline limit: data goes to a data dir
+	if _, err := z.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := stagedDataGoneDisks(z)
+	other := bytes.Repeat([]byte{'b'}, 8<<20)
+	if _, err := z.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(other), int64(len(other)), "", ""), ObjectOptions{}); err == nil {
+		t.Error("overwrite succeeded without its staged data")
+	}
+	restore()
+
+	var buf bytes.Buffer
+	if err := GetObject(ctx, z, bucket, object, 0, int64(len(body)), &buf, "", ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.Bytes(), body) {
+		t.Error("existing object content changed")
+	}
+}

@@ -2890,6 +2890,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			}
 			// if its a partial rename() do not attempt to delete recursively.
 			s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+			// renameAll() creates the object directory before the rename; if the
+			// staged data was already gone, drop it and its parents while empty,
+			// otherwise they outlive the other objects there and are listed as an
+			// empty prefix. The trailing slash removes only an empty directory.
+			s.deleteFile(dstVolumeDir, pathutil.Dir(dstFilePath)+SlashSeparator, false, false)
 			return res, osErrToFileErr(err)
 		}
 		diskHealthCheckOK(ctx, err)
