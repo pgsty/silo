@@ -648,12 +648,9 @@ func (er erasureObjects) restoreUploadActive(ctx context.Context, v restoreUploa
 }
 
 // restoreLock is the object lock that restores and their status updates
-// share: with one pool the set's own lock, as single-pool writes use.
+// share: the lock every write of the object takes.
 func (z *erasureServerPools) restoreLock(bucket, object string) RWLocker {
-	if z.SinglePool() {
-		return z.serverPools[0].getHashedSet(object).NewNSLock(bucket, object)
-	}
-	return z.NewNSLock(bucket, object)
+	return z.NewObjectNSLock(bucket, object)
 }
 
 // restoreRequestStatus is what a POST restore recorded on its version.
