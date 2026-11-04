@@ -1234,6 +1234,11 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return objInfo, err
 	}
+	if opts.DeleteAllVersions {
+		if err := opts.deleteAllInvalid(); err != nil {
+			return objInfo, InvalidArgument{Bucket: bucket, Object: object, Err: err}
+		}
+	}
 
 	if !opts.DeletePrefix { // DeletePrefix handles dir object encoding differently.
 		object = encodeDirObject(object)
@@ -1247,6 +1252,12 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
+
+	// A purge of all versions approves and deletes on the history it reads
+	// itself. The checks below decide by other options and would discard it.
+	if opts.DeleteAllVersions {
+		return z.deleteAllVersions(ctx, bucket, object, opts)
+	}
 
 	// An ILM expiry is decided on the versions in one pool. Under the lock,
 	// check it with the versions in all pools; the sets then take it as
@@ -1496,6 +1507,12 @@ func deletesData(obj ObjectToDelete, opts ObjectOptions) bool {
 func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
 	derrs := make([]error, len(objects))
 	dobjects := make([]DeletedObject, len(objects))
+	if opts.DeleteAllVersions {
+		for i := range derrs {
+			derrs[i] = errDeleteAllUnsupported
+		}
+		return dobjects, derrs
+	}
 	objSets := set.NewStringSet()
 	for i := range derrs {
 		objects[i].ObjectName = encodeDirObject(objects[i].ObjectName)

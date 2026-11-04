@@ -1774,6 +1774,13 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 // into smaller bulks if some object names are found to be duplicated in the delete list, splitting
 // into smaller bulks will avoid holding twice the write lock of the duplicated object names.
 func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
+	if opts.DeleteAllVersions {
+		errs := make([]error, len(objects))
+		for i := range errs {
+			errs[i] = errDeleteAllUnsupported
+		}
+		return make([]DeletedObject, len(objects)), errs
+	}
 	if !opts.NoAuditLog {
 		for _, obj := range objects {
 			auditObjectErasureSet(ctx, "DeleteObjects", obj.ObjectName, &er)
@@ -2024,6 +2031,9 @@ func (er erasureObjects) deletePrefix(ctx context.Context, bucket, prefix string
 // any error as it is not necessary for the handler to reply back a
 // response to the client request.
 func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	if opts.DeleteAllVersions {
+		return objInfo, errDeleteAllUnsupported
+	}
 	if !opts.NoAuditLog {
 		auditObjectErasureSet(ctx, "DeleteObject", object, &er)
 	}

@@ -445,31 +445,13 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 				oiCache.Add(od, &exp.ObjectInfo)
 			}
 
-			// DeleteObject(deletePrefix: true) to expire all versions of an object
+			// Purge all versions of exactly each key while the version the
+			// walk matched is still its latest; see
+			// erasureServerPools.deleteAllVersions.
 			for _, exp := range toExpireAll {
-				var success bool
-				for attempts := 1; attempts <= retryAttempts; attempts++ {
-					select {
-					case <-ctx.Done():
-						ri.trackMultipleObjectVersions(exp, success)
-						return
-					default:
-					}
-					stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempts)
-					_, err := api.DeleteObject(ctx, exp.Bucket, encodeDirObject(exp.Name), ObjectOptions{
-						DeletePrefix:       true,
-						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-					})
-					if err != nil {
-						stopFn(exp, err)
-						batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s due to %v (attempts=%d)", exp.Bucket, exp.Name, err, attempts))
-					} else {
-						stopFn(exp, err)
-						success = true
-						break
-					}
+				if !expireAllVersions(ctx, ri, api, exp, retryAttempts) {
+					return
 				}
-				ri.trackMultipleObjectVersions(exp, success)
 			}
 
 			// DeleteMultiple objects
@@ -523,6 +505,56 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 			}
 		}(toExpire)
 	}
+}
+
+// expireAllVersions purges all versions of the key exp, which the walk
+// matched by its latest version, and counts what the purge removed. It
+// retries a failed purge up to attempts times, each time with the version
+// the walk matched; a purge that stopped at its budget continues without
+// spending an attempt. It does not retry once the key no longer has that
+// latest version, which is not an expiry, or once the purge refused the
+// key. It returns false once ctx ends.
+func expireAllVersions(ctx context.Context, ri *batchJobInfo, api ObjectLayer, exp expireObjInfo, attempts int) bool {
+	var objects, markers int64
+	matched := deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			ri.trackExpireAll(exp, objects, markers, true)
+			return false
+		default:
+		}
+		stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempt)
+		latest := matched
+		var purge deleteAllResult
+		_, err := api.DeleteObject(ctx, exp.Bucket, encodeDirObject(exp.Name), ObjectOptions{
+			DeleteAllVersions: true,
+			DeleteAllLatest:   &latest,
+			DeleteAllResult:   &purge,
+		})
+		objects += int64(purge.Removed - purge.Markers)
+		markers += int64(purge.Markers)
+		stopFn(exp, err)
+		switch {
+		case err == nil:
+			ri.trackExpireAll(exp, objects, markers, false)
+			return true
+		case errors.Is(err, errDeleteAllChanged):
+			// Changed since the walk matched it: not expired.
+			ri.trackExpireAll(exp, objects, markers, false)
+			return true
+		case errors.Is(err, errDeleteAllBudget) && purge.Removed > 0:
+			attempt-- // progress
+			continue
+		}
+		batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s due to %v (attempts=%d)", exp.Bucket, exp.Name, err, attempt))
+		var locked ObjectLocked
+		if errors.Is(err, errDeleteAllTiered) || errors.As(err, &locked) {
+			break // refused; a later run of the job checks again
+		}
+	}
+	ri.trackExpireAll(exp, objects, markers, true)
+	return true
 }
 
 type expireObjInfo struct {
@@ -746,8 +778,8 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	<-expireDoneCh // waits for the expire goroutine to complete
 	wk.Wait()      // waits for all expire workers to retire
 
-	ri.Complete = !failed && ri.ObjectsFailed == 0
-	ri.Failed = failed || ri.ObjectsFailed > 0
+	ri.Complete = !failed && !ri.expireFailures()
+	ri.Failed = failed || ri.expireFailures()
 	globalBatchJobsMetrics.save(job.ID, ri)
 
 	// Close the saverQuitCh - this also triggers saving in-memory state

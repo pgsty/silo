@@ -103,6 +103,17 @@ type ObjectOptions struct {
 	DeletePrefix                        bool      // set true to enforce a prefix deletion, only application for DeleteObject API,
 	DeletePrefixObject                  bool      // set true when object's erasure set is resolvable by object name (using getHashedSetIndex)
 
+	// DeleteAllVersions asks DeleteObject to purge every version of exactly
+	// this key by version ID, for an ILM or batch expiry of all versions;
+	// see erasureServerPools.deleteAllVersions. In memory only.
+	DeleteAllVersions bool
+	// DeleteAllLatest is the latest version that a batch expiry matched.
+	// The purge of all versions only runs while it is still the latest.
+	DeleteAllLatest *deleteAllMatch
+	// DeleteAllResult, when set, receives what a purge of all versions
+	// confirmed, also when it fails part way.
+	DeleteAllResult *deleteAllResult
+
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn
 
