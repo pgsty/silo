@@ -1291,8 +1291,10 @@ func (s *peerRESTServer) HealBucketHandler(mss *grid.MSS) (np *grid.JSON[madmin.
 	}
 
 	bucketDeleted := mss.Get(peerS3BucketDeleted) == "true"
+	dryRun := mss.Get(peerS3BucketDryRun) == "true"
 	res, err := healBucketLocal(context.Background(), bucket, madmin.HealOpts{
 		Remove: bucketDeleted,
+		DryRun: dryRun,
 	})
 	if err != nil {
 		return np, grid.NewRemoteErr(err)
