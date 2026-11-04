@@ -113,6 +113,12 @@ type ObjectOptions struct {
 	// DeleteAllResult, when set, receives what a purge of all versions
 	// confirmed, also when it fails part way.
 	DeleteAllResult *deleteAllResult
+	// deleteAllAuthorize authorizes a batch purge of all versions, which
+	// needs it, on every copy of every version the purge approved and every
+	// revision of one that a drive holds, one of each distinct version ID
+	// and tags, before it deletes any; its error refuses the key and is
+	// returned. Set by batch expiration only, never from a request.
+	deleteAllAuthorize func(versions []ObjectInfo) error
 
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn

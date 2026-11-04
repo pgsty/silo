@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/pgsty/silo-pkg/v3/sync/errgroup"
 )
 
@@ -49,6 +50,9 @@ import (
 //     when any revision of an approved version there is transitioned or,
 //     when the bucket has Object Lock, protected by retention or a legal
 //     hold. It deletes on exactly the drives it read;
+//   - a batch expiry then authorizes every copy of every approved version,
+//     and every revision of one that a drive holds, for the submitter of the
+//     job, and the purge deletes nothing unless all of them are allowed;
 //   - it deletes the oldest version first and the latest version last and
 //     alone, once every older version is gone from every pool. A purge that
 //     stops early keeps the latest version, so it never exposes an older
@@ -118,11 +122,14 @@ func deleteAllVersionID(versionID string) string {
 }
 
 // deleteAllInvalid returns why opts cannot ask for a purge of all versions.
-// The purge is approved either as an ILM expiry or by a batch match, and it
-// only deletes: it never creates a marker, addresses a single version,
-// moves data or deletes a prefix.
+// The purge is approved either as an ILM expiry or by a batch match, which
+// also authorizes the versions it deletes, and it only deletes: it never
+// creates a marker, addresses a single version, moves data or deletes a
+// prefix.
 func (opts ObjectOptions) deleteAllInvalid() error {
 	switch {
+	case !opts.DeleteAllVersions:
+		return errors.New("only a purge of all versions authorizes the versions it deletes")
 	case opts.DeletePrefix || opts.DeletePrefixObject:
 		return errors.New("a purge of all versions is not a prefix delete")
 	case opts.VersionID != "":
@@ -137,6 +144,8 @@ func (opts ObjectOptions) deleteAllInvalid() error {
 		return errors.New("a purge of all versions takes no options of other deletes")
 	case opts.Expiration.Expire == (opts.DeleteAllLatest != nil):
 		return errors.New("a purge of all versions needs exactly one approval")
+	case (opts.DeleteAllLatest != nil) != (opts.deleteAllAuthorize != nil):
+		return errors.New("a batch purge of all versions, and only it, authorizes the versions it deletes")
 	}
 	return nil
 }
@@ -297,12 +306,29 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 			}
 		}
 	}
+	// A batch expiry deletes as its submitter: every write it is about to
+	// delete, the accepted copies and every revision a drive holds, must be
+	// allowed with the version ID and tags it has now.
+	var writes *deleteAllWrites
+	if opts.deleteAllAuthorize != nil {
+		writes = &deleteAllWrites{bucket: bucket, name: name, seen: make(map[[2]string]bool, len(history))}
+		for _, v := range history {
+			for _, c := range v.copies {
+				writes.add(c.fi)
+			}
+		}
+	}
 	drives := make([][]StorageAPI, len(z.serverPools))
 	for pool := range z.serverPools {
 		if !held[pool] {
 			continue
 		}
-		if drives[pool], err = z.serverPools[pool].getHashedSet(object).deleteAllDrives(ctx, bucket, object, ids, lr.LockEnabled); err != nil {
+		if drives[pool], err = z.serverPools[pool].getHashedSet(object).deleteAllDrives(ctx, bucket, object, ids, lr.LockEnabled, writes); err != nil {
+			return fail(err)
+		}
+	}
+	if opts.deleteAllAuthorize != nil {
+		if err := opts.deleteAllAuthorize(writes.versions); err != nil {
 			return fail(err)
 		}
 	}
@@ -329,6 +355,28 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 	return res.Latest, nil
 }
 
+// deleteAllWrites collects, for the authorization of a batch purge, the
+// writes it deletes: one of each distinct version ID and tags.
+type deleteAllWrites struct {
+	bucket, name string
+	seen         map[[2]string]bool
+	versions     []ObjectInfo
+}
+
+// add adds the write fi unless w is nil or holds one with its version ID and
+// tags.
+func (w *deleteAllWrites) add(fi FileInfo) {
+	if w == nil {
+		return
+	}
+	key := [2]string{deleteAllVersionID(fi.VersionID), fi.Metadata[xhttp.AmzObjectTagging]}
+	if w.seen[key] {
+		return
+	}
+	w.seen[key] = true
+	w.versions = append(w.versions, fi.ToObjectInfo(w.bucket, w.name, true))
+}
+
 // deleteAllRefuses returns why the purge must keep the key that holds the
 // revision fi of an approved version: it is transitioned, whose remote
 // object a later release hands to the tier cleanup, or, with Object Lock,
@@ -344,7 +392,8 @@ func deleteAllRefuses(ctx context.Context, bucket, object string, fi FileInfo, l
 }
 
 // deleteAllDrives reads object on every drive of the set and checks each
-// revision of the versions ids that a drive holds with deleteAllRefuses.
+// revision of the versions ids that a drive holds with deleteAllRefuses, and
+// adds it to writes.
 // A minority of drives can hold a revision other than the accepted one, and
 // heal would later remove what the purge leaves on a drive, so a drive that
 // cannot be read or decoded refuses the key. A drive without the object
@@ -353,7 +402,7 @@ func deleteAllRefuses(ctx context.Context, bucket, object string, fi FileInfo, l
 // handle names a drive, not a backend: a backend that replaces the drive
 // behind it starts empty and receives this object only from a write or a
 // heal of it, which take the object lock the purge holds.
-func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object string, ids map[string]bool, lockEnabled bool) ([]StorageAPI, error) {
+func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object string, ids map[string]bool, lockEnabled bool, writes *deleteAllWrites) ([]StorageAPI, error) {
 	disks := slices.Clone(er.getDisks())
 	raws, errs := readAllRawFileInfo(ctx, disks, bucket, object, false)
 	if err := ctx.Err(); err != nil {
@@ -381,6 +430,7 @@ func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object str
 			if err := deleteAllRefuses(ctx, bucket, object, fi, lockEnabled); err != nil {
 				return nil, err
 			}
+			writes.add(fi)
 		}
 	}
 	return disks, nil

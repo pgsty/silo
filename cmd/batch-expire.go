@@ -347,22 +347,10 @@ const (
 	batchExpireJobDefaultRetryDelay = 250 * time.Millisecond
 )
 
-// expireVersionRef is a version of a key whose versions are all purged, as
-// the walk saw it.
-type expireVersionRef struct {
-	VersionID    string
-	UserTags     string
-	DeleteMarker bool
-	Locked       bool
-}
-
 type expireObjInfo struct {
 	ObjectInfo
 	ExpireAll         bool
 	DeleteMarkerCount int64
-	// versions are the versions of an ExpireAll key the walk saw, the
-	// latest first.
-	versions []expireVersionRef
 }
 
 // isErrObjectLocked reports a version that Object Lock protects.
@@ -485,35 +473,20 @@ func (r *BatchJobExpire) expireVersions(ctx context.Context, api ObjectLayer, vc
 
 // expireAllVersions purges every version of a key whose rule retains none,
 // with the purge of exactly that key (erasureServerPools.deleteAllVersions),
-// while the version the walk matched is still its latest. What the purge
-// removed is counted at once; a key it refused because Object Lock protects
-// a version is counted in res as refused, and the versions a failed purge
-// left in res as failures. A failed purge is retried up to retryAttempts
-// times, each time with the version the walk matched; a purge that stopped
-// at its budget after removing versions continues without spending an
-// attempt. A key whose latest version changed since the walk is not
-// expired. It returns an error that ends the job.
+// while the version the walk matched is still its latest. Under its lock,
+// before it deletes anything, the purge refuses the key when Object Lock
+// protects a version and has every write it would delete, each copy and
+// each revision a drive holds, authorized for the submitter, with the
+// version ID and tags it has then.
 //
-// TODO(rebase onto the delete-all purge, claude/fix-delete-all): before the
-// purge removes anything, authorize every version of the history it
-// approved under its lock, with version-specific conditions
-// (expireAuthzRequests). Until then the checks here use the versions the
-// walk saw, and do not cover a version added after the walk; the purge
-// itself refuses a key that holds a locked version.
+// What the purge removed is counted at once; a refused key is counted in res
+// as refused, and the versions a failed purge left in res as failures. A
+// failed purge is retried up to retryAttempts times, each time with the
+// version the walk matched; a purge that stopped at its budget after
+// removing versions continues without spending an attempt. A key whose
+// latest version changed since the walk is not expired. It returns an error
+// that ends the job: an authorization failure or the end of ctx.
 func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer, job BatchJobRequest, ri *batchJobInfo, exp expireObjInfo, retryAttempts int, res *batchCounts) error {
-	for _, v := range exp.versions {
-		if v.Locked {
-			res.keysRefused++
-			return nil
-		}
-	}
-	var reqs []batchAuthzRequest
-	for _, v := range exp.versions {
-		reqs = append(reqs, r.expireAuthzRequests(exp.Name, v.VersionID, v.UserTags)...)
-	}
-	if err := job.Submitter.authorize(ctx, reqs...); err != nil {
-		return err
-	}
 	var objects, markers int64
 	matched := deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime}
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
@@ -523,11 +496,15 @@ func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer,
 		stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempts)
 		latest := matched
 		var purge deleteAllResult
-		_, err := api.DeleteObject(ctx, exp.Bucket, encodeDirObject(exp.Name), ObjectOptions{
-			DeleteAllVersions: true,
-			DeleteAllLatest:   &latest,
-			DeleteAllResult:   &purge,
-		})
+		p, err := job.Submitter.principal(ctx)
+		if err == nil {
+			_, err = api.DeleteObject(ctx, exp.Bucket, encodeDirObject(exp.Name), ObjectOptions{
+				DeleteAllVersions:  true,
+				DeleteAllLatest:    &latest,
+				DeleteAllResult:    &purge,
+				deleteAllAuthorize: r.expireAllAuthorize(p, exp.Name),
+			})
+		}
 		// Removed versions are gone for any later run: count them now.
 		if purge.Removed > 0 {
 			ri.countRemoved(r.Bucket, int64(purge.Removed-purge.Markers), int64(purge.Markers))
@@ -538,6 +515,8 @@ func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer,
 		switch {
 		case err == nil:
 			return nil
+		case isBatchJobAuthzError(err):
+			return err
 		case errors.Is(err, errDeleteAllChanged):
 			// Changed since the walk matched it: not expired.
 			return nil
@@ -560,6 +539,22 @@ func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer,
 	}
 	res.expireAllFailed(exp, objects, markers)
 	return nil
+}
+
+// expireAllAuthorize returns the authorization of a purge of all versions of
+// name for p: each version the purge would delete, as it holds it, needs the
+// actions of expiring it (expireAuthzRequests).
+func (r *BatchJobExpire) expireAllAuthorize(p batchJobPrincipal, name string) func([]ObjectInfo) error {
+	return func(versions []ObjectInfo) error {
+		for _, v := range versions {
+			for _, req := range r.expireAuthzRequests(name, v.VersionID, v.UserTags) {
+				if err := p.authorize(req); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 }
 
 // expireAllFailed counts the versions of info, as the walk saw them, that a
@@ -833,17 +828,12 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 					toDel = append(toDel, expireObjInfo{
 						ObjectInfo: result.Item,
 						ExpireAll:  true,
-						versions:   []expireVersionRef{newExpireVersionRef(ctx, result.Item)},
 					})
 					continue
 				}
 			} else if prevObj.Name == result.Item.Name {
 				if matchedFilter.Purge.RetainVersions == 0 {
-					// The latest version in toDel purges them all.
-					if n := len(toDel); n > 0 && toDel[n-1].Name == result.Item.Name {
-						toDel[n-1].versions = append(toDel[n-1].versions, newExpireVersionRef(ctx, result.Item))
-					}
-					continue
+					continue // including latest version in toDel suffices, skipping other versions
 				}
 				versionsCount++
 			} else {
@@ -915,15 +905,6 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	}
 
 	return nil
-}
-
-func newExpireVersionRef(ctx context.Context, oi ObjectInfo) expireVersionRef {
-	return expireVersionRef{
-		VersionID:    oi.VersionID,
-		UserTags:     oi.UserTags,
-		DeleteMarker: oi.DeleteMarker,
-		Locked:       enforceRetentionForDeletion(ctx, oi),
-	}
 }
 
 //msgp:ignore batchExpireJobError

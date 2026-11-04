@@ -1234,7 +1234,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return objInfo, err
 	}
-	if opts.DeleteAllVersions {
+	if opts.DeleteAllVersions || opts.deleteAllAuthorize != nil {
 		if err := opts.deleteAllInvalid(); err != nil {
 			return objInfo, InvalidArgument{Bucket: bucket, Object: object, Err: err}
 		}
