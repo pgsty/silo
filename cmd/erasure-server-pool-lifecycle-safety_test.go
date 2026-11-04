@@ -94,23 +94,31 @@ func TestPoolsLifecycleDuplicateLockMetadata(t *testing.T) {
 					setLifecycleCopyMetadata(t, s, key, id, pool, metadata, tc.newerPool1 && pool == 1)
 				}
 				versions, events, err := s.z.lifecycleEventsAllPools(t.Context(), s.bucket, key)
-				if err != nil {
+				switch {
+				case tc.newerPool1:
+					// Another ModTime makes the copies separate writes. The
+					// held older one refuses the object instead of merging.
+					if !errors.Is(err, errLifecycleNotApplicable) {
+						t.Fatalf("held older write: %v", err)
+					}
+				case err != nil:
 					t.Fatal(err)
-				}
-				if len(versions) != 2 || versions[1].VersionID != id || versions[1].NumVersions != 2 {
-					t.Fatalf("wrong version history: %+v", versions)
-				}
-				state := storedObjectLockState(versions[1].UserDefined)
-				if state.mode != tc.mode || state.legalHold != tc.hold {
-					t.Errorf("merged state=%+v, want mode=%s hold=%s", state, tc.mode, tc.hold)
-				}
-				want := lifecycle.NoneAction
-				if tc.delete {
-					want = lifecycle.DeleteVersionAction
-				}
-				// Read-side expiry rechecks consume the same event producer.
-				if events[1].Action != want {
-					t.Errorf("expiry event=%s want=%s", events[1].Action, want)
+				default:
+					if len(versions) != 2 || versions[1].VersionID != id || versions[1].NumVersions != 2 {
+						t.Fatalf("wrong version history: %+v", versions)
+					}
+					state := storedObjectLockState(versions[1].UserDefined)
+					if state.mode != tc.mode || state.legalHold != tc.hold {
+						t.Errorf("merged state=%+v, want mode=%s hold=%s", state, tc.mode, tc.hold)
+					}
+					want := lifecycle.NoneAction
+					if tc.delete {
+						want = lifecycle.DeleteVersionAction
+					}
+					// Read-side expiry rechecks consume the same event producer.
+					if events[1].Action != want {
+						t.Errorf("expiry event=%s want=%s", events[1].Action, want)
+					}
 				}
 				opts := ObjectOptions{Versioned: true, Expiration: ExpirationOptions{Expire: true}}
 				if batch {

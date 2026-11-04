@@ -163,6 +163,10 @@ type ExpirationOptions struct {
 	// object in all pools (checkExpiryAllPools). A set does not check it
 	// again with the versions it holds alone.
 	CheckedAllPools bool
+	// ApprovedProtection: the Object Lock state of the version with which
+	// the check approved its expiry. The set compares it with the state it
+	// reads (checkedExpiryRefused). In memory only.
+	ApprovedProtection objectLockState `msg:"-"`
 }
 
 // TransitionOptions represents object options for transition ObjectLayer operation

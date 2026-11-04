@@ -2118,6 +2118,11 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		return ObjectInfo{}, toObjectErr(er.deletePrefix(ctx, bucket, object), bucket, object)
 	}
 
+	// An ILM version expiry that the pools checked with the versions in all
+	// pools; the set still guards the protection it reads, see
+	// checkedExpiryRefused.
+	checkedExpiry := opts.Expiration.Expire && opts.Expiration.CheckedAllPools && opts.VersionID != "" && !opts.Transition.ExpireRestored
+
 	storageDisks := er.getDisks()
 	versionFound := true
 	objInfo = ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
@@ -2126,8 +2131,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	if gerr != nil && goi.Name == "" {
 		if _, ok := gerr.(InsufficientReadQuorum); ok {
 			// A restored-copy expiry needs fresh metadata to confirm its target
-			// and deadline; ordinary unversioned DELETE may still try a blind delete.
-			if opts.Transition.ExpireRestored || opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
+			// and deadline, a checked expiry to guard its protection; ordinary
+			// unversioned DELETE may still try a blind delete.
+			if opts.Transition.ExpireRestored || checkedExpiry || opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
 				// Add an MRF heal for next time.
 				er.addPartial(bucket, object, opts.VersionID)
 				return objInfo, InsufficientWriteQuorum{}
@@ -2197,6 +2203,8 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 				}
 			}
 		}
+	} else if checkedExpiry && checkedExpiryRefused(*lc, rcfg, replcfg, goi, opts.Expiration.ApprovedProtection) {
+		return goi, errLifecycleNotApplicable
 	}
 
 	//  Determine whether to mark object deleted for replication

@@ -1250,12 +1250,15 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	// An ILM expiry is decided on the versions in one pool. Under the lock,
 	// check it with the versions in all pools; the sets then take it as
-	// decided, without a recheck by the versions each one holds.
+	// decided, without a recheck by the versions each one holds. They only
+	// keep a version whose protection they read differently.
 	if z.expiryNeedsAllPools(opts) {
-		if err = z.checkExpiryAllPools(ctx, bucket, object, opts); err != nil {
+		var approved objectLockState
+		if approved, err = z.checkExpiryAllPools(ctx, bucket, object, opts); err != nil {
 			return ObjectInfo{Name: decodeDirObject(object), VersionID: opts.VersionID}, err
 		}
 		opts.Expiration.CheckedAllPools = true
+		opts.Expiration.ApprovedProtection = approved
 	}
 
 	if opts.DeletePrefix {
@@ -1527,6 +1530,7 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 		batch = make([]ObjectToDelete, 0, len(objects))
 		batchIdx = make([]int, 0, len(objects))
 		data, dataIdx := make([]ObjectToDelete, 0, len(objects)), make([]int, 0, len(objects))
+		approved := make([]objectLockState, 0, len(objects))
 		ilm := make(map[string]lifecycleAllPools)
 		for i, obj := range objects {
 			if derrs[i] != nil {
@@ -1536,6 +1540,7 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 			// its object in all pools, see checkExpiryAllPools. When the
 			// expiry no longer applies, nothing is deleted and nothing is
 			// left to replicate.
+			var protection objectLockState
 			vopts := ObjectOptions{Expiration: opts.Expiration, VersionID: obj.VersionID}
 			if obj.VersionID != "" && z.expiryNeedsAllPools(vopts) {
 				all, ok := ilm[obj.ObjectName]
@@ -1548,6 +1553,7 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 					derrs[i] = err
 					continue
 				}
+				protection = all.protection(obj.VersionID)
 			}
 			if deletesData(obj, opts) {
 				if z.copyWithoutDeleteQuorum(ctx, bucket, obj.ObjectName, obj.VersionID) {
@@ -1556,13 +1562,14 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 				}
 				data = append(data, obj)
 				dataIdx = append(dataIdx, i)
+				approved = append(approved, protection)
 				continue
 			}
 			batch = append(batch, obj)
 			batchIdx = append(batchIdx, i)
 		}
 		if len(data) > 0 {
-			deleted, errs := z.deleteObjectsReconciled(ctx, bucket, data, opts)
+			deleted, errs := z.deleteObjectsReconciled(ctx, bucket, data, approved, opts)
 			for j, i := range dataIdx {
 				dobjects[i], derrs[i] = deleted[j], errs[j]
 			}
