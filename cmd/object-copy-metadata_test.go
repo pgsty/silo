@@ -340,9 +340,9 @@ func TestCopyRewritesObjectData(t *testing.T) {
 			name: "data copy always rewrites",
 			want: true,
 		},
-		// PostRestoreObjectHandler, updateRestoreMetadata and batchKeyRotate all
-		// address the same version on both sides and never set Versioned, so they
-		// only ever reach these two cases.
+		// In-place metadata callers such as batchKeyRotate address the same
+		// version on both sides and never set Versioned, so they only ever
+		// reach these two cases.
 		{
 			name:         "unversioned in-place metadata update",
 			metadataOnly: true,

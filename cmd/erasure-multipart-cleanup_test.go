@@ -123,7 +123,20 @@ func (d *multipartCleanupDisk) Endpoint() Endpoint {
 
 func (d *multipartCleanupDisk) ReadVersion(context.Context, string, string, string, string, ReadOptions) (FileInfo, error) {
 	d.reads++
-	return FileInfo{ModTime: d.modTime}, d.readErr
+	if d.readErr != nil {
+		return FileInfo{}, d.readErr
+	}
+	fi := newFileInfo("obj", 1, 0)
+	fi.Erasure.Index, fi.ModTime = 1, d.modTime
+	return fi, nil
+}
+
+// multipartCleanupSet is a set of one drive, which also answers the
+// metadata reads that establish the restore marker of an expired upload.
+// Its locks are local: stale cleanup decides a removal under the upload's
+// commit lock.
+func multipartCleanupSet(disk StorageAPI) erasureObjects {
+	return erasureObjects{getDisks: func() []StorageAPI { return []StorageAPI{disk} }, nsMutex: newNSLock(false)}
 }
 
 func (d *multipartCleanupDisk) StatVol(ctx context.Context, volume string) (VolInfo, error) {
@@ -143,9 +156,10 @@ func TestCleanupStaleUploadsOnDisk(t *testing.T) {
 	}{
 		{name: "recent", prefix: uuid, age: expiry / 2, readErr: errFileNotFound},
 		{name: "plaintext_base64_collision", prefix: "4eacd477-e733-4851-b821-6fd42785ff87", age: expiry / 2, readErr: errFileNotFound},
-		{name: "expired", prefix: uuid, age: 2 * expiry, readErr: errFileNotFound, wantDeleted: true},
+		// Only an expired upload is read on every drive, for its restore marker.
+		{name: "expired", prefix: uuid, age: 2 * expiry, readErr: errFileNotFound, wantReads: 1, wantDeleted: true},
 		{name: "legacy_recent", prefix: uuid, age: expiry / 2, legacy: true, wantReads: 1},
-		{name: "legacy_expired", prefix: uuid, age: 2 * expiry, legacy: true, wantReads: 1, wantDeleted: true},
+		{name: "legacy_expired", prefix: uuid, age: 2 * expiry, legacy: true, wantReads: 2, wantDeleted: true},
 		{name: "legacy_metadata_missing", prefix: uuid, age: 2 * expiry, legacy: true, readErr: errFileNotFound, wantReads: 1},
 		{name: "malformed_metadata_missing", prefix: "not-a-uuid", age: 2 * expiry, readErr: errFileNotFound, wantReads: 1},
 	} {
@@ -166,7 +180,7 @@ func TestCleanupStaleUploadsOnDisk(t *testing.T) {
 			if err := os.Chtimes(filepath.Dir(uploadDir), modTime, modTime); err != nil {
 				t.Fatal(err)
 			}
-			erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
+			multipartCleanupSet(disk).cleanupStaleUploadsOnDisk(t.Context(), disk)
 			if disk.reads != tc.wantReads {
 				t.Errorf("ReadVersion calls = %d, want %d", disk.reads, tc.wantReads)
 			}
@@ -199,7 +213,7 @@ func TestCleanupStaleUploadsEmptyHashDirectory(t *testing.T) {
 			if err := os.Chtimes(shaDir, modTime, modTime); err != nil {
 				t.Fatal(err)
 			}
-			erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
+			multipartCleanupSet(disk).cleanupStaleUploadsOnDisk(t.Context(), disk)
 			if _, err := os.Stat(shaDir); !os.IsNotExist(err) {
 				t.Fatalf("empty hash directory must be removed regardless of age: %v", err)
 			}
@@ -224,7 +238,7 @@ func TestCleanupStaleUploadsSharedHashDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
+	multipartCleanupSet(disk).cleanupStaleUploadsOnDisk(t.Context(), disk)
 	if _, err := os.Stat(filepath.Join(shaDir, expiredID)); !os.IsNotExist(err) {
 		t.Errorf("expired upload must be removed: %v", err)
 	}

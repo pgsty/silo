@@ -375,8 +375,10 @@ func TestNativeRestorePOSTVersionIdentity(t *testing.T) {
 
 // A restore request is internal context, not an exception for normal S3
 // multipart overwrites or for a version that has never completed transition.
+// Only the upload of a native restore attempt, whose marker names the very
+// version being completed, may write that version back.
 func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
-	for _, mode := range []string{"matching-restore", "ordinary-complete", "not-tiered", "changed-time", "changed-size", "changed-etag"} {
+	for _, mode := range []string{"matching-restore", "ordinary-complete", "restore-without-attempt", "other-attempt", "not-tiered", "changed-time", "changed-size", "changed-etag"} {
 		t.Run(mode, func(t *testing.T) {
 			r := newRestoreSafetyTest(t, 1, versioning.Enabled)
 			oi, body := nativeRestoreSeed(t, r, 0, false, true)
@@ -398,8 +400,9 @@ func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			opts := putRestoreOpts(r.bucket, r.object, &RestoreObjectRequest{Days: 1}, current)
+			opts := putRestoreOpts(&RestoreObjectRequest{Days: 1}, current, r.opts(oi.VersionID))
 			opts.Transition.RestoreRequest = &RestoreObjectRequest{Days: 1}
+			opts.PreserveETag = current.ETag
 			if mode == "ordinary-complete" {
 				opts.Transition.RestoreRequest = nil
 			}
@@ -408,20 +411,26 @@ func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
 			}
 			// Hold the ETag constant for the size case, so only size can reject it.
 			if mode == "changed-size" {
-				opts.UserDefined["etag"] = current.ETag
 				body = append(body, 'x')
 			}
 			if mode == "changed-etag" {
-				opts.UserDefined["etag"] = "different-etag"
+				opts.PreserveETag = "different-etag"
 			}
-			upload, err := pool.NewMultipartUpload(t.Context(), r.bucket, r.object, opts)
+			// The attempt claims what its upload claims; only the matching
+			// mode claims exactly the stored version.
+			if mode != "ordinary-complete" && mode != "restore-without-attempt" {
+				opts.Transition.attempt = &restoreAttempt{ID: mustGetUUID(), VersionID: oi.VersionID, ETag: opts.PreserveETag, Size: current.Size, ModTime: opts.MTime}
+			}
+			uopts := opts
+			uopts.MTime = time.Time{}
+			upload, err := pool.NewMultipartUpload(t.Context(), r.bucket, r.object, uopts)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var complete []CompletePart
 			for i, data := range [][]byte{body[:5<<20], body[5<<20:]} {
 				part, err := pool.PutObjectPart(t.Context(), r.bucket, r.object, upload.UploadID, i+1,
-					mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), ObjectOptions{})
+					mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), ObjectOptions{Transition: opts.Transition})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -429,6 +438,11 @@ func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
 			}
 			if mode != "changed-size" && getCompleteMultipartMD5(complete) != current.ETag {
 				t.Fatal("fixture multipart ETag does not match original")
+			}
+			if mode == "other-attempt" {
+				other := *opts.Transition.attempt
+				other.ID = mustGetUUID()
+				opts.Transition.attempt = &other
 			}
 			before := nativeRestoreSnapshot(t, r)
 			_, err = pool.CompleteMultipartUpload(t.Context(), r.bucket, r.object, upload.UploadID, complete, opts)
@@ -440,9 +454,16 @@ func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
 				if err != nil || !bytes.Equal(got, body) {
 					t.Fatalf("matching restore contents: %v", err)
 				}
+				if after := r.fileInfo(oi.VersionID); after.Metadata[restoreUploadKey] != "" || after.Metadata[restoreAttemptKey] != "" {
+					t.Error("restore committed its private upload or attempt marker")
+				}
 				return
 			}
-			if !errors.Is(err, errAuthentication) {
+			if mode == "other-attempt" {
+				if !errors.As(err, &InvalidUploadID{}) {
+					t.Fatalf("another attempt completed a private upload: %v", err)
+				}
+			} else if !errors.Is(err, errAuthentication) {
 				t.Fatalf("existing version overwrite: %v", err)
 			}
 			if !reflect.DeepEqual(before, nativeRestoreSnapshot(t, r)) {
@@ -721,18 +742,10 @@ func TestNativeRestoreConcurrentCompletion(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("restore never started")
 			}
-			// A client's exact-prefix listing can discover the internal upload. It can
-			// try to complete the first part while native restore owns the object.
-			uploads, err := r.z.ListMultipartUploads(t.Context(), r.bucket, r.object, "", "", "", 10)
-			if err != nil || len(uploads.Uploads) != 1 {
-				t.Fatalf("restore upload discovery: %+v, %v", uploads, err)
-			}
-			id := uploads.Uploads[0].UploadID
-			parts, err := r.z.ListObjectParts(t.Context(), r.bucket, r.object, id, 0, 10, ObjectOptions{})
-			if err != nil || len(parts.Parts) != 1 {
-				t.Fatalf("restore must have published its first part: %+v, %v", parts, err)
-			}
-			part := parts.Parts[0]
+			// A client that learns the internal upload ID, which listings no
+			// longer show, can try to complete the first part while native
+			// restore owns the object.
+			id, part := restoreIsolationUpload(t, r, 0)
 			completed := make(chan struct{})
 			var completeErr error
 			go func() {
@@ -942,17 +955,22 @@ func TestNativeRestoreCompletionReadSafety(t *testing.T) {
 	}
 }
 
+// nativeRestoreStatusHook runs afterRead once POST has read the version and
+// before POST records its status on it.
 type nativeRestoreStatusHook struct {
 	ObjectLayer
-	beforeCopy       func()
-	copyCalled       bool
+	afterRead        func()
+	readCalled       bool
 	backgroundCalled atomic.Bool
 }
 
-func (h *nativeRestoreStatusHook) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, info ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
-	h.copyCalled = true
-	h.beforeCopy()
-	return h.ObjectLayer.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, info, srcOpts, dstOpts)
+func (h *nativeRestoreStatusHook) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+	oi, err := h.ObjectLayer.GetObjectInfo(ctx, bucket, object, opts)
+	if err == nil && !h.readCalled {
+		h.readCalled = true
+		h.afterRead()
+	}
+	return oi, err
 }
 
 func (h *nativeRestoreStatusHook) RestoreTransitionedObject(context.Context, string, string, ObjectOptions) error {
@@ -985,7 +1003,7 @@ func TestNativeRestorePOSTReadSafety(t *testing.T) {
 					}
 					before = restoreBoundarySnapshot(t, r)
 				}
-				hook := &nativeRestoreStatusHook{ObjectLayer: r.z, beforeCopy: mutate}
+				hook := &nativeRestoreStatusHook{ObjectLayer: r.z, afterRead: mutate}
 				if stage == "initial" {
 					mutate()
 				}
@@ -1004,7 +1022,7 @@ func TestNativeRestorePOSTReadSafety(t *testing.T) {
 				if rec.Code < 400 {
 					t.Fatalf("POST acknowledged failed read: %d %s", rec.Code, rec.Body.String())
 				}
-				if hook.copyCalled != (stage == "status-copy") || hook.backgroundCalled.Load() {
+				if hook.readCalled != (stage == "status-copy") || hook.backgroundCalled.Load() {
 					t.Fatal("request followed the wrong failure path")
 				}
 				if !reflect.DeepEqual(before, restoreBoundarySnapshot(t, r)) {

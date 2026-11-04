@@ -156,7 +156,7 @@ func TestExpireRestoredRenewedOrMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = expireTransitionedObject(t.Context(), r.z, &stale, lifecycle.Event{Action: lifecycle.DeleteRestoredAction}, lcEventSrc_Scanner)
-	if !isErrVersionNotFound(err) {
+	if !errors.Is(err, errLifecycleNotApplicable) {
 		t.Errorf("stale task should be rejected, got %v", err)
 	}
 	if got := r.fileInfo(oi.VersionID); got.Metadata[xhttp.AmzRestore] != renewed || got.DataDir != before.DataDir {

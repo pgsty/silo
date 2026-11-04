@@ -37,6 +37,7 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
@@ -987,8 +988,10 @@ func postRestoreOpts(ctx context.Context, r *http.Request, bucket, object string
 	}, nil
 }
 
-// set ObjectOptions for PUT call to restore temporary copy of transitioned data
-func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo ObjectInfo) (putOpts ObjectOptions) {
+// set ObjectOptions for PUT call to restore temporary copy of transitioned data.
+// opts are the restore's options, with the versioning POST captured: the
+// bucket's versioning may have changed since, and must not mint a new version.
+func putRestoreOpts(rreq *RestoreObjectRequest, objInfo ObjectInfo, opts ObjectOptions) (putOpts ObjectOptions) {
 	meta := make(map[string]string)
 	sc := rreq.OutputLocation.S3.StorageClass
 	if sc == "" {
@@ -1011,8 +1014,8 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 			meta[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
 		}
 		return ObjectOptions{
-			Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, object),
-			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, object),
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
 			UserDefined:      meta,
 		}
 	}
@@ -1020,17 +1023,36 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 	if len(objInfo.UserTags) != 0 {
 		meta[xhttp.AmzObjectTagging] = objInfo.UserTags
 	}
-	// Set restore object status
+	// Set restore object status; a completed restore has no attempt.
 	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
 	meta[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
+	delete(meta, restoreAttemptKey)
+	delete(meta, restoreUploadKey)
 	return ObjectOptions{
-		Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, object),
-		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, object),
+		Versioned:        opts.Versioned,
+		VersionSuspended: opts.VersionSuspended,
 		UserDefined:      meta,
-		VersionID:        objInfo.VersionID,
+		VersionID:        restoreVersionID(objInfo.VersionID),
 		MTime:            objInfo.ModTime,
 		Expires:          objInfo.Expires,
 	}
+}
+
+// restoredCopyExpires reports whether the restored copy of oi, as read now,
+// expires by its own reason: lifecycle expires the restored copy of this
+// version, its restore deadline is valid and has passed, its transition is
+// complete and no restore is running. Another rule falling due is no reason.
+func restoredCopyExpires(ctx context.Context, lc lifecycle.Lifecycle, lr lock.Retention, rcfg *replication.Config, oi ObjectInfo) bool {
+	if !evalActionFromLifecycle(ctx, lc, lr, rcfg, oi).Action.DeleteRestored() {
+		return false
+	}
+	status, err := parseRestoreObjStatus(oi.UserDefined[xhttp.AmzRestore])
+	if err != nil {
+		return false
+	}
+	expiry, completed := status.Expiry()
+	return completed && !expiry.IsZero() && UTCNow().After(expiry) &&
+		oi.TransitionedObject.Status == lifecycle.TransitionComplete && !oi.RestoreOngoing
 }
 
 var errRestoreHDRMalformed = fmt.Errorf("x-amz-restore header malformed")

@@ -3369,8 +3369,16 @@ func (z *erasureServerPools) TransitionObject(ctx context.Context, bucket, objec
 }
 
 // RestoreTransitionedObject - restore transitioned object content locally on this cluster.
-func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) (err error) {
 	object = encodeDirObject(object)
+	defer func() {
+		// The restore stopped before it could clear POST's ongoing marker.
+		var reset restoreResetError
+		if errors.As(err, &reset) {
+			z.recoverRestoreStatus(bucket, object, opts)
+			err = reset.error
+		}
+	}()
 	if z.SinglePool() {
 		return z.serverPools[0].RestoreTransitionedObject(ctx, bucket, object, opts)
 	}
@@ -3380,7 +3388,7 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 		lk := z.NewNSLock(bucket, object)
 		lkctx, err := getRestoreLock(ctx, lk)
 		if err != nil {
-			return err
+			return restoreResetError{err}
 		}
 		ctx = lkctx.Context()
 		defer lk.Unlock(lkctx)
@@ -3389,10 +3397,7 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 	// Avoid restoring object from a pool being decommissioned.
 	opts.SkipDecommissioned = true
 	opts.NoLock = true
-	// Restore an existing version, not the latest version's write location.
-	lookupOpts := opts
-	lookupOpts.MetadataChg = true
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, lookupOpts)
+	idx, err := z.restorePoolIdx(ctx, bucket, object, opts)
 	if err != nil {
 		return err
 	}

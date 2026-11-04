@@ -3955,7 +3955,11 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 
 	// Preserve a failed restore read even before the request body is parsed.
 	opts.Transition.RestoreRequest = &RestoreObjectRequest{}
-	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
+	// Resolve the target without the object lock: a running restore holds it
+	// for its download, and the status step bounds its own wait for it.
+	preOpts := opts
+	preOpts.NoLock = true
+	objInfo, err := getObjectInfo(ctx, bucket, object, preOpts)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -3982,48 +3986,47 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	}
 	opts.Transition.RestoreRequest = rreq
 	statusCode := http.StatusOK
-	alreadyRestored := false
-	if err == nil {
-		if objInfo.RestoreOngoing && rreq.Type != SelectRestoreRequest {
+	// set or upgrade restore expiry
+	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
+
+	// update self with restore metadata
+	var attempt *restoreAttempt
+	if rreq.Type != SelectRestoreRequest {
+		// Native restore needs every server to keep its upload private;
+		// refuse it, writing nothing, while that is not established.
+		if err := nativeRestoreAvailable(ctx); err != nil {
+			apiErr := errorCodes.ToAPIErr(ErrBusy)
+			apiErr.Code, apiErr.Description = "ServiceUnavailable", err.Error()
+			writeErrorResponse(ctx, w, apiErr, r.URL)
+			return
+		}
+		// Decide on a fresh read under the object lock: renew a restored copy
+		// that is still there, or mark the version ongoing for a new attempt.
+		// Only the version resolved above, with its identity, is restored.
+		statusOpts := opts
+		statusOpts.Transition.RestoreExpiry = restoreExpiry
+		status, err := objectAPI.restoreRequest(GlobalContext, bucket, object, statusOpts, objInfo)
+		if errors.Is(err, errRestoreInProgress) {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrObjectRestoreAlreadyInProgress), r.URL)
 			return
 		}
-		if !objInfo.RestoreOngoing && !objInfo.RestoreExpires.IsZero() {
-			statusCode = http.StatusAccepted
-			alreadyRestored = true
-		}
-	}
-	// set or upgrade restore expiry
-	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
-	metadata := cloneMSS(objInfo.UserDefined)
-
-	// update self with restore metadata
-	if rreq.Type != SelectRestoreRequest {
-		objInfo.metadataOnly = true // Perform only metadata updates.
-		metadata[xhttp.AmzRestoreExpiryDays] = strconv.Itoa(rreq.Days)
-		metadata[xhttp.AmzRestoreRequestDate] = time.Now().UTC().Format(http.TimeFormat)
-		if alreadyRestored {
-			metadata[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
-		} else {
-			metadata[xhttp.AmzRestore] = ongoingRestoreObj().String()
-		}
-		objInfo.UserDefined = metadata
-		if _, err := objectAPI.CopyObject(GlobalContext, bucket, object, bucket, object, objInfo, ObjectOptions{
-			VersionID:  objInfo.VersionID,
-			Transition: opts.Transition,
-		}, ObjectOptions{
-			VersionID:   objInfo.VersionID,
-			Transition:  opts.Transition,
-			MTime:       objInfo.ModTime,
-			MetadataChg: true,
-		}); err != nil {
+		if errors.As(err, &InvalidObjectState{}) || errors.As(err, &MethodNotAllowed{}) {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidObjectState), r.URL)
 			return
 		}
-		// for previously restored object, just update the restore expiry
-		if alreadyRestored {
+		if err != nil {
+			// Such as a read quorum error while telling whether it restores.
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
+		// Events keep the version ID as this request resolved it.
+		status.objInfo.VersionID = objInfo.VersionID
+		objInfo = status.objInfo
+		// for previously restored object, just update the restore expiry
+		if status.attempt == nil {
+			return
+		}
+		attempt = status.attempt
 	}
 
 	restoreObject := mustGetUUID()
@@ -4088,12 +4091,14 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 			rreq.SelectParameters.Close()
 			return
 		}
+		// The versioning context and the explicit version POST resolved.
 		restoreOpts := ObjectOptions{
 			Transition: TransitionOptions{
 				RestoreRequest: rreq,
 				RestoreExpiry:  restoreExpiry,
+				attempt:        attempt,
 			},
-			VersionID:        objInfo.VersionID,
+			VersionID:        attempt.VersionID,
 			Versioned:        opts.Versioned,
 			VersionSuspended: opts.VersionSuspended,
 		}

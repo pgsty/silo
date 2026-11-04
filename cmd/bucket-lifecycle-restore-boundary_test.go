@@ -137,8 +137,7 @@ func TestExpireRestoredMetadataReadKeepsMinorityVersion(t *testing.T) {
 				case "restore-cleanup":
 					// The initial read succeeded before remote download failed;
 					// cleanup must not purge a now-incomplete target on reread.
-					opts.Transition.RestoreRequest = &RestoreObjectRequest{Days: 1}
-					err = er.updateRestoreMetadata(ctx, r.bucket, r.object, fi.ToObjectInfo(r.bucket, r.object, true), opts)
+					err = er.clearRestoreStatus(ctx, r.bucket, r.object, oi.VersionID, nil)
 				case "lookup-cleanup", "lookup-restore":
 					// Version-sensitive lookup also covers native restore routing.
 					opts.MetadataChg = true

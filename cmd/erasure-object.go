@@ -2158,6 +2158,20 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	if opts.Transition.ExpireRestored && (gerr != nil || goi.DeleteMarker) {
 		return objInfo, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
 	}
+	// A restored copy expires only by its own reason, decided on the
+	// version's authoritative generation: a drive that missed a renewal or a
+	// later POST must not authorize removing the cache, nor drives that
+	// disagree on the restore status. Another lifecycle deletion falling due,
+	// or the all-pools check of an ordinary expiry, does not stand in for it.
+	if opts.Transition.ExpireRestored {
+		gen, err := er.readRestoreGeneration(ctx, bucket, object, opts.VersionID)
+		if err != nil || gen.split || gen.fi.Deleted || lc == nil {
+			return goi, errLifecycleNotApplicable
+		}
+		if !restoredCopyExpires(ctx, *lc, rcfg, replcfg, gen.fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)) {
+			return goi, errLifecycleNotApplicable
+		}
+	}
 
 	if opts.EvalMetadataFn != nil {
 		dsc, err := opts.EvalMetadataFn(&goi, gerr)
@@ -2660,29 +2674,6 @@ func (er erasureObjects) RestoreTransitionedObject(ctx context.Context, bucket, 
 	return er.restoreTransitionedObject(ctx, bucket, object, opts)
 }
 
-// update restore status header in the metadata
-func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, object string, objInfo ObjectInfo, opts ObjectOptions) error {
-	oi := objInfo.Clone()
-	oi.metadataOnly = true // Perform only metadata updates.
-
-	// allow retry in the case of failure to restore
-	delete(oi.UserDefined, xhttp.AmzRestore)
-
-	if _, err := er.CopyObject(ctx, bucket, object, bucket, object, oi, ObjectOptions{
-		VersionID:  oi.VersionID,
-		Transition: opts.Transition,
-	}, ObjectOptions{
-		VersionID:  oi.VersionID,
-		MTime:      oi.ModTime,
-		NoLock:     opts.NoLock,
-		Transition: opts.Transition,
-	}); err != nil {
-		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
-		return err
-	}
-	return nil
-}
-
 // getRestoreLock waits for a restore's object lock for as long as ctx lives.
 // The POST handler has already marked the version ongoing, and only the
 // restore clears that marker. A restore queued behind another version's
@@ -2698,6 +2689,11 @@ func getRestoreLock(ctx context.Context, lk RWLocker) (LockContext, error) {
 
 // restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
 // as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
+//
+// A POST restore publishes its attempt on the version's ongoing marker. The
+// restore rehydrates the version only while that attempt owns the marker, and
+// on failure clears the marker only while it still does. A direct caller
+// publishes no attempt; its attempt only names the private upload.
 func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
 	if !opts.NoLock {
 		// Single-pool and direct callers must protect the metadata snapshot
@@ -2705,30 +2701,45 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		lk := er.NewNSLock(bucket, object)
 		lkctx, err := getRestoreLock(ctx, lk)
 		if err != nil {
-			return err
+			return restoreResetError{err}
 		}
 		ctx = lkctx.Context()
 		defer lk.Unlock(lkctx)
 		opts.NoLock = true
 	}
 
-	setRestoreHeaderFn := func(oi ObjectInfo, rerr error) error {
-		if rerr == nil {
-			return nil // nothing to do; restore object was successful
-		}
-		er.updateRestoreMetadata(ctx, bucket, object, oi, opts)
-		return rerr
-	}
-	var oi ObjectInfo
-	// get the file info on disk for transitioned object
-	actualfi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts, false)
+	published := opts.Transition.attempt
+	// Restore the authoritative generation of the version, never a revision
+	// that only some drives hold.
+	gen, err := er.readRestoreGeneration(ctx, bucket, object, opts.VersionID)
 	if err != nil {
-		// No version was read, so there is no restore metadata to update.
-		return toObjectErr(err, bucket, object)
+		err = toObjectErr(err, bucket, object, opts.VersionID)
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			// No version was read, so there is no restore marker to clear.
+			return err
+		}
+		return restoreResetError{err}
+	}
+	actualfi := gen.fi
+	if actualfi.Deleted {
+		return toObjectErr(errMethodNotAllowed, bucket, object)
 	}
 
-	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
-	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
+	oi := actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
+	attempt := published
+	if attempt == nil {
+		attempt = newRestoreAttempt(oi)
+	} else if !attempt.owns(oi) {
+		// A later POST took the version over, or it was replaced.
+		return errRestoreSuperseded
+	}
+	opts.Transition.attempt = attempt
+	versionID := restoreVersionID(actualfi.VersionID)
+	fail := func(cause error) error {
+		return er.restoreFailed(ctx, bucket, object, versionID, published, cause)
+	}
+
+	ropts := putRestoreOpts(opts.Transition.RestoreRequest, oi, opts)
 	ropts.NoLock = opts.NoLock
 	ropts.Transition = opts.Transition
 	// Rehydration copies encoded bytes without changing their content identity.
@@ -2738,35 +2749,51 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	if len(oi.Parts) == 1 && !oi.isMultipart() {
 		actualSize, err := oi.GetActualSize()
 		if err != nil {
-			return setRestoreHeaderFn(oi, err)
+			return fail(err)
 		}
 		ropts.IndexCB = func() []byte { return oi.Parts[0].Index }
 		var rs *HTTPRangeSpec
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
 		if err != nil {
-			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+			return fail(toObjectErr(err, bucket, object))
 		}
 		defer gr.Close()
 		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", actualSize)
 		if err != nil {
-			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+			return fail(toObjectErr(err, bucket, object))
 		}
 		pReader := NewPutObjReader(hashReader)
-		_, err = er.PutObject(ctx, bucket, object, pReader, ropts)
-		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+		if _, err = er.PutObject(ctx, bucket, object, pReader, ropts); err != nil {
+			return fail(toObjectErr(err, bucket, object))
+		}
+		return nil
 	}
 
-	res, err := er.NewMultipartUpload(ctx, bucket, object, ropts)
-	if err != nil {
-		return setRestoreHeaderFn(oi, err)
+	// Every server must keep the upload private, also a queued restore's.
+	if err := nativeRestoreAvailable(ctx); err != nil {
+		return fail(err)
 	}
+	// The upload records when it starts, which the stale-upload cleanup ages;
+	// completion still commits the version's own ModTime.
+	uopts := ropts
+	uopts.MTime = time.Time{}
+	res, err := er.NewMultipartUpload(ctx, bucket, object, uopts)
+	if err != nil {
+		return fail(err)
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			er.abortRestoreUpload(bucket, object, res.UploadID, attempt)
+		}
+	}()
 
 	var uploadedParts []CompletePart
 	var rs *HTTPRangeSpec
 	// get reader from the warm backend - note that even in the case of encrypted objects, this stream is still encrypted.
 	gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
 	if err != nil {
-		return setRestoreHeaderFn(oi, err)
+		return fail(err)
 	}
 	defer gr.Close()
 
@@ -2781,16 +2808,17 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		}
 		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", actualSize)
 		if err != nil {
-			return setRestoreHeaderFn(oi, err)
+			return fail(err)
 		}
 		pInfo, err := er.PutObjectPart(ctx, bucket, object, res.UploadID, partInfo.Number, NewPutObjReader(hr), ObjectOptions{
-			IndexCB: func() []byte { return partInfo.Index },
+			IndexCB:    func() []byte { return partInfo.Index },
+			Transition: TransitionOptions{attempt: attempt},
 		})
 		if err != nil {
-			return setRestoreHeaderFn(oi, err)
+			return fail(err)
 		}
 		if pInfo.Size != partInfo.Size {
-			return setRestoreHeaderFn(oi, InvalidObjectState{Bucket: bucket, Object: object})
+			return fail(InvalidObjectState{Bucket: bucket, Object: object})
 		}
 		uploadedParts = append(uploadedParts, CompletePart{
 			PartNumber: pInfo.PartNumber,
@@ -2804,7 +2832,11 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		VersionSuspended: opts.VersionSuspended,
 		Transition:       opts.Transition,
 	})
-	return setRestoreHeaderFn(oi, err)
+	if err != nil {
+		return fail(err)
+	}
+	completed = true
+	return nil
 }
 
 // DecomTieredObject - moves tiered object to another pool during decommissioning.

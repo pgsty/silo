@@ -177,6 +177,10 @@ type TransitionOptions struct {
 	RestoreRequest *RestoreObjectRequest
 	RestoreExpiry  time.Time
 	ExpireRestored bool
+
+	// attempt is the native restore a call belongs to. Only that restore
+	// sees its private upload, see restoreUploadVisible.
+	attempt *restoreAttempt
 }
 
 // MakeBucketOptions represents bucket options for ObjectLayer bucket operations
@@ -295,6 +299,8 @@ type ObjectLayer interface {
 	DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error)
 	TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error
 	RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error
+	// restoreRequest records a POST restore on a version, see erasureServerPools.
+	restoreRequest(ctx context.Context, bucket, object string, opts ObjectOptions, target ObjectInfo) (restoreRequestStatus, error)
 
 	// Multipart operations.
 	ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error)

@@ -373,6 +373,13 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 	if err != nil {
 		return result, err
 	}
+	// The restore fields fence native restores and restored-copy cleanup.
+	// Heal copies them only as a quorum of the drives holds them; while the
+	// drives disagree, it waits rather than create a quorum for one side.
+	latestMeta, err = restoreHealMeta(partsMetadata, latestMeta, max(len(storageDisks)/2+1, readQuorum))
+	if err != nil {
+		return result, toObjectErr(err, bucket, object, versionID)
+	}
 
 	// No modtime quorum
 	filterDisksByETag := quorumETag != ""
