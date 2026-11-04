@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -471,6 +472,11 @@ func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toD
 		})
 
 		for i, dobj := range deletedObjs {
+			if errors.Is(errs[i], errLifecycleNotApplicable) {
+				// The recheck kept this version. Do not audit or announce a
+				// removal that did not happen; the next scan re-evaluates it.
+				continue
+			}
 			oi := ObjectInfo{
 				Bucket:    bucket,
 				Name:      dobj.ObjectName,

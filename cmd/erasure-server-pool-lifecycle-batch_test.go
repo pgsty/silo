@@ -23,9 +23,12 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/bucket/versioning"
+	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/pubsub"
 )
 
 // Reuse the author's scanner/worker fixture. A second configured pool is
@@ -210,5 +213,58 @@ func TestPoolsLifecycleTieredBatchIdentity(t *testing.T) {
 				t.Fatalf("gone=%t err=%v, want gone=%t", gone, err, tc.wantGone)
 			}
 		})
+	}
+}
+
+// A batch entry whose expiry the all-pools recheck rejects is kept. The worker
+// must not report it as removed, by event, ILM trace or audit, while eligible
+// entries of the same batch are still reported.
+func TestPoolsLifecycleBatchRejectionNotAnnounced(t *testing.T) {
+	s := newSplitILM(t, versioning.Enabled, splitILMRules)
+	const key = "nnv-announce"
+	for _, v := range []splitVersion{splitTiered("v1", 5, 0), splitTiered("v2", 4, 0), splitTiered("v3", 3, 0), splitAt("v4", 2, 0)} {
+		s.write(key, v)
+	}
+	eligible, retained := s.ids[key+" v1"], s.ids[key+" v3"]
+	done := make(chan struct{})
+	defer close(done)
+	events := make(chan event.Event, 8)
+	if err := globalHTTPListen.Subscribe(pubsub.MaskFromMaskable(event.ObjectRemovedDelete), events, done, nil); err != nil {
+		t.Fatal(err)
+	}
+	traces := make(chan madmin.TraceInfo, 8)
+	if err := globalTrace.Subscribe(madmin.TraceILM, traces, done, nil); err != nil {
+		t.Fatal(err)
+	}
+	result := &lifecycleBatchResult{ObjectLayer: s.z}
+	deleteObjectVersions(t.Context(), result, s.bucket, []ObjectToDelete{
+		{ObjectV: ObjectV{ObjectName: key, VersionID: eligible}},
+		{ObjectV: ObjectV{ObjectName: key, VersionID: retained}},
+	}, []lifecycle.Event{{Action: lifecycle.DeleteVersionAction}, {Action: lifecycle.DeleteVersionAction}})
+	if result.errs[0] != nil || !errors.Is(result.errs[1], errLifecycleNotApplicable) {
+		t.Fatalf("fixture results: eligible=%v retained=%v", result.errs[0], result.errs[1])
+	}
+	if _, err := s.z.GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: retained, Versioned: true}); err != nil {
+		t.Fatalf("rejected version must remain: %v", err)
+	}
+	// Both publishers deliver synchronously, so everything sent is buffered.
+	var notified, traced []string
+	for drained := false; !drained; {
+		select {
+		case ev := <-events:
+			notified = append(notified, ev.S3.Object.VersionID)
+		case tr := <-traces:
+			if tr.FuncName == ILMExpiry {
+				traced = append(traced, tr.Custom["version-id"])
+			}
+		default:
+			drained = true
+		}
+	}
+	if len(notified) != 1 || notified[0] != eligible {
+		t.Errorf("removal events for %v, want only eligible %s (retained %s)", notified, eligible, retained)
+	}
+	if len(traced) != 1 || traced[0] != eligible {
+		t.Errorf("ILM expiry traces for %v, want only eligible %s (retained %s)", traced, eligible, retained)
 	}
 }
