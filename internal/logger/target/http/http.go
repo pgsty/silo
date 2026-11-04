@@ -196,8 +196,6 @@ func (h *Target) Init(ctx context.Context) (err error) {
 func (h *Target) initDiskStore(ctx context.Context) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	h.storeCtxCancel = cancel
-	h.lastStarted = time.Now()
-	go h.startQueueProcessor(ctx, true)
 
 	queueStore := store.NewQueueStore[any](
 		filepath.Join(h.config.QueueDir, h.Name()),
@@ -206,10 +204,14 @@ func (h *Target) initDiskStore(ctx context.Context) (err error) {
 	)
 
 	if err := queueStore.Open(); err != nil {
+		cancel()
 		return fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
 	}
 
 	h.store = queueStore
+	// The writer may immediately consume entries migrated from an old target.
+	h.lastStarted = time.Now()
+	go h.startQueueProcessor(ctx, true)
 	store.StreamItems(h.store, h, ctx.Done(), h.config.LogOnceIf)
 
 	return nil
@@ -627,6 +629,25 @@ func (h *Target) Cancel() {
 	// and finish the existing ones.
 	// All future ones will be discarded.
 	h.logChMu.Lock()
+	// Hand entries that no worker drained to the replacement, for example
+	// when the queue store never opened and no worker was started.
+	logChLock.Lock()
+	if migrateBuffer, ok := logChBuffers[h.Name()]; ok {
+	drain:
+		for {
+			select {
+			case v := <-h.logCh:
+				select {
+				case migrateBuffer <- v:
+				default:
+					break drain
+				}
+			default:
+				break drain
+			}
+		}
+	}
+	logChLock.Unlock()
 	xioutil.SafeClose(h.logCh)
 	h.logCh = nil
 	h.logChMu.Unlock()

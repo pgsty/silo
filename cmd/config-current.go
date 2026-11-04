@@ -609,7 +609,8 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			}
 			loggerCfg.HTTP[n] = l
 		}
-		if errs := logger.UpdateHTTPWebhooks(ctx, loggerCfg.HTTP); len(errs) > 0 {
+		// Webhook workers outlive the bounded configuration reload.
+		if errs := logger.UpdateHTTPWebhooks(GlobalContext, loggerCfg.HTTP); len(errs) > 0 {
 			configLogIf(ctx, fmt.Errorf("Unable to update logger webhook config: %v", errs))
 		}
 	case config.AuditWebhookSubSys:
@@ -627,7 +628,8 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			loggerCfg.AuditWebhook[n] = l
 		}
 
-		if errs := logger.UpdateAuditWebhooks(ctx, loggerCfg.AuditWebhook); len(errs) > 0 {
+		// Both the queue worker and disk replay follow the server lifetime.
+		if errs := logger.UpdateAuditWebhooks(GlobalContext, loggerCfg.AuditWebhook); len(errs) > 0 {
 			configLogIf(ctx, fmt.Errorf("Unable to update audit webhook targets: %v", errs))
 		}
 	case config.AuditKafkaSubSys:
@@ -644,7 +646,8 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 				loggerCfg.AuditKafka[n] = l
 			}
 		}
-		if errs := logger.UpdateAuditKafkaTargets(ctx, loggerCfg); len(errs) > 0 {
+		// The Kafka disk replay follows the server lifetime as well.
+		if errs := logger.UpdateAuditKafkaTargets(GlobalContext, loggerCfg); len(errs) > 0 {
 			configLogIf(ctx, fmt.Errorf("Unable to update audit kafka targets: %v", errs))
 		}
 	case config.StorageClassSubSys:
