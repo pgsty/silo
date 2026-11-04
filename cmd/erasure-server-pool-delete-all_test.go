@@ -332,8 +332,9 @@ func (p *purgeTest) matched(name string) expireObjInfo {
 	return expireObjInfo{ObjectInfo: oi, ExpireAll: true, DeleteMarkerCount: markers}
 }
 
-// batch runs the deletes of a batch expiration job for walked, the keys its
-// walk matched, and returns the counts of the job.
+// batch runs the deletes of a batch expiration job of the root user for
+// walked, the keys its walk matched, as one batch of a walk that reached its
+// end, and returns the counts of the job.
 func (p *purgeTest) batch(walked ...expireObjInfo) *batchJobInfo {
 	p.t.Helper()
 	globalBatchJobsMetrics.Lock()
@@ -341,7 +342,11 @@ func (p *purgeTest) batch(walked ...expireObjInfo) *batchJobInfo {
 		globalBatchJobsMetrics.metrics = make(map[string]*batchJobInfo)
 	}
 	globalBatchJobsMetrics.Unlock()
-	job := BatchJobRequest{ID: "purge-" + mustGetUUID(), Started: time.Now(), Expire: &BatchJobExpire{Bucket: p.bucket}}
+	sub, err := newBatchJobSubmitter(globalActiveCred)
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	job := BatchJobRequest{ID: "purge-" + mustGetUUID(), Started: time.Now(), Submitter: sub, Expire: &BatchJobExpire{Bucket: p.bucket}}
 	ri := &batchJobInfo{JobID: job.ID}
 	wk, err := workers.New(1)
 	if err != nil {
@@ -350,7 +355,8 @@ func (p *purgeTest) batch(walked ...expireObjInfo) *batchJobInfo {
 	ch := make(chan []expireObjInfo, 1)
 	ch <- walked
 	close(ch)
-	batchObjsForDelete(p.t.Context(), job.Expire, ri, job, p.z, wk, ch)
+	refuse := func(err error) { p.t.Errorf("batch job refused: %v", err) }
+	batchObjsForDelete(p.t.Context(), refuse, func() bool { return true }, job.Expire, ri, job, p.z, wk, ch)
 	wk.Wait()
 	return ri
 }
@@ -837,8 +843,8 @@ func TestPurgeAllVersionsKeepsProtectedWrites(t *testing.T) {
 			t.Errorf("%s holds %v, want both versions", name, got)
 		}
 	}
-	if ri.Objects != 2 || ri.ObjectsFailed == 0 {
-		t.Errorf("job counts objects=%d failed=%d, want 2 and the refusals", ri.Objects, ri.ObjectsFailed)
+	if ri.Objects != 2 || ri.KeysRefused != 3 || ri.ObjectsFailed != 0 {
+		t.Errorf("job counts objects=%d refused=%d failed=%d, want 2, 3 and 0", ri.Objects, ri.KeysRefused, ri.ObjectsFailed)
 	}
 }
 

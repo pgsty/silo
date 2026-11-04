@@ -149,7 +149,11 @@ func TestPurgeAllVersionsBudgetCoversReads(t *testing.T) {
 // A marker that an expiration job failed to remove fails the job.
 func TestPurgeAllVersionsMarkerFailureFailsJob(t *testing.T) {
 	ri := &batchJobInfo{}
-	ri.trackExpireAll(expireObjInfo{ObjectInfo: ObjectInfo{NumVersions: 2}, DeleteMarkerCount: 1}, 1, 0, true)
+	var res batchCounts
+	res.expireAllFailed(expireObjInfo{ObjectInfo: ObjectInfo{Name: "key", NumVersions: 2}, DeleteMarkerCount: 1}, 1, 0)
+	progress := newBatchProgress(ri, "bucket")
+	progress.done(progress.begin(), "key", res)
+	progress.finish()
 	if ri.ObjectsFailed != 0 || ri.DeleteMarkersFailed != 1 || !ri.expireFailures() {
 		t.Errorf("failed=%d/%d failures=%t", ri.ObjectsFailed, ri.DeleteMarkersFailed, ri.expireFailures())
 	}

@@ -35,6 +35,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/pgsty/silo-pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/pgsty/silo-pkg/v3/workers"
 )
 
@@ -161,8 +162,68 @@ func (r BatchJobKeyRotateV1) Notify(ctx context.Context, ri *batchJobInfo) error
 	return notifyEndpoint(ctx, ri, r.Flags.Notify.Endpoint, r.Flags.Notify.Token)
 }
 
-// KeyRotate rotates encryption key of an object
-func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, objInfo ObjectInfo) error {
+// batchAuthoritativeVersion returns the version obj as all its copies
+// describe it. With several pools a version can have copies in more than one
+// pool, and a read returns one of them; the merged copy carries the newest
+// Object Lock and tag state. The caller holds the object's write lock.
+func batchAuthoritativeVersion(ctx context.Context, api ObjectLayer, bucket, object string, obj ObjectInfo) (ObjectInfo, error) {
+	z, ok := api.(*erasureServerPools)
+	if !ok || z.SinglePool() {
+		return obj, nil
+	}
+	versionID := obj.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	return z.replicaObjectInfo(ctx, bucket, encodeDirObject(object), ObjectOptions{VersionID: versionID, NoLock: true, NoAuditLog: true})
+}
+
+// batchAuthoritativeRead is batchAuthoritativeVersion for a version that has
+// been opened for reading. It takes the object's read lock itself, since an
+// opened reader may hold none.
+func batchAuthoritativeRead(ctx context.Context, api ObjectLayer, bucket, object string, obj ObjectInfo) (ObjectInfo, error) {
+	z, ok := api.(*erasureServerPools)
+	if !ok || z.SinglePool() {
+		return obj, nil
+	}
+	lk := z.NewNSLock(bucket, encodeDirObject(object))
+	lkctx, err := lk.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer lk.RUnlock(lkctx)
+	return batchAuthoritativeVersion(lkctx.Context(), api, bucket, object, obj)
+}
+
+// rotateAuthzRequests are the actions of rotating one version: it is read and
+// written again in place with the new key.
+func (r *BatchJobKeyRotateV1) rotateAuthzRequests(oi ObjectInfo) []batchAuthzRequest {
+	versionID := oi.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	// The encryption the rewrite leaves: rotation keeps the kind of the
+	// version (rotateKey), and SSE-KMS takes the requested key.
+	values := map[string][]string{}
+	switch {
+	case crypto.S3KMS.IsEncrypted(oi.UserDefined):
+		values[strings.ToLower(xhttp.AmzServerSideEncryption)] = []string{xhttp.AmzEncryptionKMS}
+		if r.Encryption.Type == ssekms && r.Encryption.Key != "" {
+			values[strings.ToLower(xhttp.AmzServerSideEncryptionKmsID)] = []string{r.Encryption.Key}
+		}
+	case crypto.S3.IsEncrypted(oi.UserDefined):
+		values[strings.ToLower(xhttp.AmzServerSideEncryption)] = []string{xhttp.AmzEncryptionAES}
+	}
+	return []batchAuthzRequest{
+		{action: policy.GetObjectAction, bucket: r.Bucket, object: oi.Name, versionID: versionID, tags: oi.UserTags},
+		{action: policy.GetObjectVersionAction, bucket: r.Bucket, object: oi.Name, versionID: versionID, tags: oi.UserTags},
+		{action: policy.PutObjectAction, bucket: r.Bucket, object: oi.Name, versionID: versionID, tags: oi.UserTags, values: values},
+	}
+}
+
+// KeyRotate rotates encryption key of an object. A version that Object Lock
+// protects is not rewritten: it returns ObjectLocked.
+func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, objInfo ObjectInfo, sub *batchJobSubmitter) error {
 	srcBucket := r.Bucket
 	srcObject := objInfo.Name
 
@@ -180,7 +241,8 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	versioned := globalBucketVersioningSys.PrefixEnabled(srcBucket, srcObject)
 	versionSuspended := globalBucketVersioningSys.PrefixSuspended(srcBucket, srcObject)
 
-	lock := api.NewObjectNSLock(r.Bucket, objInfo.Name)
+	// Lock the name writers lock: the stored name of a directory object.
+	lock := api.NewObjectNSLock(r.Bucket, encodeDirObject(objInfo.Name))
 	lkctx, err := lock.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return err
@@ -197,6 +259,24 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	obj, err := api.GetObjectInfo(ctx, r.Bucket, objInfo.Name, opts)
 	if err != nil {
 		return err
+	}
+	// Decide on the version as it is under the lock that the rewrite holds,
+	// before any key is requested, with the metadata of all its copies.
+	logical, err := batchAuthoritativeVersion(ctx, api, r.Bucket, objInfo.Name, obj)
+	if err != nil {
+		return err
+	}
+	if enforceRetentionForDeletion(ctx, logical) {
+		return ObjectLocked{Bucket: r.Bucket, Object: obj.Name, VersionID: obj.VersionID}
+	}
+	p, err := sub.principal(ctx)
+	if err != nil {
+		return err
+	}
+	for _, req := range r.rotateAuthzRequests(logical) {
+		if err := p.authorize(req); err != nil {
+			return err
+		}
 	}
 	oi := obj.Clone()
 	var (
@@ -260,6 +340,9 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	if ri.Complete {
 		return nil
 	}
+	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
+		return err
+	}
 
 	globalBatchJobsMetrics.save(job.ID, ri)
 	lastObject := ri.Object
@@ -272,8 +355,6 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	if delay <= 0 {
 		delay = batchKeyRotateJobDefaultRetryDelay
 	}
-
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	selectObj := func(info FileInfo) (ok bool) {
 		if r.Flags.Filter.OlderThan > 0 && time.Since(info.ModTime) < r.Flags.Filter.OlderThan {
@@ -355,65 +436,92 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		return err
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancelCause := context.WithCancelCause(ctx)
+	defer cancelCause(nil)
+	// refuse ends the job for its submitter: record why before stopping.
+	refuse := func(err error) {
+		ri.refuse(err)
+		cancelCause(err)
+	}
+	progress := newBatchProgress(ri, r.Bucket)
 
 	results := make(chan itemOrErr[ObjectInfo], 100)
 	if err := api.Walk(ctx, r.Bucket, r.Prefix, results, WalkOptions{
 		Marker: lastObject,
 		Filter: selectObj,
 	}); err != nil {
-		cancel()
 		// Do not need to retry if we can't list objects on source.
 		return err
 	}
 	failed := false
 	for res := range results {
+		if context.Cause(ctx) != nil {
+			// Refused or canceled: schedule nothing more.
+			continue
+		}
 		if res.Err != nil {
 			failed = true
 			batchLogIf(ctx, res.Err)
 			break
 		}
 		result := res.Item
+		if !batchResumeAfter(lastObject, result.Name) {
+			// Completed by the run that set the cursor.
+			continue
+		}
 		sseKMS := crypto.S3KMS.IsEncrypted(result.UserDefined)
 		sseS3 := crypto.S3.IsEncrypted(result.UserDefined)
 		if !sseKMS && !sseS3 { // neither sse-s3 nor sse-kms disallowed
 			continue
 		}
+		seq := progress.begin()
 		wk.Take()
 		go func() {
 			defer wk.Give()
+			var counts batchCounts
 			for attempts := 1; attempts <= retryAttempts; attempts++ {
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricKeyRotation, job.ID, attempts)
-				success := true
-				if err := r.KeyRotate(ctx, api, result); err != nil {
-					stopFn(result, err)
-					batchLogIf(ctx, err)
-					success = false
-					if attempts >= retryAttempts {
-						auditOptions := AuditLogOptions{
-							Event:     "KeyRotate",
-							APIName:   "StartBatchJob",
-							Bucket:    result.Bucket,
-							Object:    result.Name,
-							VersionID: result.VersionID,
-							Error:     err.Error(),
-						}
-						auditLogInternal(ctx, auditOptions)
-					}
-				} else {
-					stopFn(result, nil)
+				err := r.KeyRotate(ctx, api, result, job.Submitter)
+				stopFn(result, err)
+				if err == nil {
+					counts.objects = 1
+					break
 				}
-				ri.trackCurrentBucketObject(r.Bucket, result, success, attempts)
-				globalBatchJobsMetrics.save(job.ID, ri)
-				// persist in-memory state to disk after every 10secs.
-				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
-				if success {
+				if isBatchJobAuthzError(err) {
+					refuse(err)
+					return
+				}
+				if isErrObjectLocked(err) {
+					// Left as it is, not retried and not a failure.
+					counts.versionsSkipped = 1
+					break
+				}
+				if ctx.Err() != nil {
+					// Not done; a later run rotates it.
+					return
+				}
+				batchLogIf(ctx, err)
+				if attempts >= retryAttempts {
+					auditOptions := AuditLogOptions{
+						Event:     "KeyRotate",
+						APIName:   "StartBatchJob",
+						Bucket:    result.Bucket,
+						Object:    result.Name,
+						VersionID: result.VersionID,
+						Error:     err.Error(),
+					}
+					auditLogInternal(ctx, auditOptions)
+					counts.objectsFailed = 1
 					break
 				}
 				if delay > 0 {
-					time.Sleep(delay + time.Duration(rnd.Float64()*float64(delay)))
+					time.Sleep(delay + time.Duration(rand.Float64()*float64(delay)))
 				}
 			}
+			progress.done(seq, result.Name, counts)
+			globalBatchJobsMetrics.save(job.ID, ri)
+			// persist in-memory state to disk after every 10secs.
+			batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
 
 			if wait := globalBatchConfig.KeyRotationWait(); wait > 0 {
 				time.Sleep(wait)
@@ -421,18 +529,31 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		}()
 	}
 	wk.Wait()
-
-	ri.Complete = !failed && ri.ObjectsFailed == 0
-	ri.Failed = failed || ri.ObjectsFailed > 0
-	globalBatchJobsMetrics.save(job.ID, ri)
-	// persist in-memory state to disk.
-	batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
-
-	if err := r.Notify(ctx, ri); err != nil {
-		batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
+	cause := context.Cause(ctx)
+	if !failed && cause == nil {
+		// The walk ended: its last key is done.
+		progress.finish()
+	}
+	if cause != nil && !ri.refused() {
+		// Stopped before the end: keep the work after the cursor pending.
+		globalBatchJobsMetrics.save(job.ID, ri)
+		batchLogIf(ctx, ri.updateAfter(GlobalContext, api, 0, job))
+		return cause
 	}
 
-	cancel()
+	if !ri.refused() {
+		ri.mu.Lock()
+		ri.Complete = !failed && ri.ObjectsFailed == 0
+		ri.Failed = failed || ri.ObjectsFailed > 0
+		ri.mu.Unlock()
+	}
+	globalBatchJobsMetrics.save(job.ID, ri)
+	// persist in-memory state to disk.
+	batchLogIf(ctx, ri.updateAfter(GlobalContext, api, 0, job))
+
+	if err := r.Notify(GlobalContext, ri); err != nil {
+		batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
+	}
 	return nil
 }
 

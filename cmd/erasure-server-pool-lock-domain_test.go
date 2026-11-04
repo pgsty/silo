@@ -1013,9 +1013,13 @@ func TestLockDomainKeyRotationWaitsForWriter(t *testing.T) {
 			// The rotation's listing found an SSE-S3 object; it reads it again
 			// under the lock.
 			listed := ObjectInfo{Bucket: bucket, Name: key, UserDefined: map[string]string{crypto.MetaSealedKeyS3: "listed"}}
+			sub, err := newBatchJobSubmitter(globalActiveCred)
+			if err != nil {
+				t.Fatal(err)
+			}
 			waited, _, _ := ldOverlapRun(t,
 				func(ctx context.Context) error { return ldPut(ctx, z, bucket, key, "written") },
-				func(ctx context.Context) error { return job.KeyRotate(ctx, z, listed) })
+				func(ctx context.Context) error { return job.KeyRotate(ctx, z, listed, sub) })
 			if !waited {
 				t.Errorf("key rotation ran while a PUT held its commit")
 			}
