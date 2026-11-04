@@ -28,10 +28,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config/storageclass"
 )
 
@@ -1318,20 +1323,20 @@ func (d stagedDataGoneDisk) RenameData(ctx context.Context, srcVolume, srcPath s
 // of a write right before RenameData, as when the caller has already given up
 // and removed it. It returns a function that restores the drives.
 func stagedDataGoneDisks(z *erasureServerPools) func() {
-	xl := z.serverPools[0].sets[0]
-	getDisks := xl.getDisks
-	disks := getDisks()
-	wrapped := make([]StorageAPI, len(disks))
+	// Swap the drives behind the set's getDisks under the mutex that
+	// getDisks takes, so that background readers do not race the swap.
+	sets := z.serverPools[0]
+	sets.erasureDisksMu.Lock()
+	disks := sets.erasureDisks[0]
+	original := slices.Clone(disks)
 	for i, disk := range disks {
-		wrapped[i] = stagedDataGoneDisk{StorageAPI: disk}
+		disks[i] = stagedDataGoneDisk{StorageAPI: disk}
 	}
-	z.serverPools[0].erasureDisksMu.Lock()
-	xl.getDisks = func() []StorageAPI { return wrapped }
-	z.serverPools[0].erasureDisksMu.Unlock()
+	sets.erasureDisksMu.Unlock()
 	return func() {
-		z.serverPools[0].erasureDisksMu.Lock()
-		xl.getDisks = getDisks
-		z.serverPools[0].erasureDisksMu.Unlock()
+		sets.erasureDisksMu.Lock()
+		copy(sets.erasureDisks[0], original)
+		sets.erasureDisksMu.Unlock()
 	}
 }
 
@@ -1426,5 +1431,123 @@ func TestRenameDataStagedDataGoneKeepsExistingObject(t *testing.T) {
 	}
 	if !bytes.Equal(buf.Bytes(), body) {
 		t.Error("existing object content changed")
+	}
+}
+
+// A failed RenameData that runs late removes its object directory while it is
+// empty. When it does so on a drive between the directory creation and the
+// rename of another write of the same key, that write must create the
+// directory again and succeed instead of failing on the drive.
+func TestRenameDataSurvivesConcurrentEmptyDirCleanup(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip("directory creation is not traced on Windows")
+	}
+	for _, tc := range []struct {
+		name      string
+		size      int
+		multipart bool
+	}{
+		{"put", 8 << 20, false},
+		{"inline_put", 1 << 10, false},
+		{"multipart", 8 << 20, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			obj, dirs, err := prepareErasure16(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer obj.Shutdown(context.Background())
+			defer removeRoots(dirs)
+			z := obj.(*erasureServerPools)
+			const bucket, object = "bucket", "day=1/b=9/object"
+			if err := z.MakeBucket(ctx, bucket, MakeBucketOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			body := bytes.Repeat([]byte{'a'}, tc.size)
+			var uploadID, etag string
+			if tc.multipart {
+				res, err := z.NewMultipartUpload(ctx, bucket, object, ObjectOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pi, err := z.PutObjectPart(ctx, bucket, object, res.UploadID, 1, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				uploadID, etag = res.UploadID, pi.ETag
+			}
+
+			drives := make(map[string]*xlStorage)
+			for _, disk := range z.serverPools[0].sets[0].getDisks() {
+				s := disk.(*xlStorageDiskIDCheck).storage
+				drives[filepath.Join(s.drivePath, bucket, filepath.FromSlash(object))] = s
+			}
+			var mu sync.Mutex
+			hit := make(map[string]bool)
+			var hits atomic.Int32
+			var lateErrs []error
+			traceOSCalls(t, func(tr madmin.TraceInfo) {
+				if tr.FuncName != "os.Mkdir" || tr.Error != "" {
+					return
+				}
+				s := drives[tr.Path]
+				if s == nil {
+					return
+				}
+				mu.Lock()
+				first := !hit[tr.Path]
+				hit[tr.Path] = true
+				mu.Unlock()
+				if !first {
+					return
+				}
+				// The write has just created the object directory on this
+				// drive. A late RenameData of the same key, whose staged data
+				// is gone, fails now and removes the empty directory.
+				fi := newFileInfo(object, 8, 8)
+				fi.DataDir, fi.VersionID = mustGetUUID(), mustGetUUID()
+				fi.Erasure.Index = 1
+				fi.ModTime = time.Now().UTC()
+				fi.Size = 1
+				fi.AddObjectPart(1, "", 1, 1, fi.ModTime, nil, nil)
+				_, err := s.RenameData(context.Background(), minioMetaTmpBucket, mustGetUUID(), fi, bucket, object, RenameOptions{})
+				if _, serr := os.Stat(tr.Path); !os.IsNotExist(serr) {
+					err = fmt.Errorf("late RenameData left %s (%v, rename error %v)", tr.Path, serr, err)
+				} else if errors.Is(err, errFileNotFound) {
+					err = nil
+				}
+				mu.Lock()
+				if err != nil {
+					lateErrs = append(lateErrs, err)
+				}
+				mu.Unlock()
+				hits.Add(1)
+			})
+
+			if tc.multipart {
+				_, err = z.CompleteMultipartUpload(ctx, bucket, object, uploadID, []CompletePart{{PartNumber: 1, ETag: etag}}, ObjectOptions{})
+			} else {
+				_, err = z.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(body), int64(len(body)), "", ""), ObjectOptions{})
+			}
+			if n := hits.Load(); n != int32(len(dirs)) {
+				t.Fatalf("late cleanup ran on %d drives, want %d", n, len(dirs))
+			}
+			mu.Lock()
+			for _, lateErr := range lateErrs {
+				t.Error(lateErr)
+			}
+			mu.Unlock()
+			if err != nil {
+				t.Fatalf("write failed after a concurrent cleanup: %v", err)
+			}
+			var buf bytes.Buffer
+			if err := GetObject(ctx, z, bucket, object, 0, int64(len(body)), &buf, "", ObjectOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(buf.Bytes(), body) {
+				t.Fatal("object content differs")
+			}
+		})
 	}
 }

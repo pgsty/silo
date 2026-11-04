@@ -142,32 +142,37 @@ func renameAll(srcFilePath, dstFilePath, baseDir string) (err error) {
 		return err
 	}
 
-	if err = reliableRename(srcFilePath, dstFilePath, baseDir); err != nil {
-		switch {
-		case isSysErrNotDir(err) && !osIsNotExist(err):
-			// Windows can have both isSysErrNotDir(err) and osIsNotExist(err) returning
-			// true if the source file path contains an non-existent directory. In that case,
-			// we want to return errFileNotFound instead, which will honored in subsequent
-			// switch cases
-			return errFileAccessDenied
-		case isSysErrPathNotFound(err):
-			// This is a special case should be handled only for
-			// windows, because windows API does not return "not a
-			// directory" error message. Handle this specifically here.
-			return errFileAccessDenied
-		case isSysErrCrossDevice(err):
-			return fmt.Errorf("%w (%s)->(%s)", errCrossDeviceLink, srcFilePath, dstFilePath)
-		case osIsNotExist(err):
-			return errFileNotFound
-		case osIsExist(err):
-			// This is returned only when destination is a directory and we
-			// are attempting a rename from file to directory.
-			return errIsNotRegular
-		default:
-			return err
-		}
+	return renameAllErr(reliableRename(srcFilePath, dstFilePath, baseDir), srcFilePath, dstFilePath)
+}
+
+// renameAllErr converts an error of reliableRename into the error that
+// renameAll returns.
+func renameAllErr(err error, srcFilePath, dstFilePath string) error {
+	switch {
+	case err == nil:
+		return nil
+	case isSysErrNotDir(err) && !osIsNotExist(err):
+		// Windows can have both isSysErrNotDir(err) and osIsNotExist(err) returning
+		// true if the source file path contains an non-existent directory. In that case,
+		// we want to return errFileNotFound instead, which will honored in subsequent
+		// switch cases
+		return errFileAccessDenied
+	case isSysErrPathNotFound(err):
+		// This is a special case should be handled only for
+		// windows, because windows API does not return "not a
+		// directory" error message. Handle this specifically here.
+		return errFileAccessDenied
+	case isSysErrCrossDevice(err):
+		return fmt.Errorf("%w (%s)->(%s)", errCrossDeviceLink, srcFilePath, dstFilePath)
+	case osIsNotExist(err):
+		return errFileNotFound
+	case osIsExist(err):
+		// This is returned only when destination is a directory and we
+		// are attempting a rename from file to directory.
+		return errIsNotRegular
+	default:
+		return err
 	}
-	return nil
 }
 
 // Reliably retries os.RenameAll if for some reason os.RenameAll returns
