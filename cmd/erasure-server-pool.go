@@ -1277,6 +1277,15 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return z.deleteAllVersions(ctx, bucket, object, opts)
 	}
 
+	// A delete marker that names a version replaces that version in
+	// whichever pool holds it.
+	if opts.RefuseLockedOverwrite && opts.DeleteMarker && opts.VersionID != "" && !z.SinglePool() {
+		goi, gerr := z.replicaObjectInfo(ctx, bucket, object, ObjectOptions{VersionID: opts.VersionID, NoLock: true, NoAuditLog: true})
+		if err := refuseLockedMarkerOverwrite(ctx, bucket, object, opts.VersionID, goi, gerr); err != nil {
+			return ObjectInfo{Name: decodeDirObject(object), VersionID: opts.VersionID}, err
+		}
+	}
+
 	// An ILM expiry is decided on the versions in one pool. Under the lock,
 	// check it with the versions in all pools; the sets then take it as
 	// decided, without a recheck by the versions each one holds. They only

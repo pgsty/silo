@@ -117,6 +117,12 @@ type ObjectOptions struct {
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn
 
+	// RefuseLockedOverwrite refuses, under the destination's write lock, a
+	// write that would replace a stored version Object Lock protects: the
+	// version it writes, or the version a delete marker it writes names.
+	// It returns ObjectLocked. Set by batch replication pulls.
+	RefuseLockedOverwrite bool
+
 	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
 	// Use the maximum parity (N/2), used when saving server configuration files

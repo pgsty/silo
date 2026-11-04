@@ -291,6 +291,53 @@ func checkObjectLockedForOverwrite(ctx context.Context, bucket, object string, g
 	return nil
 }
 
+// checkVersionLockedForOverwrite re-checks under the object write lock
+// whether a write would replace the stored version versionID (the null
+// version if empty) while Object Lock protects it. It reads the version's own
+// metadata, whatever the bucket configuration, and a failed read is an error.
+func checkVersionLockedForOverwrite(ctx context.Context, bucket, object, versionID string, getObjectInfoFn GetObjectInfoFn, transition TransitionOptions) error {
+	if isMinioMetaBucketName(bucket) {
+		return nil
+	}
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	objInfo, err := getObjectInfoFn(ctx, bucket, object, ObjectOptions{
+		VersionID:  versionID,
+		Transition: transition,
+		NoLock:     true,
+		NoAuditLog: true,
+	})
+	if err != nil {
+		// A delete marker is not protected.
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) || errors.As(err, &MethodNotAllowed{}) {
+			return nil
+		}
+		return err
+	}
+	if enforceRetentionForDeletion(ctx, objInfo) {
+		return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
+	}
+	return nil
+}
+
+// refuseLockedMarkerOverwrite refuses a delete marker write that would replace
+// the stored version it names while Object Lock protects it. goi and gerr are
+// that version as read under the write lock. A new marker, or one replacing a
+// marker, is allowed.
+func refuseLockedMarkerOverwrite(ctx context.Context, bucket, object, versionID string, goi ObjectInfo, gerr error) error {
+	if gerr != nil {
+		if isErrObjectNotFound(gerr) || isErrVersionNotFound(gerr) || errors.As(gerr, &MethodNotAllowed{}) {
+			return nil
+		}
+		return gerr
+	}
+	if enforceRetentionForDeletion(ctx, goi) {
+		return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
+	}
+	return nil
+}
+
 // checkPutObjectLockAllowed enforces object retention policy and legal hold policy
 // for requests with WORM headers
 // See https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lock-managing.html for the spec.
