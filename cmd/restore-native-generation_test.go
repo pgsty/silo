@@ -369,7 +369,7 @@ func TestRestoreUploadUnreadableFailsClosed(t *testing.T) {
 			if mode == "stale" {
 				select {
 				case <-gate.entered:
-				case <-time.After(10 * time.Second):
+				case <-time.After(restoreTestWait):
 					t.Fatal("restore never reached completion")
 				}
 			} else {
@@ -701,7 +701,7 @@ func testRestoreUploadStaging(t *testing.T, mode string) {
 	}
 	select {
 	case <-entered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(restoreTestWait):
 		t.Fatal("completion never staged its commit")
 	}
 	stored := restoreIsolationUploads(t, r, 0)
@@ -784,7 +784,7 @@ func TestRestoreSplitKeepsRunningUpload(t *testing.T) {
 	}
 	select {
 	case <-gate.entered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(restoreTestWait):
 		t.Fatal("restore never reached completion")
 	}
 	stored := restoreIsolationUploads(t, r, 0)
@@ -1277,7 +1277,7 @@ func TestCleanupStaleUploadsSkipsRunningCommit(t *testing.T) {
 	readOnce.Do(func() { close(readRelease) })
 	select {
 	case <-cleanupDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(restoreTestWait):
 		t.Fatal("stale cleanup never returned")
 	}
 	stageOnce.Do(func() { close(stageRelease) })
@@ -1403,7 +1403,7 @@ func TestCleanupStaleUploadsHoldsLockThroughRename(t *testing.T) {
 	paused.Do(func() { close(pause.release) })
 	select {
 	case <-stageEntered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(restoreTestWait):
 		t.Fatal("completion never staged after the rename ended")
 	}
 	stageOnce.Do(func() { close(stageRelease) })

@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,14 +83,21 @@ func (l *restoreIsolationLayer) RestoreTransitionedObject(ctx context.Context, b
 	return err
 }
 
+// restoreTestWait bounds how long a restore test waits for a step that does
+// real drive work: metadata writes with synchronous persistence and renames
+// on every drive. It is a liveness bound, not a latency contract; a loaded
+// machine has stalled such a step past ten seconds.
+const restoreTestWait = time.Minute
+
 // wait returns the result of the next background restore.
 func (l *restoreIsolationLayer) wait(t *testing.T) error {
 	t.Helper()
 	select {
 	case err := <-l.done:
 		return err
-	case <-time.After(10 * time.Second):
-		t.Fatal("background restore did not finish")
+	case <-time.After(restoreTestWait):
+		buf := make([]byte, 1<<20)
+		t.Fatalf("background restore did not finish in %v; goroutines:\n%s", restoreTestWait, buf[:runtime.Stack(buf, true)])
 		return nil
 	}
 }
@@ -255,7 +263,7 @@ func restoreIsolationEntered(t *testing.T, tier *restoreIsolationGateTier) {
 	t.Helper()
 	select {
 	case <-tier.entered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(restoreTestWait):
 		t.Fatal("restore never reached its download gate")
 	}
 }
@@ -1062,7 +1070,7 @@ func TestRestoreUploadOutlivesStaleAge(t *testing.T) {
 			if gated {
 				select {
 				case <-gate.entered:
-				case <-time.After(10 * time.Second):
+				case <-time.After(restoreTestWait):
 					t.Fatal("restore never reached completion")
 				}
 			} else {
