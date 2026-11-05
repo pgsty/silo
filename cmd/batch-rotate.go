@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand"
@@ -256,7 +257,7 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 		VersionSuspended: versionSuspended,
 		NoLock:           true,
 	}
-	obj, err := api.GetObjectInfo(ctx, r.Bucket, objInfo.Name, opts)
+	obj, pool, err := batchRotateRead(ctx, api, r.Bucket, objInfo.Name, opts)
 	if err != nil {
 		return err
 	}
@@ -273,9 +274,13 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	if err != nil {
 		return err
 	}
-	for _, req := range r.rotateAuthzRequests(logical) {
-		if err := p.authorize(req); err != nil {
-			return err
+	// Authorize the copy that is read and rewritten, and the version as all
+	// its copies describe it.
+	for _, v := range []ObjectInfo{obj, logical} {
+		for _, req := range r.rotateAuthzRequests(v) {
+			if err := p.authorize(req); err != nil {
+				return err
+			}
 		}
 	}
 	oi := obj.Clone()
@@ -305,16 +310,61 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	oi.metadataOnly = true
 	oi.keyRotation = true
 	maps.Copy(oi.UserDefined, encMetadata)
-	if _, err := api.CopyObject(ctx, r.Bucket, oi.Name, r.Bucket, oi.Name, oi, ObjectOptions{
-		VersionID: oi.VersionID,
-	}, ObjectOptions{
-		VersionID: oi.VersionID,
-		NoLock:    true,
-	}); err != nil {
-		return err
+	// The rewrite replaces the stored metadata with UserDefined, which a
+	// read returns without the tags and the expiry: keep them.
+	if oi.UserTags != "" {
+		oi.UserDefined[xhttp.AmzObjectTagging] = oi.UserTags
 	}
+	if !oi.Expires.IsZero() {
+		oi.UserDefined["expires"] = oi.ExpiresStr()
+	}
+	srcOpts := ObjectOptions{VersionID: oi.VersionID}
+	dstOpts := ObjectOptions{VersionID: oi.VersionID, NoLock: true}
+	if z, ok := api.(*erasureServerPools); ok && pool >= 0 {
+		// Rewrite the copy that was read and authorized. The pools layer
+		// would route the rewrite by the latest version of the key, which
+		// can be in a pool that holds another write of this version ID.
+		//
+		// Check the pool's state again where the pools layer checks it,
+		// right before the write: a move can have started since the read.
+		if z.IsSuspended(pool) || z.IsPoolRebalancing(pool) {
+			return errBatchRotateMoving
+		}
+		dstOpts.replicaObjectInfo = z.replicaObjectInfo
+		name := encodeDirObject(oi.Name)
+		_, err = z.serverPools[pool].CopyObject(ctx, r.Bucket, name, r.Bucket, name, oi, srcOpts, dstOpts)
+	} else {
+		_, err = api.CopyObject(ctx, r.Bucket, oi.Name, r.Bucket, oi.Name, oi, srcOpts, dstOpts)
+	}
+	return err
+}
 
-	return nil
+// errBatchRotateMoving: the version is read from a pool that a decommission
+// or a rebalance is moving.
+var errBatchRotateMoving = errors.New("the version is being moved to another pool; rotate it once the move is done")
+
+// batchRotateRead reads the version that a rotation rewrites, as
+// GetObjectInfo does. With several pools it also returns the pool of the
+// copy it read, otherwise -1. The caller holds the object lock.
+//
+// A copy in a pool that a decommission or a rebalance is moving is the
+// source of that move, which must not change under it, and rewriting a copy
+// in another pool would change which copy the version's metadata comes
+// from. Such a version is left to a later run (errBatchRotateMoving).
+func batchRotateRead(ctx context.Context, api ObjectLayer, bucket, object string, opts ObjectOptions) (ObjectInfo, int, error) {
+	z, ok := api.(*erasureServerPools)
+	if !ok || z.SinglePool() {
+		oi, err := api.GetObjectInfo(ctx, bucket, object, opts)
+		return oi, -1, err
+	}
+	if err := checkGetObjArgs(ctx, bucket, object); err != nil {
+		return ObjectInfo{}, -1, err
+	}
+	oi, idx, err := z.getLatestObjectInfoWithIdx(ctx, bucket, object, opts)
+	if err == nil && (z.IsSuspended(idx) || z.IsPoolRebalancing(idx)) {
+		return ObjectInfo{}, -1, errBatchRotateMoving
+	}
+	return oi, idx, err
 }
 
 const (
