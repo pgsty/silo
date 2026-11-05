@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/config/storageclass"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
@@ -373,6 +374,12 @@ func (d batchTagWriteFault) UpdateMetadata(ctx context.Context, bucket, object s
 func TestBatchExpirePurgeAuthorizesDriveRevisions(t *testing.T) {
 	resetTestGlobals()
 	t.Cleanup(resetTestGlobals)
+	// One drive of sixteen holds the failed tag write, so the read quorum of
+	// the metadata must stay below sixteen. Earlier tests can leave a
+	// storage class of parity 0 behind (newTestConfig on a single drive).
+	previous := globalStorageClass
+	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: 4}})
+	t.Cleanup(func() { globalStorageClass.Update(previous) })
 	z := purgeSinglePool(t, 16)
 	globalIAMSys.initStore(z, nil)
 	mustIAM(t, globalIAMSys.Load(t.Context(), true))
