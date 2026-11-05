@@ -56,7 +56,7 @@ func (d restoreGenerationDisk) WriteMetadata(ctx context.Context, orig, vol, pat
 	if d.write != nil && d.write.Load() && vol == d.bucket && path == d.object {
 		return errFaultyDisk
 	}
-	return d.StorageAPI.WriteMetadata(ctx, orig, vol, path, fi)
+	return d.WriteMetadata(ctx, orig, vol, path, fi)
 }
 
 func (d restoreGenerationDisk) UpdateMetadata(ctx context.Context, vol, path string, fi FileInfo, opts UpdateMetadataOpts) error {
@@ -99,7 +99,7 @@ func (d restoreGenerationOffline) WriteMetadata(ctx context.Context, orig, bucke
 	if d.fail.Load() && bucket == d.bucket && object == d.object {
 		return errFaultyDisk
 	}
-	return d.StorageAPI.WriteMetadata(ctx, orig, bucket, object, fi)
+	return d.WriteMetadata(ctx, orig, bucket, object, fi)
 }
 
 // restoreGenerationMetadata returns the version's metadata on each drive.
@@ -650,7 +650,7 @@ type restoreGenerationStageDisk struct {
 func (d restoreGenerationStageDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (RenameDataResp, error) {
 	if srcVolume == minioMetaMultipartBucket && dstVolume == d.bucket && dstPath == d.object {
 		if d.stage {
-			if err := d.StorageAPI.WriteMetadata(ctx, "", srcVolume, srcPath, fi); err != nil {
+			if err := d.WriteMetadata(ctx, "", srcVolume, srcPath, fi); err != nil {
 				return RenameDataResp{}, err
 			}
 		}
@@ -691,8 +691,10 @@ func testRestoreUploadStaging(t *testing.T, mode string) {
 	}()
 	wrapped := make([]StorageAPI, len(disks))
 	for i, d := range disks {
-		wrapped[i] = restoreGenerationStageDisk{StorageAPI: d, bucket: r.bucket, object: r.object, stage: mode != "partly-staged" || i == 0,
-			arrived: &arrived, entered: entered, release: release, disks: int32(len(disks))}
+		wrapped[i] = restoreGenerationStageDisk{
+			StorageAPI: d, bucket: r.bucket, object: r.object, stage: mode != "partly-staged" || i == 0,
+			arrived: &arrived, entered: entered, release: release, disks: int32(len(disks)),
+		}
 	}
 	er.getDisks = func() []StorageAPI { return wrapped }
 	layer := newRestoreIsolationLayer(r)
@@ -834,7 +836,7 @@ func (d restoreGenerationCleanupDisk) WriteMetadata(ctx context.Context, orig, b
 	if bucket == d.bucket && object == d.object && d.metaWrites.Load() {
 		return errFaultyDisk
 	}
-	return d.StorageAPI.WriteMetadata(ctx, orig, bucket, object, fi)
+	return d.WriteMetadata(ctx, orig, bucket, object, fi)
 }
 
 // Restored-copy expiry decides on the version's authoritative generation. A
@@ -1053,7 +1055,7 @@ type restoreGenerationFailedCommit struct {
 
 func (d restoreGenerationFailedCommit) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (RenameDataResp, error) {
 	if srcVolume == minioMetaMultipartBucket && dstVolume == d.bucket && dstPath == d.object {
-		if err := d.StorageAPI.WriteMetadata(ctx, "", srcVolume, srcPath, fi); err != nil {
+		if err := d.WriteMetadata(ctx, "", srcVolume, srcPath, fi); err != nil {
 			return RenameDataResp{}, err
 		}
 		return RenameDataResp{}, errFaultyDisk
@@ -1236,8 +1238,10 @@ func TestCleanupStaleUploadsSkipsRunningCommit(t *testing.T) {
 	defer stageOnce.Do(func() { close(stageRelease) })
 	wrapped := make([]StorageAPI, len(disks))
 	for i, d := range disks {
-		stage := restoreGenerationStageDisk{StorageAPI: d, bucket: r.bucket, object: r.object, stage: true,
-			arrived: &staged, entered: stageEntered, release: stageRelease, disks: int32(len(disks))}
+		stage := restoreGenerationStageDisk{
+			StorageAPI: d, bucket: r.bucket, object: r.object, stage: true,
+			arrived: &staged, entered: stageEntered, release: stageRelease, disks: int32(len(disks)),
+		}
 		wrapped[i] = restoreGenerationSnapshotDisk{StorageAPI: stage, reads: &reads, release: readRelease}
 	}
 	er.getDisks = func() []StorageAPI { return wrapped }
@@ -1384,8 +1388,10 @@ func TestCleanupStaleUploadsHoldsLockThroughRename(t *testing.T) {
 	defer stageOnce.Do(func() { close(stageRelease) })
 	wrapped := make([]StorageAPI, len(disks))
 	for i, d := range disks {
-		wrapped[i] = restoreGenerationStageDisk{StorageAPI: d, bucket: r.bucket, object: r.object, stage: true,
-			arrived: &staged, entered: stageEntered, release: stageRelease, disks: int32(len(disks))}
+		wrapped[i] = restoreGenerationStageDisk{
+			StorageAPI: d, bucket: r.bucket, object: r.object, stage: true,
+			arrived: &staged, entered: stageEntered, release: stageRelease, disks: int32(len(disks)),
+		}
 	}
 	er.getDisks = func() []StorageAPI { return wrapped }
 	completion := make(chan ObjectInfo, 1)

@@ -185,7 +185,7 @@ func ldKey(t *testing.T, z *erasureServerPools, prefix string, set int) string {
 // ldOverlap runs hold until it is inside its storage commit, then runs other.
 // It reports whether other was still waiting after ldWait, then lets hold
 // commit and returns both results.
-func ldOverlapRun(t *testing.T, hold, other func(context.Context) error) (holdErr, otherErr error, waited bool) {
+func ldOverlapRun(t *testing.T, hold, other func(context.Context) error) (waited bool, holdErr, otherErr error) {
 	t.Helper()
 	g := newLDGate()
 	defer g.let()
@@ -212,7 +212,7 @@ func ldOverlapRun(t *testing.T, hold, other func(context.Context) error) (holdEr
 	if waited {
 		otherErr = <-done
 	}
-	return holdErr, otherErr, waited
+	return waited, holdErr, otherErr
 }
 
 func ldReader(r io.Reader, size int64) *PutObjReader {
@@ -425,11 +425,12 @@ func TestLockDomainSinglePoolWritersExclude(t *testing.T) {
 				t.Run(c.name, func(t *testing.T) {
 					key := ldKey(t, z, strings.ReplaceAll(c.name, "/", "-"), 1)
 					c.setup(t, z, bucket, key)
-					holdErr, otherErr, waited := ldOverlapRun(t,
+					waited, holdErr, otherErr := ldOverlapRun(t,
 						func(ctx context.Context) error { return c.hold(ctx, z, bucket, key) },
 						func(ctx context.Context) error { return c.other(ctx, z, bucket, key) })
 					if !waited {
-						t.Errorf("%s ran while %s held its commit (other: %v)", c.name[strings.Index(c.name, "/")+1:], c.name[:strings.Index(c.name, "/")], otherErr)
+						holder, contender, _ := strings.Cut(c.name, "/")
+						t.Errorf("%s ran while %s held its commit (other: %v)", contender, holder, otherErr)
 					}
 					c.check(t, z, bucket, key, holdErr, otherErr)
 				})
@@ -478,7 +479,7 @@ func TestLockDomainUploadGuards(t *testing.T) {
 				t.Run(op, func(t *testing.T) {
 					key := ldKey(t, z, "upload-"+op, 1)
 					id := ldUpload(t, z, bucket, key, false)
-					holdErr, otherErr, waited := ldOverlapRun(t,
+					waited, holdErr, otherErr := ldOverlapRun(t,
 						func(ctx context.Context) error { return putPart(ctx, z, bucket, key, id) },
 						func(ctx context.Context) error {
 							var err error
@@ -537,7 +538,7 @@ func TestLockDomainBulkDeleteAgainstUploads(t *testing.T) {
 					if alias {
 						names = append(names, ObjectToDelete{ObjectV: ObjectV{ObjectName: pathJoin(key, id)}})
 					}
-					holdErr, otherErr, waited := ldOverlapRun(t,
+					waited, holdErr, otherErr := ldOverlapRun(t,
 						func(ctx context.Context) error {
 							_, err := z.CompleteMultipartUpload(ctx, bucket, key, id, []CompletePart{{PartNumber: 1, ETag: partETag}}, ObjectOptions{})
 							return err
@@ -561,7 +562,7 @@ func TestLockDomainBulkDeleteAgainstUploads(t *testing.T) {
 				key := ldKey(t, z, "bulk-part", 1)
 				id := ldUpload(t, z, bucket, key, true)
 				names := []ObjectToDelete{{ObjectV: ObjectV{ObjectName: pathJoin(key, id)}}, {ObjectV: ObjectV{ObjectName: pathJoin(key, id, "1")}}}
-				holdErr, otherErr, _ := ldOverlapRun(t,
+				_, holdErr, otherErr := ldOverlapRun(t,
 					func(ctx context.Context) error {
 						_, err := z.PutObjectPart(ctx, bucket, key, id, 1, ldReader(bytes.NewReader(part), int64(len(part))), ObjectOptions{})
 						return err
@@ -871,7 +872,7 @@ func TestLockDomainCopyHandler(t *testing.T) {
 					ldMustPut(t, z, bucket, key, "seed")
 					ldMustPut(t, z, bucket, src, "source")
 					var rec *httptest.ResponseRecorder
-					holdErr, _, waited := ldOverlapRun(t,
+					waited, holdErr, _ := ldOverlapRun(t,
 						func(ctx context.Context) error { return ldPut(ctx, z, bucket, key, "written") },
 						func(ctx context.Context) error {
 							if self {
@@ -1002,7 +1003,7 @@ func TestLockDomainSelectWaitsForWriter(t *testing.T) {
 			key := ldKey(t, z, "select", 1)
 			ldMustPut(t, z, bucket, key, "seed,1\n")
 			var rec *httptest.ResponseRecorder
-			holdErr, _, waited := ldOverlapRun(t,
+			waited, holdErr, _ := ldOverlapRun(t,
 				func(ctx context.Context) error { return ldPut(ctx, z, bucket, key, "written,2\n") },
 				func(ctx context.Context) error {
 					rec = ldRequest(ctx, t, router, http.MethodPost, "/"+bucket+"/"+key+"?select&select-type=2", request, nil)
@@ -1029,7 +1030,7 @@ func TestLockDomainKeyRotationWaitsForWriter(t *testing.T) {
 			// The rotation's listing found an SSE-S3 object; it reads it again
 			// under the lock.
 			listed := ObjectInfo{Bucket: bucket, Name: key, UserDefined: map[string]string{crypto.MetaSealedKeyS3: "listed"}}
-			_, _, waited := ldOverlapRun(t,
+			waited, _, _ := ldOverlapRun(t,
 				func(ctx context.Context) error { return ldPut(ctx, z, bucket, key, "written") },
 				func(ctx context.Context) error { return job.KeyRotate(ctx, z, listed) })
 			if !waited {
@@ -1107,8 +1108,10 @@ func TestLockDomainCopyExcludesObjectLockUpdates(t *testing.T) {
 							}
 						}
 						put(key)
-						g := &ldCopyGate{ObjectLayer: z, bucket: bucket, object: key,
-							copying: make(chan struct{}), updating: make(chan struct{}), release: make(chan struct{})}
+						g := &ldCopyGate{
+							ObjectLayer: z, bucket: bucket, object: key,
+							copying: make(chan struct{}), updating: make(chan struct{}), release: make(chan struct{}),
+						}
 						setObjectLayer(g)
 						defer setObjectLayer(z)
 						router := initTestAPIEndPoints(g, nil)
