@@ -673,6 +673,8 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	// run, so the cursor cannot move past what was not listed.
 	walkCtx, stopWalk := context.WithCancel(ctx)
 	defer stopWalk()
+	// walkFailed: a listing failed before it returned any result.
+	var walkFailed atomic.Bool
 	results := make(chan itemOrErr[ObjectInfo], workerSize)
 	go func() {
 		// One ascending walk over disjoint prefixes, which the cursor
@@ -689,6 +691,7 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 			})
 			if err != nil {
 				if walkCtx.Err() == nil {
+					walkFailed.Store(true)
 					cancelCause(err)
 				}
 				xioutil.SafeClose(results)
@@ -881,6 +884,13 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	refused := ri.refused()
 	cause := context.Cause(ctx)
 	if cause != nil && !refused {
+		if walkFailed.Load() {
+			// This run failed; a later run lists again from the cursor.
+			ri.mu.Lock()
+			ri.Complete = false
+			ri.Failed = true
+			ri.mu.Unlock()
+		}
 		saveCtx, cancel := context.WithTimeout(GlobalContext, 30*time.Second)
 		batchLogIf(saveCtx, ri.updateAfter(saveCtx, api, 0, job))
 		cancel()

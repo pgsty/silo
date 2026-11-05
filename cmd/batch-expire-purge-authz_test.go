@@ -473,3 +473,45 @@ func TestBatchExpirePurgeBudgetIncludesAuthorization(t *testing.T) {
 		}
 	}
 }
+
+// A listing that failed before any result fails the run without moving the
+// cursor or refusing the job; a later run completes it, in both modes.
+func TestBatchExpireWalkFailureResumes(t *testing.T) {
+	for _, purgeAll := range []bool{false, true} {
+		name := "retain-one"
+		if purgeAll {
+			name = "retain-zero"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newBatchAuthzFixture(t)
+			const key = "data/key"
+			older := f.putVersions(t, key)
+			definition := f.expireYAML("data/")
+			if purgeAll {
+				definition = f.purgeYAML("data/")
+			}
+			rec, job := f.submit(t, globalActiveCred, definition)
+			if job == nil {
+				t.Fatalf("submit: %d %s", rec.Code, rec.Body.String())
+			}
+			listErr := errors.New("review7: transient listing failure")
+			err := job.Expire.Start(f.ctx, batchWalkError{ObjectLayer: f.obj, err: listErr}, *job)
+			if !errors.Is(err, listErr) {
+				t.Fatalf("listing error: %v", err)
+			}
+			ri := f.jobInfo(t, job)
+			if !ri.Failed || ri.Complete || ri.FailureReason != "" || ri.Object != "" || !f.versionExists(t, key, older) {
+				t.Fatalf("listing failure changed progress or became terminal: failed=%v complete=%v reason=%q cursor=%q", ri.Failed, ri.Complete, ri.FailureReason, ri.Object)
+			}
+			mustIAM(t, job.Expire.Start(f.ctx, f.obj, *job))
+			ri = f.jobInfo(t, job)
+			wantRemoved := int64(1)
+			if purgeAll {
+				wantRemoved = 2
+			}
+			if ri.Failed || !ri.Complete || ri.FailureReason != "" || ri.Objects != wantRemoved || f.versionExists(t, key, older) {
+				t.Fatalf("resume did not complete: failed=%v complete=%v reason=%q removed=%d", ri.Failed, ri.Complete, ri.FailureReason, ri.Objects)
+			}
+		})
+	}
+}

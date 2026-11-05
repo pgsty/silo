@@ -20,7 +20,7 @@ import (
 	"github.com/minio/minio/internal/kms"
 )
 
-// Rotation cases found in review.
+// Rotation and listing cases found in review.
 
 // Rotation rewrites the copy GetObjectInfo returns, which can carry another
 // tag revision than the merged version of all pools: both are authorized.
@@ -62,6 +62,33 @@ func TestBatchReviewRotationAuthorizesWrittenCopy(t *testing.T) {
 	mustIAM(t, err)
 	if after.UserDefined[crypto.MetaSealedKeyS3] != before.UserDefined[crypto.MetaSealedKeyS3] {
 		t.Fatal("a refused rotation rewrote the copy")
+	}
+}
+
+// batchWalkError fails every listing before it returns a result.
+type batchWalkError struct {
+	ObjectLayer
+	err error
+}
+
+func (w batchWalkError) Walk(context.Context, string, string, chan<- itemOrErr[ObjectInfo], WalkOptions) error {
+	return w.err
+}
+
+// A listing that fails before it returns anything fails the run, as a
+// listing error in the results does, and the job is left to a later run.
+func TestBatchReviewExpireWalkErrorFailsRun(t *testing.T) {
+	f := newBatchAuthzFixture(t)
+	rec, job := f.submit(t, globalActiveCred, f.expireYAML("data/"))
+	if job == nil {
+		t.Fatalf("submission status %d: %s", rec.Code, rec.Body.String())
+	}
+	listErr := errors.New("review6: listing failed")
+	if err := job.Expire.Start(f.ctx, batchWalkError{ObjectLayer: f.obj, err: listErr}, *job); !errors.Is(err, listErr) {
+		t.Fatalf("start returned %v, want %v", err, listErr)
+	}
+	if ri := f.jobInfo(t, job); !ri.Failed || ri.Complete {
+		t.Fatalf("failed listing: complete=%v failed=%v", ri.Complete, ri.Failed)
 	}
 }
 
