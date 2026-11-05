@@ -1,6 +1,6 @@
 {
-  "updated": "2026-10-26T16:35:06+00:00",
-  "revision": "f2b5d10abfabf11fdb5917eb9ee4a96dd356a0d2",
+  "updated": "2026-11-04T11:20:24+00:00",
+  "revision": "152aa8b4513ebc4ed01618a2ce9d0e5027fecf3b",
   "repositories": [
     "pgsty/silo",
     "pgsty/silo-console",
@@ -192,6 +192,20 @@
       "firstContribution": "2026-06-24"
     },
     {
+      "handle": "cyberbret",
+      "group": "proposed",
+      "featured": true,
+      "what": "Contributed on-demand folder and bucket usage scans and the optional persistent usage worker",
+      "firstContribution": "2026-10-26"
+    },
+    {
+      "handle": "kh0mka",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported inter-node I/O timeouts, OIDC configuration-fetch failures, and lost Console bucket quotas",
+      "firstContribution": "2026-08-03"
+    },
+    {
       "handle": "MikeVL",
       "group": "reports",
       "featured": true,
@@ -365,13 +379,6 @@
       "featured": false,
       "what": "Reported missing RPM package signatures",
       "firstContribution": "2026-07-21"
-    },
-    {
-      "handle": "kh0mka",
-      "group": "reports",
-      "featured": false,
-      "what": "Reported inter-node I/O timeouts and OIDC configuration-fetch failures",
-      "firstContribution": "2026-08-03"
     },
     {
       "handle": "bagutzu",
