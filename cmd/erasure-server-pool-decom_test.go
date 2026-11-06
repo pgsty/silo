@@ -197,3 +197,29 @@ func TestPoolMetaValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolMetaDecommissionCancellationIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	canceled := poolMeta{Pools: []PoolStatus{{Decommission: &PoolDecommissionInfo{}}}}
+	if !canceled.DecommissionCancel(0) {
+		t.Fatal("failed to record cancellation")
+	}
+	if canceled.DecommissionFailed(0) {
+		t.Fatal("a canceled decommission was changed to failed")
+	}
+	if canceled.DecommissionComplete(0) {
+		t.Fatal("a canceled decommission was changed to complete")
+	}
+	if got := canceled.returnResumablePools(); len(got) != 0 {
+		t.Fatalf("canceled decommission is resumable: %+v", got)
+	}
+
+	failed := poolMeta{Pools: []PoolStatus{{Decommission: &PoolDecommissionInfo{}}}}
+	if !failed.DecommissionFailed(0) {
+		t.Fatal("failed to record failure")
+	}
+	if got := failed.returnResumablePools(); len(got) != 1 {
+		t.Fatalf("failed decommission is not resumable: %+v", got)
+	}
+}

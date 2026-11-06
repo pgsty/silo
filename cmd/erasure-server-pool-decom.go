@@ -182,7 +182,9 @@ func (p *poolMeta) returnResumablePools() []PoolStatus {
 }
 
 func (p *poolMeta) DecommissionComplete(idx int) bool {
-	if p.Pools[idx].Decommission != nil && !p.Pools[idx].Decommission.Complete {
+	if p.Pools[idx].Decommission != nil &&
+		!p.Pools[idx].Decommission.Complete &&
+		!p.Pools[idx].Decommission.Canceled {
 		p.Pools[idx].LastUpdate = UTCNow()
 		p.Pools[idx].Decommission.Complete = true
 		p.Pools[idx].Decommission.Failed = false
@@ -193,7 +195,9 @@ func (p *poolMeta) DecommissionComplete(idx int) bool {
 }
 
 func (p *poolMeta) DecommissionFailed(idx int) bool {
-	if p.Pools[idx].Decommission != nil && !p.Pools[idx].Decommission.Failed {
+	if p.Pools[idx].Decommission != nil &&
+		!p.Pools[idx].Decommission.Failed &&
+		!p.Pools[idx].Decommission.Canceled {
 		p.Pools[idx].LastUpdate = UTCNow()
 		p.Pools[idx].Decommission.StartTime = time.Time{}
 		p.Pools[idx].Decommission.Complete = false
