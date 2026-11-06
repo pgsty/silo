@@ -135,11 +135,9 @@ func TestLockObjectsMergesByResource(t *testing.T) {
 				t.Fatalf("no names with sameSet=%v", sameSet)
 				return "", ""
 			}
-			cases := []bool{true}
-			if split {
-				cases = append(cases, false)
-			}
-			for _, sameSet := range cases {
+			// Where the sets share one table, an alias of another set still
+			// names the same resource there.
+			for _, sameSet := range []bool{true, false} {
 				clean, alias := pick(sameSet)
 				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 				start := time.Now()
@@ -159,12 +157,14 @@ func TestLockObjectsMergesByResource(t *testing.T) {
 				}
 				if split && !sameSet {
 					// The alias's table holds the alias's read lock.
+					// Writers first: a reader probe's release is asynchronous
+					// and would hold off a writer probe right after it.
 					aliasSet := pool.getHashedSet(alias)
-					if !ldTry(t, aliasSet.NewNSLock(bucket, alias), false) {
-						t.Errorf("%s: readers excluded in its own table", alias)
-					}
 					if ldTry(t, aliasSet.NewNSLock(bucket, alias), true) {
 						t.Errorf("%s: writers admitted in its own table, the alias lock is missing", alias)
+					}
+					if !ldTry(t, aliasSet.NewNSLock(bucket, alias), false) {
+						t.Errorf("%s: readers excluded in its own table", alias)
 					}
 				}
 				unlock()
