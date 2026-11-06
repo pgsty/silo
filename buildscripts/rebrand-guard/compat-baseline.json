@@ -616,7 +616,6 @@
     "x-minio-internal-replication-status",
     "x-minio-internal-replication-timestamp",
     "x-minio-internal-restore-attempt",
-    "x-minio-internal-restore-upload",
     "x-minio-internal-server-side-encryption",
     "x-minio-internal-server-side-encryption-context",
     "x-minio-internal-server-side-encryption-iv",
