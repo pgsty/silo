@@ -19,11 +19,18 @@ func TestAuthZPluginExplicitDecision(t *testing.T) {
 		status      int
 		allow, fail bool
 	}{
-		{`{"result":true}`, 200, true, false}, {`{"result":false}`, 200, false, false},
-		{`{"result":{"allow":true}}`, 200, true, false}, {`{"result":{"allow":false}}`, 200, false, false},
-		{`{"result":true}`, 503, false, true}, {`{"result":true}`, 403, false, true},
-		{`{}`, 200, false, true}, {`{"error":"unavailable"}`, 200, false, true}, {`{"result":null}`, 200, false, true},
-		{`{"result":{}}`, 200, false, true}, {`{"result":{"allow":null}}`, 200, false, true}, {`{"result":"true"}`, 200, false, true},
+		{`{"result":true}`, 200, true, false},
+		{`{"result":false}`, 200, false, false},
+		{`{"result":{"allow":true}}`, 200, true, false},
+		{`{"result":{"allow":false}}`, 200, false, false},
+		{`{"result":true}`, 503, false, true},
+		{`{"result":true}`, 403, false, true},
+		{`{}`, 200, false, true},
+		{`{"error":"unavailable"}`, 200, false, true},
+		{`{"result":null}`, 200, false, true},
+		{`{"result":{}}`, 200, false, true},
+		{`{"result":{"allow":null}}`, 200, false, true},
+		{`{"result":"true"}`, 200, false, true},
 		{`{"result":true} garbage`, 200, false, true},
 	} {
 		t.Run(tc.body+http.StatusText(tc.status), func(t *testing.T) {

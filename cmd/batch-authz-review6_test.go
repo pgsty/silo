@@ -269,7 +269,6 @@ func TestBatchReviewRotationLeavesMovingSource(t *testing.T) {
 	if !ri.Complete || ri.Failed || ri.PausedReason != "" || ri.Objects != 1 {
 		t.Fatalf("resumed rotation: %+v", ri)
 	}
-
 }
 
 // Once a move copied a version, the rotation leaves it to a later run, so the

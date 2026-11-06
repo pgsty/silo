@@ -195,9 +195,11 @@ func (z *erasureServerPools) deleteTierTupleLocked(ctx context.Context, bucket, 
 	// also checks the free marker and tuple, so a stale cleanup cannot remove
 	// a different revision with the same local version ID.
 	for _, record := range records {
-		fi := FileInfo{VersionID: record.info.VersionID,
+		fi := FileInfo{
+			VersionID:      record.info.VersionID,
 			TransitionTier: tuple.Tier, TransitionedObjName: tuple.Object,
-			TransitionVersionID: tuple.VersionID}
+			TransitionVersionID: tuple.VersionID,
+		}
 		fi.SetTierFreeVersion()
 		err := record.disk.DeleteVersion(ctx, bucket, object, fi, false, DeleteOptions{})
 		if err != nil && !errors.Is(err, errFileNotFound) && !errors.Is(err, errFileVersionNotFound) {

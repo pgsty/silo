@@ -33,10 +33,13 @@ func batchUnavailable(reason string, err error) error {
 	}
 	return batchJobUnavailableError{reason: reason, err: err}
 }
+
 func isBatchJobUnavailable(err error) bool { var e batchJobUnavailableError; return errors.As(err, &e) }
+
 func isBatchJobStopped(err error) bool {
 	return isBatchJobAuthzError(err) || isBatchJobUnavailable(err)
 }
+
 func batchListingError(err error) error {
 	if isErrBucketNotFound(err) {
 		return err
@@ -54,6 +57,7 @@ func (ri *batchJobInfo) pause(err error) {
 	ri.Complete, ri.Failed = false, false
 	ri.PausedReason = err.Error()
 }
+
 func (ri *batchJobInfo) savePaused(ctx context.Context, api ObjectLayer, job BatchJobRequest, err error) error {
 	ri.pause(err)
 	globalBatchJobsMetrics.save(job.ID, ri)
@@ -83,8 +87,10 @@ func validateBatchJobAdminReq(ctx context.Context, w http.ResponseWriter, r *htt
 		var principal batchJobPrincipal
 		principal, err = submitter.principal(ctx)
 		if err == nil {
-			err = principal.authorizeArgs(policy.Args{AccountName: cred.AccessKey, Groups: cred.Groups,
-				Action: policy.Action(policy.StartBatchJobAction), ConditionValues: getConditionValues(r, "", cred), IsOwner: owner, Claims: principal.claims}, nil)
+			err = principal.authorizeArgs(policy.Args{
+				AccountName: cred.AccessKey, Groups: cred.Groups,
+				Action: policy.Action(policy.StartBatchJobAction), ConditionValues: getConditionValues(r, "", cred), IsOwner: owner, Claims: principal.claims,
+			}, nil)
 		}
 	}
 	if err != nil {
@@ -119,6 +125,7 @@ func (j *BatchJobPool) beginJob(job *BatchJobRequest) bool {
 	o.state = "running"
 	return true
 }
+
 func (j *BatchJobPool) finishJob(job *BatchJobRequest, err error) {
 	j.jmu.Lock()
 	defer j.jmu.Unlock()
@@ -156,6 +163,7 @@ func (j *BatchJobPool) retryDue(now time.Time) {
 		}
 	}
 }
+
 func (j *BatchJobPool) retryLoop() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()

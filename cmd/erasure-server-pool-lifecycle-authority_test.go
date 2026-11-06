@@ -634,7 +634,6 @@ func TestPoolsLifecycleMissingVersion(t *testing.T) {
 // The completeness checks also hold where a set has fewer answering drives
 // than a read quorum or no version reaches one.
 func TestPoolsLifecycleHistoryEarlyReturns(t *testing.T) {
-
 	// Seven drives hold the key, the other nine do not have it at all.
 	t.Run("minority-copy-only", func(t *testing.T) {
 		s := newSplitILM(t, versioning.Enabled, splitILMRules)
@@ -1243,14 +1242,6 @@ func TestPoolsLifecycleNullGenerations(t *testing.T) {
 			}
 		})
 	}
-}
-
-// authoritySideEffects collects the version IDs that removal notifications
-// and ILM expiry audit traces report.
-func authoritySideEffects(t *testing.T, run func()) (notified, traced []string) {
-	t.Helper()
-	notified, traced, _ = authoritySideEffectsAll(t, run)
-	return notified, traced
 }
 
 // authoritySideEffectsAll also returns, by version ID, the result an ILM
