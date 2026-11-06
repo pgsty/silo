@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/minio/minio/internal/bucket/versioning"
+	"github.com/minio/minio/internal/config/storageclass"
 )
 
 // Drive heal evaluates lifecycle on the versions of one pool and enqueues
@@ -31,8 +32,13 @@ import (
 
 // startTestBackgroundHeal registers the background heal sequence and a heal
 // worker, which drive healing needs for its bucket heals.
-func startTestBackgroundHeal(t *testing.T, z ObjectLayer) {
+func startTestBackgroundHeal(t *testing.T, z *erasureServerPools) {
 	t.Helper()
+	// The healed drive is rebuilt from parity. Earlier tests can leave a
+	// storage class of parity 0 behind (newTestConfig on a single drive).
+	previous := globalStorageClass
+	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: z.serverPools[0].setDriveCount / 2}})
+	t.Cleanup(func() { globalStorageClass.Update(previous) })
 	if globalBackgroundHealState == nil {
 		globalBackgroundHealState = newHealState(GlobalContext, false)
 	}
