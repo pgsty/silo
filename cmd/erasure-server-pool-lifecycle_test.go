@@ -40,6 +40,8 @@ type splitILM struct {
 	*migrationILM
 	ids    map[string]string // object and label -> version ID
 	bodies map[string]string // body -> label
+	// replication is the replication configuration the scanner runs with.
+	replication replicationConfig
 }
 
 func newSplitILM(t *testing.T, status versioning.State, rules string) *splitILM {
@@ -147,7 +149,7 @@ func (s *splitILM) scan(pool int) {
 		for i, fi := range fivs.Versions {
 			objInfos[i] = fi.ToObjectInfo(s.bucket, object, vc != nil && vc.Versioned(object))
 		}
-		item := scannerItem{bucket: s.bucket, objectName: object, lifeCycle: lc}
+		item := scannerItem{bucket: s.bucket, objectName: object, lifeCycle: lc, replication: s.replication}
 		item.applyActions(ctx, s.z, objInfos, lr, &sizeSummary{}, nil)
 	}
 	s.runQueue()

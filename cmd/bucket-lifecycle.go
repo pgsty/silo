@@ -651,23 +651,12 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	// the remote object is still protected.
 	keepRemote := opts.VersionID == "" &&
 		(opts.Versioned || (opts.VersionSuspended && oi.VersionID != "" && oi.VersionID != nullVersionID))
-	if lcEvent.Action == lifecycle.DeleteAction || lcEvent.Action == lifecycle.DeleteVersionAction {
-		opts.SetEvalMetadataFn(func(goi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
-			return checkReplicateDelete(ctx, oi.Bucket, ObjectToDelete{
-				ObjectV: ObjectV{
-					ObjectName: goi.Name,
-					VersionID:  opts.VersionID,
-				},
-			}, *goi, opts, gerr), nil
-		})
-	}
 
 	// Delete the hot-tier namespace first. For a transitioned version this
 	// leaves a durable free-version record until the remote delete succeeds;
 	// that record is the retry point if the process stops between the two
 	// operations.
-	delInfo, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
-	if err != nil {
+	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
 		return err
 	}
 
@@ -675,32 +664,6 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		if err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier); err != nil {
 			transitionLogIf(ctx, err)
 		}
-	}
-
-	// Queue replication of the ILM-created delete marker or version purge,
-	// mirroring the DELETE handler's post-delete scheduling.
-	if delInfo.ReplicationStatus == replication.Pending || delInfo.VersionPurgeStatus == replication.VersionPurgePending {
-		dmVersionID, versionID := "", ""
-		if delInfo.DeleteMarker && delInfo.VersionPurgeStatus.Empty() {
-			dmVersionID = delInfo.VersionID
-		} else {
-			versionID = delInfo.VersionID
-		}
-		if delInfo.Name == "" {
-			delInfo.Name = oi.Name
-		}
-		scheduleReplicationDelete(ctx, DeletedObjectReplicationInfo{
-			DeletedObject: DeletedObject{
-				ObjectName:            delInfo.Name,
-				VersionID:             versionID,
-				DeleteMarkerVersionID: dmVersionID,
-				DeleteMarkerMTime:     DeleteMarkerMTime{delInfo.ModTime},
-				DeleteMarker:          delInfo.DeleteMarker,
-				ReplicationState:      delInfo.ReplicationState(),
-			},
-			Bucket:    oi.Bucket,
-			EventType: ReplicateILMDelete,
-		}, objectAPI)
 	}
 
 	// Send audit for the lifecycle delete operation

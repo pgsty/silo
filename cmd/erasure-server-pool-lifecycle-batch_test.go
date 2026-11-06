@@ -20,12 +20,10 @@ package cmd
 import (
 	"context"
 	"errors"
-	"net/http"
 	"testing"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
-	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
@@ -67,7 +65,10 @@ func (o *lifecycleBatchResult) DeleteObjects(ctx context.Context, bucket string,
 	return o.deleted, o.errs
 }
 
-func TestPoolsLifecycleTieredBatchReplication(t *testing.T) {
+// A batch of ILM version purges keeps the cross-pool refusal and does not
+// replicate: the eligible version is gone from every pool, the refused one
+// stays, and nothing reaches the replication target.
+func TestPoolsLifecycleTieredBatchNotReplicated(t *testing.T) {
 	for _, identity := range []string{"uuid", "null"} {
 		t.Run(identity, func(t *testing.T) {
 			s := newSplitILM(t, versioning.Enabled, splitILMRules)
@@ -77,24 +78,7 @@ func TestPoolsLifecycleTieredBatchReplication(t *testing.T) {
 			for _, v := range []splitVersion{oldest, splitTiered("v2", 4, 0), splitTiered("v3", 3, 0), splitAt("v4", 2, 0)} {
 				s.write(key, v)
 			}
-			target := newILMTestTarget(t)
-			registerILMTestTarget(t, s.z, s.bucket, target, func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodDelete {
-					t.Errorf("unexpected target method: %s", r.Method)
-					w.WriteHeader(500)
-					return
-				}
-				target.deletes.Add(1)
-				opts := ObjectOptions{VersionID: r.URL.Query().Get("versionId"), Versioned: true, ReplicationRequest: true}
-				opts.SetReplicaStatus(replication.Replica)
-				if _, err := s.z.DeleteObject(r.Context(), target.bucket, key, opts); err != nil && !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
-					t.Errorf("target purge: %v", err)
-					w.WriteHeader(500)
-					return
-				}
-				w.WriteHeader(http.StatusNoContent)
-			})
-			setILMTestReplicationConfig(t, s.bucket, target.arn, target.bucket)
+			target, requests := ilmTestTarget(t, s.z, s.bucket, key, false)
 			stats := NewReplicationStats(t.Context(), nil)
 			previous := globalReplicationStats.Swap(stats)
 			t.Cleanup(func() { globalReplicationStats.Store(previous) })
@@ -106,15 +90,8 @@ func TestPoolsLifecycleTieredBatchReplication(t *testing.T) {
 				if vid == "" {
 					vid = nullVersionID
 				}
-				oi, err := s.z.GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: vid, Versioned: true})
-				if err != nil {
-					t.Fatal(err)
-				}
-				entry := ilmPurgeToDelete(t.Context(), s.bucket, oi, true)
-				if entry.VersionPurgeStatus != replication.VersionPurgePending {
-					t.Fatalf("fixture lacks purge decision: %+v", entry)
-				}
-				entries = append(entries, entry)
+				// As the scanner builds a noncurrent expiry entry.
+				entries = append(entries, ObjectToDelete{ObjectV: ObjectV{ObjectName: key, VersionID: vid}})
 				putConsistencyObject(t, s.z, target.bucket, key, 0, label, ObjectOptions{Versioned: identity != "null" || label != "v1", VersionID: vid})
 			}
 			result := &lifecycleBatchResult{ObjectLayer: s.z}
@@ -126,36 +103,26 @@ func TestPoolsLifecycleTieredBatchReplication(t *testing.T) {
 				t.Errorf("retained version result: %v", result.errs[1])
 			}
 			if result.deleted[1].VersionPurgeStatus() != "" || result.deleted[1].ReplicationState.ReplicateDecisionStr != "" {
-				t.Errorf("rejected entry retained replication state: %+v", result.deleted[1])
+				t.Errorf("rejected entry carries replication state: %+v", result.deleted[1])
 			}
-			source, err := s.z.GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: entries[0].VersionID, Versioned: true})
-			if !isErrMethodNotAllowed(err) || source.VersionPurgeStatus != replication.VersionPurgePending {
-				t.Errorf("source must be a pending purge tombstone before enqueue: status=%q err=%v", source.VersionPurgeStatus, err)
+			for pool := range s.z.serverPools {
+				if _, err := s.z.serverPools[pool].GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: entries[0].VersionID, Versioned: true}); !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
+					t.Errorf("pool %d: purged v1 remains: %v", pool, err)
+				}
 			}
 			retained, err := s.z.GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: entries[1].VersionID, Versioned: true})
 			if err != nil || retained.VersionPurgeStatus != "" {
 				t.Errorf("rejected source changed: %+v, %v", retained, err)
 			}
-			queue := globalReplicationPool.Get().workers[0]
-			if len(queue) != 1 {
-				t.Fatalf("queued %d purges, want only eligible v1", len(queue))
+			if n := len(globalReplicationPool.Get().workers[0]); n != 0 {
+				t.Fatalf("queued %d replication tasks", n)
 			}
-			deletion, ok := (<-queue).(DeletedObjectReplicationInfo)
-			if !ok || deletion.VersionID != entries[0].VersionID || deletion.EventType != ReplicateILMDelete || deletion.VersionPurgeStatus() != replication.VersionPurgePending {
-				t.Fatalf("wrong purge queued: %+v", deletion)
+			if n := requests.Load(); n != 0 {
+				t.Errorf("the target saw %d requests", n)
 			}
-			if result := replicateDelete(t.Context(), deletion, s.z); result.VersionPurgeStatus() != replication.VersionPurgeComplete {
-				t.Fatalf("replicate purge: %+v", result)
-			}
-			if target.deletes.Load() != 1 {
-				t.Errorf("target delete count=%d", target.deletes.Load())
-			}
-			for _, bucket := range []string{s.bucket, target.bucket} {
-				if _, err := s.z.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: entries[0].VersionID}); !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
-					t.Errorf("purged v1 remains in %s: %v", bucket, err)
-				}
-				if _, err := s.z.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: entries[1].VersionID}); err != nil {
-					t.Errorf("retained v3 missing from %s: %v", bucket, err)
+			for _, e := range entries {
+				if _, err := s.z.GetObjectInfo(t.Context(), target.bucket, key, ObjectOptions{VersionID: e.VersionID}); err != nil {
+					t.Errorf("target copy %s changed: %v", e.VersionID, err)
 				}
 			}
 		})

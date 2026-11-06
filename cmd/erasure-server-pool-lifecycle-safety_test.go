@@ -257,10 +257,9 @@ func TestPoolsLifecycleBatchRejectionReplication(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			entry := ilmPurgeToDelete(t.Context(), s.bucket, oi, true)
-			if entry.VersionPurgeStatus != replication.VersionPurgePending {
-				t.Fatal("fixture lacks pending purge")
-			}
+			// As the scanner builds a noncurrent expiry entry: lifecycle
+			// purges carry no replication decision.
+			entry := ObjectToDelete{ObjectV: ObjectV{ObjectName: key, VersionID: oi.VersionID}}
 			withdraw := func() {
 				meta, err := globalBucketMetadataSys.Get(s.bucket)
 				if err != nil {
@@ -334,27 +333,17 @@ func TestPoolsLifecycleBatchRejectionReplication(t *testing.T) {
 				}
 				return
 			}
-			if result.errs[0] != nil || len(queue) != 1 {
+			if result.errs[0] != nil || len(queue) != 0 {
 				t.Fatalf("valid/absent purge: error=%v queued=%d", result.errs[0], len(queue))
 			}
-			source, err := s.z.GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: id})
-			if mode == "normal" && (!isErrMethodNotAllowed(err) || source.VersionPurgeStatus != replication.VersionPurgePending) {
-				t.Fatalf("purge not committed locally: %+v %v", source, err)
+			if _, err := s.z.GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: id}); !isErrVersionNotFound(err) {
+				t.Fatalf("source must be gone, not a purge tombstone: %v", err)
 			}
-			if mode == "already-absent" && !isErrVersionNotFound(err) {
-				t.Fatalf("source must actually be absent: %v", err)
-			}
-			deletion := (<-queue).(DeletedObjectReplicationInfo)
-			if result := replicateDelete(t.Context(), deletion, s.z); result.VersionPurgeStatus() != replication.VersionPurgeComplete {
-				t.Fatalf("purge failed: %+v", result)
-			}
-			if target.deletes.Load() != 1 {
+			if target.deletes.Load() != 0 {
 				t.Fatalf("remote deletes=%d", target.deletes.Load())
 			}
-			for _, bucket := range []string{s.bucket, target.bucket} {
-				if _, err := s.z.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: id}); !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
-					t.Errorf("purged version remains in %s: %v", bucket, err)
-				}
+			if _, err := s.z.GetObjectInfo(t.Context(), target.bucket, key, ObjectOptions{VersionID: id}); err != nil {
+				t.Errorf("target copy changed: %v", err)
 			}
 		})
 	}

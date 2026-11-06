@@ -19,8 +19,6 @@ package cmd
 
 import (
 	"context"
-	"errors"
-	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -29,7 +27,6 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
-	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/bucket/versioning"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -460,7 +457,10 @@ func TestPoolsMigrationLifecycleChangePreservesSource(t *testing.T) {
 // A migration must route an ILM version purge through the normal delete
 // replication path before it can retire the source copy. Otherwise the
 // source pool can disappear while the replica still retains the version.
-func TestPoolsMigrationLifecycleExpiryReplication(t *testing.T) {
+// A decommission whose walk leaves a noncurrent version to its ILM expiry
+// completes in one run: the expiry deletes the version and does not wait for
+// a replication target, which lifecycle deletes do not reach.
+func TestPoolsMigrationLifecycleExpiryNotReplicated(t *testing.T) {
 	m := newMigrationILM(t, versioning.Enabled, false,
 		migrationILMRule("<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>"))
 	m.aged(0, "obj-01")
@@ -471,37 +471,8 @@ func TestPoolsMigrationLifecycleExpiryReplication(t *testing.T) {
 	oldStats := globalReplicationStats.Swap(stats)
 	defer globalReplicationStats.Store(oldStats)
 
-	target := newILMTestTarget(t)
-	registerILMTestTarget(t, m.z, m.bucket, target, func(w http.ResponseWriter, r *http.Request) {
-		opts := ObjectOptions{VersionID: r.URL.Query().Get("versionId"), Versioned: true}
-		switch r.Method {
-		case http.MethodHead:
-			oi, err := m.z.GetObjectInfo(r.Context(), target.bucket, "obj-01", opts)
-			if err != nil {
-				writeErrorResponseHeadersOnly(w, toAPIError(r.Context(), err))
-				return
-			}
-			if oi.DeleteMarker {
-				w.Header().Set(xhttp.AmzDeleteMarker, "true")
-				w.Header().Set(xhttp.AmzVersionID, oi.VersionID)
-			}
-			w.WriteHeader(http.StatusOK)
-		case http.MethodDelete:
-			target.deletes.Add(1)
-			opts.DeleteMarker = r.Header.Get(xhttp.MinIOSourceDeleteMarker) == "true"
-			opts.ReplicationRequest = true
-			opts.SetReplicaStatus(replication.Replica)
-			if _, err := m.z.DeleteObject(r.Context(), target.bucket, "obj-01", opts); err != nil && !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
-				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Errorf("unexpected remote method %s", r.Method)
-		}
-	})
-	setILMTestReplicationConfig(t, m.bucket, target.arn, target.bucket)
-	restorePool, receive := newILMTestReplicationPool(ctx, m.z, stats)
+	target, requests := ilmTestTarget(t, m.z, m.bucket, "obj-01", false)
+	restorePool, _ := newILMTestReplicationPool(ctx, m.z, stats)
 	defer restorePool()
 
 	if err := m.z.StartDecommission(ctx, 0); err != nil {
@@ -511,41 +482,14 @@ func TestPoolsMigrationLifecycleExpiryReplication(t *testing.T) {
 	m.z.poolMetaMutex.RLock()
 	info := *m.z.poolMeta.Pools[0].Decommission
 	m.z.poolMetaMutex.RUnlock()
-	if info.Complete || !info.Failed {
-		t.Fatalf("decommission completed before ILM purge replication: complete=%t failed=%t", info.Complete, info.Failed)
-	}
-
-	deletion := receive()
-	if deletion.ObjectName != "obj-01" || deletion.VersionID == "" || deletion.VersionPurgeStatus() != replication.VersionPurgePending {
-		t.Fatalf("unexpected migration purge: %+v", deletion)
-	}
-	if result := replicateDelete(ctx, deletion, m.z); result.VersionPurgeStatus() != replication.VersionPurgeComplete {
-		t.Fatalf("migration purge replication result: %+v", result)
-	}
-	if target.deletes.Load() != 1 {
-		t.Fatalf("replication target saw %d deletes, want 1", target.deletes.Load())
-	}
-
-	// A failed decommission may already have moved the source pool's bucket
-	// metadata. Recreate the metadata directory before the resumable retry,
-	// as the server's scanner would do in production.
-	for _, set := range m.z.serverPools[0].sets {
-		for _, disk := range set.getDisks() {
-			if err := disk.MakeVol(ctx, pathJoin(minioMetaBucket, bucketMetaPrefix)); err != nil && !errors.Is(err, errVolumeExists) {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	if err := m.z.StartDecommission(ctx, 0); err != nil {
-		t.Fatal(err)
-	}
-	m.z.doDecommissionInRoutine(ctx, 0)
-	m.z.poolMetaMutex.RLock()
-	info = *m.z.poolMeta.Pools[0].Decommission
-	m.z.poolMetaMutex.RUnlock()
 	if !info.Complete || info.Failed {
-		t.Fatalf("decommission did not complete after ILM purge replication: complete=%t failed=%t", info.Complete, info.Failed)
+		t.Fatalf("decommission: complete=%t failed=%t", info.Complete, info.Failed)
+	}
+	if n := len(globalReplicationPool.Get().workers[0]); n != 0 {
+		t.Fatalf("the migration expiry queued %d replication tasks", n)
+	}
+	if n := requests.Load(); n != 0 || target.deletes.Load() != 0 {
+		t.Fatalf("the target saw %d requests", n)
 	}
 }
 

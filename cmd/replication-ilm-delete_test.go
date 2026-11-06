@@ -22,6 +22,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,6 +33,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/bucket/versioning"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/once"
 )
@@ -101,41 +103,20 @@ func newILMTestReplicationPool(ctx context.Context, obj ObjectLayer, stats *Repl
 	}
 }
 
-// TestReplicateILMExpiryDeleteMarker verifies that a delete marker created by
-// ILM expiry carries delete replication state and is queued for replication,
-// exactly like a marker created through the S3 DELETE API.
-func TestReplicateILMExpiryDeleteMarker(t *testing.T) {
-	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
-		t:          t,
-		objAPITest: testReplicateILMExpiryDeleteMarker,
-	})
-}
+// Lifecycle deletes are not replicated: a delete marker or a version purge
+// that ILM makes stays on the source, as in S3. The replication heal still
+// sends an empty-state marker when existing-object replication applies to
+// it, as it always did; that path is pinned here too.
 
-func testReplicateILMExpiryDeleteMarker(obj ObjectLayer, instanceType, bucket string, _ http.Handler, creds auth.Credentials, t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	stats := NewReplicationStats(ctx, nil)
-	oldStats := globalReplicationStats.Swap(stats)
-	defer globalReplicationStats.Store(oldStats)
-
-	const name = "ilm-object"
-	if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, enabledBucketVersioningConfig); err != nil {
-		t.Fatal(err)
-	}
-	// DeleteObject refuses ILM expiry (Expiration.Expire) without lifecycle
-	// rules; a date in the past makes every version eligible immediately.
-	ilmXML := []byte(`<LifecycleConfiguration><Rule><ID>ilm-expire</ID><Status>Enabled</Status><Filter/><Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>`)
-	if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketLifecycleConfig, ilmXML); err != nil {
-		t.Fatal(err)
-	}
-	oi, err := obj.PutObject(ctx, bucket, name, mustGetPutObjReader(t, strings.NewReader("data"), 4, "", ""), ObjectOptions{Versioned: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-
+// ilmTestTarget registers a target that applies the deletes it receives and
+// records the requests, and the replication configuration of bucket with
+// existing-object replication set as given.
+func ilmTestTarget(t *testing.T, obj ObjectLayer, bucket, name string, existing bool) (*ilmDeleteTarget, *atomic.Int32) {
+	t.Helper()
 	target := newILMTestTarget(t)
+	var requests atomic.Int32
 	registerILMTestTarget(t, obj, bucket, target, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		topts := ObjectOptions{VersionID: r.URL.Query().Get("versionId"), Versioned: true}
 		switch r.Method {
 		case http.MethodHead:
@@ -151,9 +132,6 @@ func testReplicateILMExpiryDeleteMarker(obj ObjectLayer, instanceType, bucket st
 			w.WriteHeader(http.StatusOK)
 		case http.MethodDelete:
 			target.deletes.Add(1)
-			if topts.VersionID == "" {
-				t.Error("missing remote versionId")
-			}
 			topts.DeleteMarker = r.Header.Get(xhttp.MinIOSourceDeleteMarker) == "true"
 			topts.ReplicationRequest = true
 			topts.SetReplicaStatus(replication.Replica)
@@ -167,67 +145,59 @@ func testReplicateILMExpiryDeleteMarker(obj ObjectLayer, instanceType, bucket st
 		}
 	})
 	setILMTestReplicationConfig(t, bucket, target.arn, target.bucket)
-	restorePool, receive := newILMTestReplicationPool(ctx, obj, stats)
-	defer restorePool()
-
-	if ok := applyExpiryOnNonTransitionedObjects(ctx, obj, oi, lifecycle.Event{Action: lifecycle.DeleteAction}, lcEventSrc_Scanner); !ok {
-		t.Fatalf("%s: ILM expiry did not apply", instanceType)
+	if !existing {
+		meta, err := globalBucketMetadataSys.Get(bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := *meta.replicationConfig
+		cfg.Rules = slices.Clone(cfg.Rules)
+		cfg.Rules[0].ExistingObjectReplication = replication.ExistingObjectReplication{Status: replication.Disabled}
+		meta.replicationConfig = &cfg
+		globalBucketMetadataSys.Set(bucket, meta)
 	}
-
-	deletion := receive()
-	if deletion.ObjectName == "" {
-		t.Fatalf("%s: ILM delete marker was not queued for replication", instanceType)
-	}
-	if !deletion.DeleteMarker || deletion.VersionID != "" || deletion.DeleteMarkerVersionID == "" {
-		t.Fatalf("%s: unexpected queued delete: %+v", instanceType, deletion)
-	}
-	if deletion.EventType != ReplicateILMDelete {
-		t.Fatalf("%s: queued event type = %q, want %q", instanceType, deletion.EventType, ReplicateILMDelete)
-	}
-
-	// The ILM-created marker must carry pending replication state.
-	markerVID := deletion.DeleteMarkerVersionID
-	moi, merr := obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: markerVID, Versioned: true})
-	if !isErrMethodNotAllowed(merr) || !moi.DeleteMarker {
-		t.Fatalf("%s: ILM marker missing: %v %v", instanceType, moi, merr)
-	}
-	if moi.ReplicationStatus != replication.Pending {
-		t.Fatalf("%s: ILM marker replication status = %q, want PENDING", instanceType, moi.ReplicationStatus)
-	}
-
-	result := replicateDelete(ctx, deletion, obj)
-	if result.ReplicationStatus() != replication.Completed {
-		t.Fatalf("%s: marker replication result: %+v", instanceType, result)
-	}
-	if target.deletes.Load() != 1 {
-		t.Fatalf("%s: target saw %d deletes, want 1", instanceType, target.deletes.Load())
-	}
-	// The marker must exist on the target.
-	roi, rerr := obj.GetObjectInfo(ctx, target.bucket, name, ObjectOptions{VersionID: markerVID, Versioned: true})
-	if !isErrMethodNotAllowed(rerr) || !roi.DeleteMarker {
-		t.Fatalf("%s: target marker missing: %v %v", instanceType, roi, rerr)
-	}
-	// The source marker records the completed replication per target. The
-	// composite ReplicationStatus field is unreliable on read-back for
-	// markers carrying a replication timestamp, so assert the raw state.
-	moi, merr = obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: markerVID})
-	if !isErrMethodNotAllowed(merr) || !strings.Contains(moi.ReplicationStatusInternal, "=COMPLETED;") {
-		t.Fatalf("%s: source marker state = %q (err %v), want COMPLETED", instanceType, moi.ReplicationStatusInternal, merr)
-	}
+	return target, &requests
 }
 
-// TestReplicateILMExpiryNoncurrentPurge verifies that a noncurrent version
-// removed by ILM carries a pending version purge state, is queued for delete
-// replication and converges on the target.
-func TestReplicateILMExpiryNoncurrentPurge(t *testing.T) {
+// ilmTestReplicationConfig is the replication configuration the scanner and
+// the replication heal use for bucket.
+func ilmTestReplicationConfig(t *testing.T, bucket string) replicationConfig {
+	t.Helper()
+	cfg, err := getReplicationConfig(t.Context(), bucket)
+	if err != nil || cfg == nil {
+		t.Fatalf("replication config: %v", err)
+	}
+	remotes, err := globalBucketTargetSys.ListBucketTargets(t.Context(), bucket)
+	if err != nil {
+		t.Fatalf("bucket targets: %v", err)
+	}
+	return replicationConfig{Config: cfg, remotes: remotes}
+}
+
+// An ILM delete marker carries no replication state and is not queued; with
+// existing-object replication off, the replication heal leaves it too.
+func TestILMExpiryDeleteMarkerNotReplicated(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
-		t:          t,
-		objAPITest: testReplicateILMExpiryNoncurrentPurge,
-	})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testILMExpiryDeleteMarkerNotReplicated})
 }
 
-func testReplicateILMExpiryNoncurrentPurge(obj ObjectLayer, instanceType, bucket string, _ http.Handler, creds auth.Credentials, t *testing.T) {
+func testILMExpiryDeleteMarkerNotReplicated(obj ObjectLayer, instanceType, bucket string, _ http.Handler, _ auth.Credentials, t *testing.T) {
+	ilmMarkerReplicationCase(obj, instanceType, bucket, t, false)
+}
+
+// The inherited exception: with existing-object replication on, the
+// replication heal sends an empty-state ILM delete marker, as it did before
+// lifecycle deletes were ever replication-aware.
+func TestILMExpiryDeleteMarkerExistingObjectResync(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testILMExpiryDeleteMarkerExistingObjectResync})
+}
+
+func testILMExpiryDeleteMarkerExistingObjectResync(obj ObjectLayer, instanceType, bucket string, _ http.Handler, _ auth.Credentials, t *testing.T) {
+	ilmMarkerReplicationCase(obj, instanceType, bucket, t, true)
+}
+
+func ilmMarkerReplicationCase(obj ObjectLayer, instanceType, bucket string, t *testing.T, existing bool) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	stats := NewReplicationStats(ctx, nil)
@@ -238,96 +208,145 @@ func testReplicateILMExpiryNoncurrentPurge(obj ObjectLayer, instanceType, bucket
 	if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, enabledBucketVersioningConfig); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := obj.PutObject(ctx, bucket, name, mustGetPutObjReader(t, strings.NewReader("v1"), 2, "", ""), ObjectOptions{Versioned: true}); err != nil {
+	ilmXML := []byte(`<LifecycleConfiguration><Rule><ID>ilm-expire</ID><Status>Enabled</Status><Filter/><Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule></LifecycleConfiguration>`)
+	if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketLifecycleConfig, ilmXML); err != nil {
 		t.Fatal(err)
 	}
-	v1Info, err := obj.PutObject(ctx, bucket, name, mustGetPutObjReader(t, strings.NewReader("v2"), 2, "", ""), ObjectOptions{Versioned: true})
+	oi, err := obj.PutObject(ctx, bucket, name, mustGetPutObjReader(t, strings.NewReader("data"), 4, "", ""), ObjectOptions{Versioned: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	v1 := v1Info.VersionID
-	if v1 == "" {
-		t.Fatalf("%s: missing version ID on second version", instanceType)
+	target, requests := ilmTestTarget(t, obj, bucket, name, existing)
+	restorePool, _ := newILMTestReplicationPool(ctx, obj, stats)
+	defer restorePool()
+	queue := globalReplicationPool.Get().workers[0]
+
+	if ok := applyExpiryOnNonTransitionedObjects(ctx, obj, oi, lifecycle.Event{Action: lifecycle.DeleteAction}, lcEventSrc_Scanner); !ok {
+		t.Fatalf("%s: ILM expiry did not apply", instanceType)
+	}
+	if n := len(queue); n != 0 {
+		t.Fatalf("%s: ILM expiry queued %d replication tasks", instanceType, n)
+	}
+	marker, err := obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{Versioned: true})
+	if !isErrMethodNotAllowed(err) && !isErrObjectNotFound(err) || !marker.DeleteMarker || marker.VersionID == "" {
+		t.Fatalf("%s: latest after expiry: %+v %v", instanceType, marker, err)
+	}
+	marker.Bucket, marker.Name = bucket, name
+	if !marker.ReplicationStatus.Empty() || marker.ReplicationStatusInternal != "" {
+		t.Fatalf("%s: ILM marker carries replication state %q / %q", instanceType, marker.ReplicationStatus, marker.ReplicationStatusInternal)
 	}
 
-	target := newILMTestTarget(t)
-	registerILMTestTarget(t, obj, bucket, target, func(w http.ResponseWriter, r *http.Request) {
-		topts := ObjectOptions{VersionID: r.URL.Query().Get("versionId"), Versioned: true}
-		switch r.Method {
-		case http.MethodDelete:
-			target.deletes.Add(1)
-			if topts.VersionID == "" {
-				t.Error("missing remote versionId")
-			}
-			topts.DeleteMarker = r.Header.Get(xhttp.MinIOSourceDeleteMarker) == "true"
-			topts.ReplicationRequest = true
-			topts.SetReplicaStatus(replication.Replica)
-			if _, err := obj.DeleteObject(r.Context(), target.bucket, name, topts); err != nil && !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
-				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Errorf("unexpected remote method %s", r.Method)
+	// The replication heal, as the scanner runs it for the marker.
+	queueReplicationHeal(ctx, bucket, marker, ilmTestReplicationConfig(t, bucket), 0)
+	if !existing {
+		if n := len(queue); n != 0 {
+			t.Fatalf("%s: replication heal queued %d tasks for an ILM marker", instanceType, n)
 		}
-	})
-	// Pre-create a marker version on the target with the same version ID as
-	// the noncurrent version being purged, so the purge can be observed.
-	if _, err := obj.DeleteObject(ctx, target.bucket, name, ObjectOptions{VersionID: v1, Versioned: true, DeleteMarker: true, ReplicationRequest: true}); err != nil {
+		if n := requests.Load(); n != 0 {
+			t.Fatalf("%s: the target saw %d requests", instanceType, n)
+		}
+		return
+	}
+	// The test harness reuses the bucket name for each object layer type, so
+	// targets registered for earlier ones are still listed: expect a task for
+	// at least the target of this run. Existing-object replication may also
+	// resync the data version; only the marker's tasks matter here.
+	markerTasks := 0
+	for n := len(queue); n > 0; n-- {
+		op := <-queue
+		deletion, ok := op.(DeletedObjectReplicationInfo)
+		if !ok {
+			continue
+		}
+		if !deletion.DeleteMarker || deletion.DeleteMarkerVersionID != marker.VersionID {
+			t.Fatalf("%s: unexpected resync task %+v", instanceType, deletion)
+		}
+		markerTasks++
+		replicateDelete(ctx, deletion, obj)
+	}
+	if markerTasks == 0 {
+		t.Fatalf("%s: existing-object resync queued no task for the marker", instanceType)
+	}
+	if target.deletes.Load() == 0 {
+		t.Fatalf("%s: the target saw no delete", instanceType)
+	}
+}
+
+// An API delete of a version still carries a purge decision and is queued:
+// only lifecycle deletes are left out of replication.
+func TestAPIVersionDeleteStillReplicated(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testAPIVersionDeleteStillReplicated})
+}
+
+func testAPIVersionDeleteStillReplicated(obj ObjectLayer, instanceType, bucket string, router http.Handler, creds auth.Credentials, t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stats := NewReplicationStats(ctx, nil)
+	oldStats := globalReplicationStats.Swap(stats)
+	defer globalReplicationStats.Store(oldStats)
+
+	const name = "api-object"
+	if _, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, enabledBucketVersioningConfig); err != nil {
 		t.Fatal(err)
 	}
-	setILMTestReplicationConfig(t, bucket, target.arn, target.bucket)
+	if _, err := obj.PutObject(ctx, bucket, name, mustGetPutObjReader(t, strings.NewReader("v1"), 2, "", ""), ObjectOptions{Versioned: true}); err != nil {
+		t.Fatal(err)
+	}
+	v1, err := obj.PutObject(ctx, bucket, name, mustGetPutObjReader(t, strings.NewReader("v2"), 2, "", ""), ObjectOptions{Versioned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ilmTestTarget(t, obj, bucket, name, false)
 	restorePool, receive := newILMTestReplicationPool(ctx, obj, stats)
 	defer restorePool()
 
-	// The scanner evaluates noncurrent version expiry per version; build the
-	// delete entry exactly the way the scanner does for the oldest version.
-	vi, verr := obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: v1, Versioned: true})
-	if verr != nil {
-		t.Fatalf("%s: missing noncurrent version: %v", instanceType, verr)
+	req, err := newTestSignedRequestV4(http.MethodDelete, getDeleteObjectURL("", bucket, name)+"?versionId="+v1.VersionID, 0, nil, creds.AccessKey, creds.SecretKey, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	otd := ilmPurgeToDelete(ctx, bucket, vi, true)
-	if otd.VersionPurgeStatus != replication.VersionPurgePending || otd.VersionPurgeStatuses == "" || otd.ReplicateDecisionStr == "" {
-		t.Fatalf("%s: ILM purge entry carries no replication state: %+v", instanceType, otd)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("%s: DELETE: %d %s", instanceType, rec.Code, rec.Body.String())
 	}
-	if plain := ilmPurgeToDelete(ctx, bucket, vi, false); plain.VersionPurgeStatus != "" || plain.ReplicateDecisionStr != "" {
-		t.Fatalf("%s: non-replicating purge entry carries state: %+v", instanceType, plain)
-	}
-
-	deleteObjectVersions(ctx, obj, bucket, []ObjectToDelete{otd}, []lifecycle.Event{{Action: lifecycle.DeleteVersionAction}})
-
-	// The version must remain locally as a tombstone with pending purge
-	// state until replication completes.
-	pi, perr := obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: v1, Versioned: true})
-	if !isErrMethodNotAllowed(perr) {
-		t.Fatalf("%s: purged version metadata lost: %v", instanceType, perr)
-	}
-	if pi.VersionPurgeStatus != replication.VersionPurgePending {
-		t.Fatalf("%s: purged version state = %q, want PENDING", instanceType, pi.VersionPurgeStatus)
-	}
-
 	deletion := receive()
-	if deletion.ObjectName == "" {
-		t.Fatalf("%s: ILM noncurrent purge was not queued for replication", instanceType)
+	if deletion.VersionID != v1.VersionID || deletion.VersionPurgeStatus() != replication.VersionPurgePending {
+		t.Fatalf("%s: API version delete not queued for replication: %+v", instanceType, deletion)
 	}
-	if deletion.VersionID != v1 || deletion.DeleteMarkerVersionID != "" || deletion.DeleteMarker {
-		t.Fatalf("%s: unexpected queued purge: %+v", instanceType, deletion)
-	}
+}
 
-	result := replicateDelete(ctx, deletion, obj)
-	if result.VersionPurgeStatus() != replication.VersionPurgeComplete {
-		t.Fatalf("%s: purge replication result: %+v", instanceType, result)
+// The scanner's noncurrent expiry deletes the version at once: no pending
+// purge tombstone, nothing queued, the target untouched.
+func TestILMNoncurrentPurgeNotReplicatedThroughScanner(t *testing.T) {
+	s := newSplitILM(t, versioning.Enabled, splitILMRules)
+	ctx := t.Context()
+	stats := NewReplicationStats(ctx, nil)
+	oldStats := globalReplicationStats.Swap(stats)
+	t.Cleanup(func() { globalReplicationStats.Store(oldStats) })
+
+	const key = "ncv-scanner-replicated"
+	s.write(key, splitAt("old", 5, 0))
+	s.write(key, splitAt("new", 3, 0))
+	old := s.ids[key+" old"]
+	target, requests := ilmTestTarget(t, s.z, s.bucket, key, false)
+	putConsistencyObject(t, s.z, target.bucket, key, 0, "replica", ObjectOptions{Versioned: true, VersionID: old})
+	restorePool, _ := newILMTestReplicationPool(ctx, s.z, stats)
+	t.Cleanup(restorePool)
+	s.replication = ilmTestReplicationConfig(t, s.bucket)
+
+	s.scan(0)
+
+	if _, err := s.z.GetObjectInfo(ctx, s.bucket, key, ObjectOptions{VersionID: old}); !isErrVersionNotFound(err) {
+		t.Fatalf("expired version: %v, want it gone (no pending purge tombstone)", err)
 	}
-	if target.deletes.Load() != 1 {
-		t.Fatalf("%s: target saw %d deletes, want 1", instanceType, target.deletes.Load())
+	if n := len(globalReplicationPool.Get().workers[0]); n != 0 {
+		t.Fatalf("noncurrent expiry queued %d replication tasks", n)
 	}
-	// The purge must have converged on the target.
-	if _, terr := obj.GetObjectInfo(ctx, target.bucket, name, ObjectOptions{VersionID: v1, Versioned: true}); !isErrVersionNotFound(terr) && !isErrObjectNotFound(terr) {
-		t.Fatalf("%s: target version still present: %v", instanceType, terr)
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("the target saw %d requests", n)
 	}
-	// Once the purge completes the local tombstone is freed and the version
-	// is gone on both sides.
-	if _, terr := obj.GetObjectInfo(ctx, bucket, name, ObjectOptions{VersionID: v1}); !isErrVersionNotFound(terr) && !isErrObjectNotFound(terr) {
-		t.Fatalf("%s: purged version still present locally: %v", instanceType, terr)
+	if _, err := s.z.GetObjectInfo(ctx, target.bucket, key, ObjectOptions{VersionID: old}); err != nil {
+		t.Fatalf("target copy changed: %v", err)
 	}
 }

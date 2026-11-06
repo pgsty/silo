@@ -1132,7 +1132,13 @@ eventLoop:
 		case lifecycle.DeleteVersionAction: // noncurrent versions expiration
 			remainingVersions--
 			size = 0
-			toDel = append(toDel, ilmPurgeToDelete(ctx, i.bucket, oi, i.replication.Config != nil))
+			opts := objOpts[idx]
+			toDel = append(toDel, ObjectToDelete{
+				ObjectV: ObjectV{
+					ObjectName: opts.Name,
+					VersionID:  opts.VersionID,
+				},
+			})
 			noncurrentEvents = append(noncurrentEvents, event)
 
 		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
@@ -1241,20 +1247,6 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		}
 	}
 
-	// ILM-created delete markers and version purges must carry the same
-	// replication decision as API-created deletes. DeleteAll is intentionally
-	// excluded: it is an object-local purge and has no single version to
-	// replicate.
-	if lcEvent.Action == lifecycle.DeleteAction || lcEvent.Action == lifecycle.DeleteVersionAction {
-		opts.SetEvalMetadataFn(func(oi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
-			return checkReplicateDelete(ctx, obj.Bucket, ObjectToDelete{
-				ObjectV: ObjectV{
-					ObjectName: oi.Name,
-					VersionID:  opts.VersionID,
-				},
-			}, *oi, opts, gerr), nil
-		})
-	}
 	var (
 		dobj ObjectInfo
 		err  error
@@ -1292,29 +1284,6 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	}
 	if dobj.Name == "" {
 		dobj = obj
-	}
-
-	// Queue replication of the ILM-created delete marker or version purge,
-	// mirroring the DELETE handler's post-delete scheduling.
-	if dobj.ReplicationStatus == replication.Pending || dobj.VersionPurgeStatus == replication.VersionPurgePending {
-		dmVersionID, versionID := "", ""
-		if dobj.DeleteMarker && dobj.VersionPurgeStatus.Empty() {
-			dmVersionID = dobj.VersionID
-		} else {
-			versionID = dobj.VersionID
-		}
-		scheduleReplicationDelete(ctx, DeletedObjectReplicationInfo{
-			DeletedObject: DeletedObject{
-				ObjectName:            dobj.Name,
-				VersionID:             versionID,
-				DeleteMarkerVersionID: dmVersionID,
-				DeleteMarkerMTime:     DeleteMarkerMTime{dobj.ModTime},
-				DeleteMarker:          dobj.DeleteMarker,
-				ReplicationState:      dobj.ReplicationState(),
-			},
-			Bucket:    obj.Bucket,
-			EventType: ReplicateILMDelete,
-		}, objLayer)
 	}
 
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
@@ -1402,33 +1371,6 @@ func deleteAllNotCompleted(ctx context.Context, obj ObjectInfo, lcEvent lifecycl
 // Apply object, object version, restored object or restored object version action on the given object
 func applyExpiryRule(event lifecycle.Event, src lcEventSrc, obj ObjectInfo) {
 	globalExpiryState.enqueueByDays(obj, event, src)
-}
-
-// ilmPurgeToDelete builds the bulk delete entry for an ILM-initiated removal
-// of a noncurrent version. The entry carries a pending version-purge state so
-// the purge is replicated and retried like an API version purge.
-func ilmPurgeToDelete(ctx context.Context, bucket string, oi ObjectInfo, replicate bool) ObjectToDelete {
-	otd := ObjectToDelete{
-		ObjectV: ObjectV{
-			ObjectName: oi.Name,
-			VersionID:  oi.VersionID,
-		},
-	}
-	if !replicate {
-		return otd
-	}
-	delOpts := ObjectOptions{
-		Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, oi.Name),
-		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, oi.Name),
-	}
-	dsc := checkReplicateDelete(ctx, bucket, otd, oi, delOpts, nil)
-	if !dsc.ReplicateAny() {
-		return otd
-	}
-	otd.VersionPurgeStatus = replication.VersionPurgePending
-	otd.VersionPurgeStatuses = dsc.PendingStatus()
-	otd.ReplicateDecisionStr = dsc.String()
-	return otd
 }
 
 // objectPath returns the prefix and object name.
