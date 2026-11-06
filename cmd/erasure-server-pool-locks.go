@@ -87,27 +87,34 @@ type objectLockRequest struct {
 func (z *erasureServerPools) lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error) {
 	type entry struct {
 		objectLockRequest
-		domain int
+		domain   int
+		resource string
 	}
+	// A lock is one resource in one lock table. The resource is the cleaned
+	// name the lockers see; the domain is the set whose lockers grant it,
+	// or 0 where every set shares one local table or the pools lock
+	// applies.
+	splitDomains := z.SinglePool() && !z.serverPools[0].sharesLocalNSLock()
 	locks := make([]entry, 0, len(reqs))
 	for _, r := range reqs {
 		r.object = encodeDirObject(r.object)
-		i := slices.IndexFunc(locks, func(e entry) bool { return e.bucket == r.bucket && e.object == r.object })
+		domain := 0
+		if splitDomains {
+			domain = z.serverPools[0].getHashedSetIndex(r.object)
+		}
+		resource := pathJoin(r.bucket, r.object)
+		i := slices.IndexFunc(locks, func(e entry) bool { return e.domain == domain && e.resource == resource })
 		if i >= 0 {
 			locks[i].write = locks[i].write || r.write
 			continue
 		}
-		domain := 0
-		if z.SinglePool() {
-			domain = z.serverPools[0].getHashedSetIndex(r.object)
-		}
-		locks = append(locks, entry{objectLockRequest: r, domain: domain})
+		locks = append(locks, entry{objectLockRequest: r, domain: domain, resource: resource})
 	}
 	slices.SortFunc(locks, func(a, b entry) int {
 		if a.domain != b.domain {
 			return a.domain - b.domain
 		}
-		return strings.Compare(pathJoin(a.bucket, a.object), pathJoin(b.bucket, b.object))
+		return strings.Compare(a.resource, b.resource)
 	})
 	nsLocks := make([]nsLockRequest, len(locks))
 	for i, l := range locks {

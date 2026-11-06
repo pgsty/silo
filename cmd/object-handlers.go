@@ -1483,8 +1483,19 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// request's context. Both locks are released once the copy has been
 	// written: a synchronous replication below reads the destination with its
 	// own lock.
+	//
+	// Names are checked before they are locked: a lock is taken on the
+	// cleaned name, so an invalid alias such as a//x would lock the resource
+	// of a/x a second time. The source is checked first, as reading it did
+	// before. An invalid destination is not locked; the copy fails at its
+	// own destination check before it writes, after the source errors that
+	// take precedence over it.
+	if err := checkGetObjArgs(ctx, srcBucket, srcObject); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
 	locks := []objectLockRequest{{bucket: srcBucket, object: srcObject}}
-	if !remoteCallRequired {
+	if !remoteCallRequired && checkCopyObjArgs(ctx, dstBucket, dstObject) == nil {
 		locks = append(locks, objectLockRequest{bucket: dstBucket, object: dstObject, write: true})
 	}
 	lkctx, unlock, err := objectAPI.lockObjects(ctx, locks...)
