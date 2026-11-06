@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -522,5 +523,100 @@ func TestFreeVersionDecommissionTierUnavailable(t *testing.T) {
 	}
 	if want := []string{f.remote("obj-01", "v3"), f.remote("obj-02", "v1")}; !slices.Equal(slices.Sorted(slices.Values(f.tier.removed)), want) {
 		t.Errorf("remote objects removed: %v, want %v", f.tier.removed, want)
+	}
+}
+
+// A free version whose tier is no longer configured keeps its bucket in the
+// decommission queue, and the decommission fails, but the buckets after it
+// are still moved. Once the tier is configured again, a retry completes it.
+func TestPoolsDecommissionContinuesPastStuckBucket(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	ctx := t.Context()
+	const other = "zz-other" // listed after f.bucket
+	if err := f.z.MakeBucket(ctx, other, MakeBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"k1", "k2", "dir/k3"}
+	for _, key := range keys {
+		putConsistencyObject(t, f.z, other, key, 0, key, ObjectOptions{})
+	}
+	delete(globalTierConfigMgr.drivercache, "WARM")
+
+	if info := f.decommission(); info.Complete || !info.Failed {
+		t.Fatalf("decommission with a free version of a removed tier: complete %v, failed %v; want failed", info.Complete, info.Failed)
+	}
+	f.z.poolMetaMutex.RLock()
+	var queued []string
+	for _, b := range f.z.poolMeta.PendingBuckets(0) {
+		queued = append(queued, b.String())
+	}
+	f.z.poolMetaMutex.RUnlock()
+	if !slices.Contains(queued, f.bucket) || slices.Contains(queued, other) {
+		t.Errorf("queued buckets %v, want %s and not %s", queued, f.bucket, other)
+	}
+	for _, key := range keys {
+		if _, err := f.z.serverPools[0].GetObjectInfo(ctx, other, key, ObjectOptions{}); !isErrObjectNotFound(err) {
+			t.Errorf("%s/%s still in pool 0: %v", other, key, err)
+		}
+		if body := migrationTestBody(t, f.z.GetObjectNInfo, other, key, ""); body != key {
+			t.Errorf("%s/%s reads %q", other, key, body)
+		}
+	}
+	for _, object := range []string{"obj-01", "obj-02"} {
+		if got, want := f.stored(0, object), []string{"free"}; !slices.Equal(got, want) {
+			t.Errorf("pool 0 holds %v of %s, want %v", got, object, want)
+		}
+	}
+	if len(f.tier.removed) != 0 {
+		t.Errorf("remote objects removed: %v", f.tier.removed)
+	}
+
+	// See TestFreeVersionDecommissionTierUnavailable.
+	for _, set := range f.z.serverPools[0].sets {
+		for _, disk := range set.getDisks() {
+			if err := disk.MakeVol(ctx, pathJoin(minioMetaBucket, bucketMetaPrefix)); err != nil && !errors.Is(err, errVolumeExists) {
+				t.Fatal(err)
+			}
+		}
+	}
+	globalTierConfigMgr.drivercache["WARM"] = f.tier
+	if info := f.decommission(); !info.Complete || info.Failed {
+		t.Fatalf("retry: complete %v, failed %v; want complete", info.Complete, info.Failed)
+	}
+	for _, object := range []string{"obj-01", "obj-02"} {
+		if got := f.stored(0, object); len(got) != 0 {
+			t.Errorf("pool 0 holds %v of %s after the retry", got, object)
+		}
+	}
+	if want := []string{f.remote("obj-01", "v3"), f.remote("obj-02", "v1")}; !slices.Equal(slices.Sorted(slices.Values(f.tier.removed)), want) {
+		t.Errorf("remote objects removed: %v, want %v", f.tier.removed, want)
+	}
+}
+
+// The error of a free version whose tier is not configured names the free
+// version, its remote object and the tier, and says what to do.
+func TestRemoveFreeVersionsMissingTierError(t *testing.T) {
+	f := newFreeVersionTest(t, "")
+	delete(globalTierConfigMgr.drivercache, "WARM")
+	buf := f.xlMeta(0, "obj-02")
+	fivs, err := getFileInfoVersions(buf, f.bucket, "obj-02", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fivs.FreeVersions) != 1 {
+		t.Fatalf("%d free versions, want 1", len(fivs.FreeVersions))
+	}
+	fv := fivs.FreeVersions[0]
+	err = f.z.removeFreeVersions(t.Context(), f.bucket, "obj-02", 0, fivs.FreeVersions)
+	if !errors.Is(err, errTierNotFound) {
+		t.Fatalf("err = %v, want errTierNotFound", err)
+	}
+	for _, want := range []string{fv.VersionID, f.remote("obj-02", "v1"), "tier WARM", "configure tier WARM again"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	if got, want := f.stored(0, "obj-02"), []string{"free"}; !slices.Equal(got, want) {
+		t.Errorf("pool 0 holds %v of obj-02, want %v", got, want)
 	}
 }

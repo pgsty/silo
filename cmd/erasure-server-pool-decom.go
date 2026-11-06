@@ -1098,12 +1098,26 @@ func (m *decomMetrics) log(d decomMetric, poolIdx int, paths ...string) func(z i
 	}
 }
 
+// decommissionInBackground decommissions the pending buckets of pool idx. A
+// bucket that cannot be finished stays queued and does not stop the others:
+// the first such error is returned after the last bucket, so the
+// decommission fails and a retry resumes with what is left. A canceled
+// context returns at once.
 func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx int) error {
 	pool := z.serverPools[idx]
 	z.poolMetaMutex.RLock()
 	pending := z.poolMeta.PendingBuckets(idx)
 	z.poolMetaMutex.RUnlock()
 
+	var firstErr error
+	failed := func(bucket decomBucketInfo, err error) {
+		if firstErr == nil {
+			firstErr = err
+			return
+		}
+		// Only the first error is returned; log the others.
+		decomLogIf(ctx, fmt.Errorf("decommission of bucket %s: %w", bucket, err))
+	}
 	for _, bucket := range pending {
 		z.poolMetaMutex.RLock()
 		isDecommissioned := z.poolMeta.isBucketDecommissioned(idx, bucket.String())
@@ -1127,7 +1141,11 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 		stopFn := globalDecommissionMetrics.log(decomMetricDecommissionBucket, idx, bucket.Name)
 		if err := z.decommissionPool(ctx, idx, pool, bucket); err != nil {
 			stopFn(0, err)
-			return err
+			if contextCanceled(ctx) {
+				return err
+			}
+			failed(bucket, err)
+			continue
 		}
 		// Do not retire the bucket from the resumable queue until every
 		// source version and free version is gone. In particular, an ILM
@@ -1136,7 +1154,11 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 		// before that action performs its logical and tier cleanup.
 		if err := z.checkAfterDecomBucket(ctx, idx, bucket); err != nil {
 			stopFn(0, err)
-			return err
+			if contextCanceled(ctx) {
+				return err
+			}
+			failed(bucket, err)
+			continue
 		}
 		stopFn(0, nil)
 
@@ -1146,7 +1168,7 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 		}
 		z.poolMetaMutex.Unlock()
 	}
-	return nil
+	return firstErr
 }
 
 // removeFreeVersions removes the free versions fvs of object from the pool
@@ -1161,6 +1183,13 @@ func (z *erasureServerPools) removeFreeVersions(ctx context.Context, bucket, obj
 	}
 	for _, fv := range fvs {
 		err := deleteObjectFromRemoteTier(ctx, fv.TransitionedObjName, fv.TransitionVersionID, fv.TransitionTier)
+		if errors.Is(err, errTierNotFound) {
+			// The free version is the only record of its remote object. It
+			// stays until the tier can be reached again.
+			return fmt.Errorf("unable to remove the free version %s of %s/%s: its remote object %s is in tier %s, which is not configured; "+
+				"configure tier %s again under the same name so that the remote object and the free version can be removed: %w",
+				fv.VersionID, bucket, object, fv.TransitionedObjName, fv.TransitionTier, fv.TransitionTier, err)
+		}
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			return fmt.Errorf("unable to remove the remote object %s of a free version of %s/%s from tier %s: %w",
 				fv.TransitionedObjName, bucket, object, fv.TransitionTier, err)
