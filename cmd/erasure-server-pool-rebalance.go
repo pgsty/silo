@@ -594,6 +594,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			if lc == nil {
 				return lifecycle.NoneAction
 			}
+			history.loadTier(ctx, z, bucket, object)
 			versioned := vc != nil && vc.Versioned(object)
 			objInfo := fi.ToObjectInfo(bucket, object, versioned)
 

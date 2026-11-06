@@ -807,6 +807,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			if lc == nil {
 				return lifecycle.NoneAction
 			}
+			history.loadTier(ctx, z, bucket, object)
 			versioned := vc != nil && vc.Versioned(object)
 			objInfo := fi.ToObjectInfo(bucket, object, versioned)
 
@@ -1186,7 +1187,11 @@ func (z *erasureServerPools) removeFreeVersions(ctx context.Context, bucket, obj
 		return nil
 	}
 	for _, fv := range fvs {
-		err := deleteObjectFromRemoteTier(ctx, fv.TransitionedObjName, fv.TransitionVersionID, fv.TransitionTier)
+		err := z.deleteTierTuple(ctx, bucket, object, tierRemoteTuple{
+			Tier:      fv.TransitionTier,
+			Object:    fv.TransitionedObjName,
+			VersionID: fv.TransitionVersionID,
+		})
 		if errors.Is(err, errTierNotFound) {
 			// The free version is the only record of its remote object. It
 			// stays until the tier can be reached again.
@@ -1197,25 +1202,6 @@ func (z *erasureServerPools) removeFreeVersions(ctx context.Context, bucket, obj
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			return fmt.Errorf("unable to remove the remote object %s of a free version of %s/%s from tier %s: %w",
 				fv.TransitionedObjName, bucket, object, fv.TransitionTier, err)
-		}
-	}
-	object = encodeDirObject(object)
-	lk := z.NewNSLock(bucket, object)
-	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return err
-	}
-	ctx = lkctx.Context()
-	defer lk.Unlock(lkctx)
-	for _, fv := range fvs {
-		_, err := z.serverPools[idx].DeleteObject(ctx, bucket, object, ObjectOptions{
-			VersionID:        fv.VersionID,
-			InclFreeVersions: true,
-			NoLock:           true,
-			NoAuditLog:       true,
-		})
-		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			return err
 		}
 	}
 	return nil

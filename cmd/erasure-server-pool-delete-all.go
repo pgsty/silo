@@ -300,11 +300,9 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 	// Check every write before deleting any: the accepted revisions, then
 	// every revision on every drive that the purge will delete on.
 	ids := make(map[string]bool, len(history))
-	held := make([]bool, len(z.serverPools))
 	for _, v := range history {
 		ids[v.id] = true
 		for _, c := range v.copies {
-			held[c.pool] = true
 			if err := deleteAllRefuses(ctx, bucket, object, c.fi, lr.LockEnabled); err != nil {
 				return fail(err)
 			}
@@ -324,9 +322,6 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 	}
 	drives := make([][]StorageAPI, len(z.serverPools))
 	for pool := range z.serverPools {
-		if !held[pool] {
-			continue
-		}
 		if drives[pool], err = z.serverPools[pool].getHashedSet(object).deleteAllDrives(ctx, bucket, object, ids, lr.LockEnabled, writes); err != nil {
 			return fail(err)
 		}
@@ -432,7 +427,7 @@ func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object str
 		return nil, err
 	}
 	for i := range disks {
-		if errors.Is(errs[i], errFileNotFound) {
+		if errors.Is(errs[i], errFileNotFound) || errors.Is(errs[i], errVolumeNotFound) {
 			continue
 		}
 		if errs[i] != nil {
@@ -447,6 +442,11 @@ func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object str
 			return nil, errDeleteAllHistoryUnavailable
 		}
 		for _, fi := range versions {
+			// A minority-drive or other-pool revision can be hidden by the
+			// logical history merge. It still owns its remote object.
+			if tierRefusesDeleteAll(fi.TierFreeVersion(), fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName) {
+				return nil, errDeleteAllTiered
+			}
 			if fi.TierFreeVersion() || !ids[deleteAllVersionID(fi.VersionID)] {
 				continue
 			}

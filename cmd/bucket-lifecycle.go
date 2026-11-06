@@ -162,7 +162,7 @@ func (n noncurrentVersionsTask) OpHash() uint64 {
 }
 
 func (j jentry) OpHash() uint64 {
-	return xxh3.HashString(j.TierName + j.ObjName)
+	return xxh3.HashString(j.Bucket + j.Object + j.TierName + j.RemoteObject + j.RemoteVersionID)
 }
 
 func (e expiryTask) OpHash() uint64 {
@@ -354,7 +354,16 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 			case noncurrentVersionsTask:
 				deleteObjectVersions(es.ctx, es.objAPI, v.bucket, v.versions, v.events)
 			case jentry:
-				transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
+				z, ok := es.objAPI.(*erasureServerPools)
+				if !ok {
+					transitionLogIf(es.ctx, errTierOwnershipUnavailable)
+					continue
+				}
+				transitionLogIf(es.ctx, z.deleteTierTuple(es.ctx, v.Bucket, v.Object, tierRemoteTuple{
+					Tier:      v.TierName,
+					Object:    v.RemoteObject,
+					VersionID: v.RemoteVersionID,
+				}))
 			case freeVersionTask:
 				oi := v.ObjectInfo
 				traceFn := globalLifecycleSys.trace(oi)
@@ -370,19 +379,26 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 					}
 					return err
 				}
-				// Remove the remote object
-				err := deleteObjectFromRemoteTier(es.ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
+				z, ok := es.objAPI.(*erasureServerPools)
+				if !ok {
+					transitionLogIf(es.ctx, errTierOwnershipUnavailable)
+					traceFn(ILMFreeVersionDelete, nil, errTierOwnershipUnavailable)
+					continue
+				}
+
+				// Check ownership, remove the remote object, and remove only the
+				// matching free record while the object lock is held.
+				err := z.deleteTierTuple(es.ctx, oi.Bucket, oi.Name, tierRemoteTuple{
+					Tier:      oi.TransitionedObject.Tier,
+					Object:    oi.TransitionedObject.Name,
+					VersionID: oi.TransitionedObject.VersionID,
+				})
 				if ignoreNotFoundErr(err) != nil {
 					transitionLogIf(es.ctx, err)
 					traceFn(ILMFreeVersionDelete, nil, err)
 					continue
 				}
 
-				// Remove this free version
-				_, err = es.objAPI.DeleteObject(es.ctx, oi.Bucket, oi.Name, ObjectOptions{
-					VersionID:        oi.VersionID,
-					InclFreeVersions: true,
-				})
 				if err == nil {
 					auditLogLifecycle(es.ctx, oi, ILMFreeVersionDelete, nil, traceFn)
 				}
@@ -661,7 +677,20 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	}
 
 	if !keepRemote {
-		if err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier); err != nil {
+		z, ok := objectAPI.(*erasureServerPools)
+		if !ok {
+			transitionLogIf(ctx, errTierOwnershipUnavailable)
+			return nil // The completed local expiry owns a durable free record.
+		}
+		if err := z.deleteTierTuple(ctx, oi.Bucket, oi.Name, tierRemoteTuple{
+			Tier:      oi.TransitionedObject.Tier,
+			Object:    oi.TransitionedObject.Name,
+			VersionID: oi.TransitionedObject.VersionID,
+		}); err != nil {
+			// The hot delete has already created a durable free record. Keep
+			// the expiry successful while the scanner retries remote cleanup;
+			// ownership or tier errors must never cause a second remote delete
+			// without that record.
 			transitionLogIf(ctx, err)
 		}
 	}

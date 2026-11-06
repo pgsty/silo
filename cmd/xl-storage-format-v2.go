@@ -1374,6 +1374,19 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		}
 	}
 
+	if fi.TierFreeVersion() {
+		_, ver, err := x.findVersion(uv)
+		if err != nil {
+			return "", err
+		}
+		if ver.Type != DeleteType || !ver.DeleteMarker.FreeVersion() ||
+			string(ver.DeleteMarker.MetaSys[metaTierName]) != fi.TransitionTier ||
+			string(ver.DeleteMarker.MetaSys[metaTierObjName]) != fi.TransitionedObjName ||
+			string(ver.DeleteMarker.MetaSys[metaTierVersionID]) != fi.TransitionVersionID {
+			return "", errFileVersionNotFound
+		}
+	}
+
 	if fi.ExpireRestored {
 		i, ver, err := x.findVersion(uv)
 		if err != nil {

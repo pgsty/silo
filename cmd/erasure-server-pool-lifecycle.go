@@ -780,6 +780,16 @@ func (z *erasureServerPools) migrationExpiryApplies(ctx context.Context, oi Obje
 		opts.VersionID = oi.VersionID
 	}
 	if evt.Action.DeleteAll() {
+		// A whole-key purge cannot handle any live tier revision, including
+		// one hidden by a duplicate-version merge or a minority drive. Move
+		// these versions instead, retaining their remote cleanup ownership.
+		if h == nil {
+			h = &migrationHistory{}
+		}
+		h.loadTier(ctx, z, oi.Bucket, oi.Name)
+		if h.tierBlocked {
+			return false
+		}
 		opts.DeletePrefix = true
 	}
 	opts.Transition.ExpireRestored = evt.Action.DeleteRestored()
@@ -807,6 +817,20 @@ var migrationHistoryLoaded func(object string)
 // migrationHistory is the history of one key in all pools, read once by a
 // decommission or rebalance walk for the prechecks of its versions.
 type migrationHistory struct {
-	loaded bool
-	all    lifecycleAllPools
+	tierLoaded  bool
+	tierBlocked bool
+	loaded      bool
+	all         lifecycleAllPools
+}
+
+// Load before moving the first version: moving a hot version can overwrite a
+// minority tier revision in the destination, turning it into a free record.
+// That must not change the whole-key expiry decision halfway through a walk.
+func (h *migrationHistory) loadTier(ctx context.Context, z *erasureServerPools, bucket, object string) {
+	if h.tierLoaded {
+		return
+	}
+	tier, err := z.readTierHistory(ctx, bucket, encodeDirObject(object))
+	h.tierBlocked = err != nil || len(tier.liveTuples) != 0
+	h.tierLoaded = true
 }
