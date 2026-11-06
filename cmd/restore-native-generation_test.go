@@ -98,6 +98,21 @@ func (d restoreGenerationOffline) WriteMetadata(ctx context.Context, orig, bucke
 	return d.StorageAPI.WriteMetadata(ctx, orig, bucket, object, fi)
 }
 
+// restoreCaptureOptions returns a background restore that records its
+// options instead of restoring. When the background restore returns, the POST
+// handler releases the restore lock it handed over. A test that restores later
+// with the recorded options would race that release and could run with a lock
+// context canceled under it. So the lock is released here, before the options
+// are recorded, and the later restore takes it again, as a queued worker whose
+// lock ended does.
+func restoreCaptureOptions(captured chan<- ObjectOptions) func(context.Context, string, string, ObjectOptions) error {
+	return func(_ context.Context, _, _ string, opts ObjectOptions) error {
+		opts.Transition.owner.release()
+		captured <- opts
+		return nil
+	}
+}
+
 // restoreGenerationMetadata returns the version's metadata on each drive.
 func restoreGenerationMetadata(t *testing.T, disks []StorageAPI, r *restoreTest, versionID string) []map[string]string {
 	t.Helper()
@@ -196,10 +211,7 @@ func TestRestoreAttemptGenerationFencing(t *testing.T) {
 			er.getDisks = func() []StorageAPI { return wrapped }
 			captured := make(chan ObjectOptions, 2)
 			layer := newRestoreIsolationLayer(r)
-			layer.restore = func(_ context.Context, _, _ string, opts ObjectOptions) error {
-				captured <- opts
-				return nil
-			}
+			layer.restore = restoreCaptureOptions(captured)
 			var older ObjectOptions
 			if mode != "worker" {
 				if rec := restoreIsolationPOST(t, r, layer, oi.VersionID); rec.Code != http.StatusOK {
@@ -541,10 +553,7 @@ func TestExpireRestoredUsesQuorumGeneration(t *testing.T) {
 				}
 				captured := make(chan ObjectOptions, 1)
 				layer := newRestoreIsolationLayer(r)
-				layer.restore = func(_ context.Context, _, _ string, opts ObjectOptions) error {
-					captured <- opts
-					return nil
-				}
+				layer.restore = restoreCaptureOptions(captured)
 				metaWrites.Store(true)
 				rec := restoreIsolationPOST(t, r, layer, oi.VersionID)
 				metaWrites.Store(false)
@@ -634,10 +643,7 @@ func TestRestoreHealNeedsRestoreQuorum(t *testing.T) {
 				versionID = oi.VersionID
 				captured := make(chan ObjectOptions, 1)
 				layer := newRestoreIsolationLayer(r)
-				layer.restore = func(_ context.Context, _, _ string, opts ObjectOptions) error {
-					captured <- opts
-					return nil
-				}
+				layer.restore = restoreCaptureOptions(captured)
 				if rec := restoreIsolationPOST(t, r, layer, versionID); rec.Code != http.StatusOK {
 					t.Fatal(rec.Body.String())
 				}
