@@ -370,6 +370,16 @@ func (p *purgeTest) matched(name string) expireObjInfo {
 // end, and returns the counts of the job.
 func (p *purgeTest) batch(walked ...expireObjInfo) *batchJobInfo {
 	p.t.Helper()
+	// Direct object-layer fixtures do not start IAM. A real batch worker
+	// requires its initial cache load even when the submitter is root.
+	previousIAM := globalIAMSys
+	sys := NewIAMSys()
+	sys.initStore(p.z, nil)
+	if err := sys.Load(p.t.Context(), true); err != nil {
+		p.t.Fatal(err)
+	}
+	globalIAMSys = sys
+	defer func() { globalIAMSys = previousIAM }()
 	globalBatchJobsMetrics.Lock()
 	if globalBatchJobsMetrics.metrics == nil {
 		globalBatchJobsMetrics.metrics = make(map[string]*batchJobInfo)

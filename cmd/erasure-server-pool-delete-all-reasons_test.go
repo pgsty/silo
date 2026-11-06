@@ -22,6 +22,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	madmin "github.com/minio/madmin-go/v3"
@@ -174,6 +175,17 @@ func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 		t.Fatalf("CRC classification after storage RPC: %v", got)
 	}
 
+	var healMu sync.Mutex
+	queued := make(map[string]bool)
+	hook := func(op PartialOperation) {
+		if op.Bucket == p.bucket && op.Object == key {
+			healMu.Lock()
+			queued[op.VersionID] = true
+			healMu.Unlock()
+		}
+	}
+	previousHook := mrfPartialOpHook.Swap(&hook)
+	t.Cleanup(func() { mrfPartialOpHook.Store(previousHook) })
 	delta := incompleteDelta(func() { p.run(ops) })
 	if delta[ilmIncompleteHistoryUnavailable] != 1 {
 		t.Errorf("counted %v, want one %s", delta, ilmIncompleteHistoryUnavailable)
@@ -191,6 +203,17 @@ func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mrfPartialOpHook.Store(previousHook)
+	healMu.Lock()
+	for _, fi := range versions.Versions {
+		if !queued[deleteAllVersionID(fi.VersionID)] {
+			t.Errorf("no MRF heal for %q: %v", fi.VersionID, queued)
+		}
+	}
+	if queued[""] {
+		t.Error("MRF used latest instead of explicit null version")
+	}
+	healMu.Unlock()
 	for _, mode := range []madmin.HealScanMode{madmin.HealNormalScan, madmin.HealDeepScan} {
 		if err := bad.WriteAll(ctx, p.bucket, metaPath, buf); err != nil {
 			t.Fatal(err)

@@ -435,6 +435,13 @@ func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object str
 		}
 		var xl xlMetaV2
 		if err := xl.LoadOrConvert(raws[i].Buf); err != nil {
+			if errors.Is(err, errFileCorrupt) {
+				// The purge remains refused. Heal each approved version explicitly,
+				// including a noncurrent null version, before a later attempt retries.
+				for id := range ids {
+					er.addPartial(bucket, object, id)
+				}
+			}
 			return nil, errDeleteAllHistoryUnavailable
 		}
 		versions, err := xl.ListVersions(bucket, object, false)
