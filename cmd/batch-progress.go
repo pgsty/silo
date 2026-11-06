@@ -173,6 +173,7 @@ type batchJobStatusMetric struct {
 	VersionsSkippedLocked int64  `json:"versionsSkippedLocked,omitempty"`
 	KeysRefused           int64  `json:"keysRefused,omitempty"`
 	FailureReason         string `json:"failureReason,omitempty"`
+	PausedReason          string `json:"pausedReason,omitempty"`
 }
 
 func (ri *batchJobInfo) statusMetric() batchJobStatusMetric {
@@ -183,5 +184,6 @@ func (ri *batchJobInfo) statusMetric() batchJobStatusMetric {
 		VersionsSkippedLocked: ri.VersionsSkippedLocked,
 		KeysRefused:           ri.KeysRefused,
 		FailureReason:         ri.FailureReason,
+		PausedReason:          ri.PausedReason,
 	}
 }

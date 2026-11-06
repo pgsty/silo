@@ -385,7 +385,7 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		StartTime: job.Started,
 	}
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
-		return err
+		return batchUnavailable("loading job progress", err)
 	}
 	if ri.Complete {
 		return nil
@@ -490,7 +490,11 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	defer cancelCause(nil)
 	// refuse ends the job for its submitter: record why before stopping.
 	refuse := func(err error) {
-		ri.refuse(err)
+		if isBatchJobUnavailable(err) {
+			ri.pause(err)
+		} else {
+			ri.refuse(err)
+		}
 		cancelCause(err)
 	}
 	progress := newBatchProgress(ri, r.Bucket)
@@ -500,8 +504,11 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		Marker: lastObject,
 		Filter: selectObj,
 	}); err != nil {
-		// Do not need to retry if we can't list objects on source.
-		return err
+		cause := batchListingError(err)
+		if isBatchJobUnavailable(cause) {
+			return ri.savePaused(ctx, api, job, cause)
+		}
+		return cause
 	}
 	failed := false
 	for res := range results {
@@ -511,8 +518,9 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		}
 		if res.Err != nil {
 			failed = true
+			cancelCause(batchListingError(res.Err))
 			batchLogIf(ctx, res.Err)
-			break
+			continue
 		}
 		result := res.Item
 		if !batchResumeAfter(lastObject, result.Name) {
@@ -532,12 +540,15 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			for attempts := 1; attempts <= retryAttempts; attempts++ {
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricKeyRotation, job.ID, attempts)
 				err := r.KeyRotate(ctx, api, result, job.Submitter)
+				if errors.Is(err, errBatchRotateMoving) {
+					err = batchUnavailable("object is being moved", err)
+				}
 				stopFn(result, err)
 				if err == nil {
 					counts.objects = 1
 					break
 				}
-				if isBatchJobAuthzError(err) {
+				if isBatchJobStopped(err) {
 					refuse(err)
 					return
 				}
@@ -585,6 +596,9 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		progress.finish()
 	}
 	if cause != nil && !ri.refused() {
+		if isBatchJobUnavailable(cause) {
+			return ri.savePaused(ctx, api, job, cause)
+		}
 		// Stopped before the end: keep the work after the cursor pending.
 		globalBatchJobsMetrics.save(job.ID, ri)
 		batchLogIf(ctx, ri.updateAfter(GlobalContext, api, 0, job))

@@ -3262,6 +3262,8 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 	return nil
 }
 
+var errTokenSigningKeyUnavailable = errors.New("token signing key unavailable")
+
 func extractJWTClaims(u UserIdentity) (jwtClaims *jwt.MapClaims, err error) {
 	keys := make([]string, 0, 3)
 
@@ -3272,7 +3274,7 @@ func extractJWTClaims(u UserIdentity) (jwtClaims *jwt.MapClaims, err error) {
 	if globalSiteReplicationSys.isEnabled() {
 		secretKey, err := getTokenSigningKey()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", errTokenSigningKeyUnavailable, err)
 		}
 		keys = append(keys, secretKey)
 	}

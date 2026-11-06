@@ -454,7 +454,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		StartTime: job.Started,
 	}
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
-		return err
+		return batchUnavailable("loading job progress", err)
 	}
 	if ri.Complete {
 		return nil
@@ -1065,16 +1065,20 @@ type batchJobInfo struct {
 	// FailureReason is set when the job was refused for its submitter. It
 	// ends the job: a job that has one does not run again.
 	FailureReason string `json:"failureReason,omitempty" msg:"fr"`
+	PausedReason  string `json:"pausedReason,omitempty" msg:"pr"`
 }
 
 const (
-	batchReplName         = "batch-replicate.bin"
-	batchReplFormat       = 1
-	batchReplVersionV1    = 1
-	batchReplVersion      = batchReplVersionV1
-	batchJobName          = "job.bin"
-	batchJobPrefix        = "batch-jobs"
-	batchJobReportsPrefix = batchJobPrefix + "/reports"
+	batchReplName      = "batch-replicate.bin"
+	batchReplFormat    = 1
+	batchReplVersionV1 = 1
+	batchReplVersion   = batchReplVersionV1
+	batchJobName       = "job.bin"
+	// The envelope rejects old decoders before they can ignore Submitter.
+	batchJobEnvelope             = "SILO-BATCH\x02"
+	batchAuthorizedReportVersion = 2
+	batchJobPrefix               = "batch-jobs"
+	batchJobReportsPrefix        = batchJobPrefix + "/reports"
 
 	batchReplJobAPIVersion        = "v1"
 	batchReplJobDefaultRetries    = 3
@@ -1162,7 +1166,7 @@ func (ri *batchJobInfo) loadByPath(ctx context.Context, api ObjectLayer, path st
 		return fmt.Errorf("%s: unknown format: %d", ri.JobType, binary.LittleEndian.Uint16(data[0:2]))
 	}
 	switch binary.LittleEndian.Uint16(data[2:4]) {
-	case version:
+	case version, batchAuthorizedReportVersion:
 	default:
 		return fmt.Errorf("%s: unknown version: %d", ri.JobType, binary.LittleEndian.Uint16(data[2:4]))
 	}
@@ -1210,6 +1214,7 @@ func (ri *batchJobInfo) clone() *batchJobInfo {
 		VersionsSkippedLocked: ri.VersionsSkippedLocked,
 		KeysRefused:           ri.KeysRefused,
 		FailureReason:         ri.FailureReason,
+		PausedReason:          ri.PausedReason,
 	}
 }
 
@@ -1263,6 +1268,7 @@ func (ri *batchJobInfo) updateAfter(ctx context.Context, api ObjectLayer, durati
 			jobTyp = string(job.Type())
 			ri.Version = batchExpireVersionV1
 		default:
+			ri.mu.Unlock()
 			return errInvalidArgument
 		}
 		if serverDebugLog {
@@ -1270,6 +1276,9 @@ func (ri *batchJobInfo) updateAfter(ctx context.Context, api ObjectLayer, durati
 		}
 		ri.LastUpdate = now
 
+		if job.Submitter != nil {
+			version = batchAuthorizedReportVersion
+		}
 		data := make([]byte, 4, ri.Msgsize()+4)
 
 		// Initialize the header.
@@ -1336,7 +1345,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		StartTime: job.Started,
 	}
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
-		return err
+		return batchUnavailable("loading job progress", err)
 	}
 	if ri.Complete {
 		return nil
@@ -1880,7 +1889,11 @@ func (j *BatchJobRequest) save(ctx context.Context, api ObjectLayer) error {
 		return err
 	}
 
-	job, err := j.MarshalMsg(nil)
+	var prefix []byte
+	if j.Submitter != nil {
+		prefix = []byte(batchJobEnvelope)
+	}
+	job, err := j.MarshalMsg(prefix)
 	if err != nil {
 		return err
 	}
@@ -1901,6 +1914,12 @@ func (j *BatchJobRequest) load(ctx context.Context, api ObjectLayer, name string
 		return err
 	}
 
+	if bytes.HasPrefix(job, []byte("SILO-BATCH")) {
+		if !bytes.HasPrefix(job, []byte(batchJobEnvelope)) {
+			return errors.New("unsupported batch job envelope version")
+		}
+		job = job[len(batchJobEnvelope):]
+	}
 	_, err = j.UnmarshalMsg(job)
 	return err
 }
@@ -2070,7 +2089,7 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	objectAPI, creds := validateAdminReq(ctx, w, r, policy.StartBatchJobAction)
+	objectAPI, creds := validateBatchJobAdminReq(ctx, w, r)
 	if objectAPI == nil {
 		return
 	}
@@ -2130,6 +2149,8 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 		apiErr := toAPIError(ctx, err)
 		if isBatchJobAuthzError(err) {
 			apiErr = errorCodes.ToAPIErrWithErr(ErrAccessDenied, err)
+		} else if isBatchJobUnavailable(err) {
+			apiErr = batchServiceUnavailable(err)
 		}
 		writeErrorResponseJSON(ctx, w, apiErr, r.URL)
 		return
@@ -2151,6 +2172,11 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err = globalBatchJobPool.queueJob(job); err != nil {
+		// Admission failed (normally shutdown). Do not leave an unacknowledged
+		// manifest that could start after restart.
+		if deleteErr := job.delete(ctx, objectAPI); deleteErr != nil {
+			batchLogIf(ctx, deleteErr)
+		}
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -2197,8 +2223,10 @@ func (a adminAPIHandlers) CancelBatchJob(w http.ResponseWriter, r *http.Request)
 		ID: jobID,
 	}
 
-	j.delete(ctx, objectAPI)
-
+	if err := j.delete(ctx, objectAPI); err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
 	writeSuccessNoContent(w)
 }
 
@@ -2208,11 +2236,10 @@ func (a adminAPIHandlers) CancelBatchJob(w http.ResponseWriter, r *http.Request)
 type BatchJobPool struct {
 	ctx          context.Context
 	objLayer     ObjectLayer
-	once         sync.Once
 	mu           sync.Mutex
 	jobCh        chan *BatchJobRequest
-	jmu          sync.Mutex // protects jobCancelers
-	jobCancelers map[string]context.CancelFunc
+	jmu          sync.Mutex // protects jobOwners
+	jobOwners    map[string]*batchJobOwner
 	workerKillCh chan struct{}
 	workerSize   int
 }
@@ -2226,9 +2253,10 @@ func newBatchJobPool(ctx context.Context, o ObjectLayer, workers int) *BatchJobP
 		objLayer:     o,
 		jobCh:        make(chan *BatchJobRequest, 10000),
 		workerKillCh: make(chan struct{}, workers),
-		jobCancelers: make(map[string]context.CancelFunc),
+		jobOwners:    make(map[string]*batchJobOwner),
 	}
 	jpool.ResizeWorkers(workers)
+	go jpool.retryLoop()
 
 	randomWait := func() time.Duration {
 		// randomWait depends on the number of nodes to avoid triggering resume and cleanups at the same time.
@@ -2249,14 +2277,14 @@ func (j *BatchJobPool) cleanupReports(randomWait func() time.Duration) {
 
 	for {
 		select {
-		case <-GlobalContext.Done():
+		case <-j.ctx.Done():
 			return
 		case <-t.C:
 			results := make(chan itemOrErr[ObjectInfo], 100)
 			ctx, cancel := context.WithCancel(j.ctx)
-			defer cancel()
 			if err := j.objLayer.Walk(ctx, minioMetaBucket, batchJobReportsPrefix, results, WalkOptions{}); err != nil {
 				batchLogIf(j.ctx, err)
+				cancel()
 				t.Reset(randomWait())
 				continue
 			}
@@ -2283,13 +2311,20 @@ func (j *BatchJobPool) cleanupReports(randomWait func() time.Duration) {
 				}
 			}
 
+			cancel()
 			t.Reset(randomWait())
 		}
 	}
 }
 
 func (j *BatchJobPool) resume(randomWait func() time.Duration) {
-	time.Sleep(randomWait())
+	timer := time.NewTimer(randomWait())
+	defer timer.Stop()
+	select {
+	case <-j.ctx.Done():
+		return
+	case <-timer.C:
+	}
 
 	results := make(chan itemOrErr[ObjectInfo], 100)
 	ctx, cancel := context.WithCancel(j.ctx)
@@ -2340,43 +2375,26 @@ func (j *BatchJobPool) AddWorker() {
 			if !ok {
 				return
 			}
+			if !j.beginJob(job) {
+				continue
+			}
+			var err error
 			switch {
 			case job.Replicate != nil:
 				if job.Replicate.RemoteToLocal() {
-					if err := job.Replicate.StartFromSource(job.ctx, j.objLayer, *job); err != nil {
-						if !isErrBucketNotFound(err) {
-							batchLogIf(j.ctx, err)
-							j.canceler(job.ID, false)
-							continue
-						}
-						// Bucket not found proceed to delete such a job.
-					}
+					err = job.Replicate.StartFromSource(job.ctx, j.objLayer, *job)
 				} else {
-					if err := job.Replicate.Start(job.ctx, j.objLayer, *job); err != nil {
-						if !isErrBucketNotFound(err) {
-							batchLogIf(j.ctx, err)
-							j.canceler(job.ID, false)
-							continue
-						}
-						// Bucket not found proceed to delete such a job.
-					}
+					err = job.Replicate.Start(job.ctx, j.objLayer, *job)
 				}
 			case job.KeyRotate != nil:
-				if err := job.KeyRotate.Start(job.ctx, j.objLayer, *job); err != nil {
-					if !isErrBucketNotFound(err) {
-						batchLogIf(j.ctx, err)
-						continue
-					}
-				}
+				err = job.KeyRotate.Start(job.ctx, j.objLayer, *job)
 			case job.Expire != nil:
-				if err := job.Expire.Start(job.ctx, j.objLayer, *job); err != nil {
-					if !isErrBucketNotFound(err) {
-						batchLogIf(j.ctx, err)
-						continue
-					}
-				}
+				err = job.Expire.Start(job.ctx, j.objLayer, *job)
 			}
-			j.canceler(job.ID, false)
+			if err != nil {
+				batchLogIf(j.ctx, err)
+			}
+			j.finishJob(job, err)
 		case <-j.workerKillCh:
 			return
 		}
@@ -2398,46 +2416,66 @@ func (j *BatchJobPool) ResizeWorkers(n int) {
 	}
 	for j.workerSize > n {
 		j.workerSize--
-		go func() { j.workerKillCh <- struct{}{} }()
+		go func() {
+			select {
+			case j.workerKillCh <- struct{}{}:
+			case <-j.ctx.Done():
+			}
+		}()
 	}
 }
 
 func (j *BatchJobPool) queueJob(req *BatchJobRequest) error {
-	if j == nil {
+	if j == nil || req == nil || req.ID == "" {
 		return errInvalidArgument
 	}
-	jctx, jcancel := context.WithCancel(j.ctx)
 	j.jmu.Lock()
-	j.jobCancelers[req.ID] = jcancel
-	j.jmu.Unlock()
+	defer j.jmu.Unlock()
+	if err := j.ctx.Err(); err != nil {
+		return err
+	}
+	if owner := j.jobOwners[req.ID]; owner != nil {
+		if owner.state == "canceled" {
+			return context.Canceled
+		}
+		return nil
+	}
+	if j.jobOwners == nil {
+		j.jobOwners = make(map[string]*batchJobOwner)
+	}
+	jctx, jcancel := context.WithCancel(j.ctx)
 	req.ctx = jctx
-
+	owner := &batchJobOwner{req: req, cancel: jcancel, state: "queued"}
+	j.jobOwners[req.ID] = owner
+	// A full channel retains explicit pending work owned by the scheduler.
+	// The durable submission still succeeds and cannot become ownerless.
 	select {
-	case <-j.ctx.Done():
-		j.once.Do(func() {
-			xioutil.SafeClose(j.jobCh)
-		})
 	case j.jobCh <- req:
 	default:
-		return fmt.Errorf("batch job queue is currently full please try again later (job %s)", req.ID)
+		owner.state = "paused"
 	}
 	return nil
 }
 
-// delete canceler from the map, cancel job if requested
 func (j *BatchJobPool) canceler(jobID string, cancel bool) error {
 	if j == nil {
 		return errInvalidArgument
 	}
 	j.jmu.Lock()
 	defer j.jmu.Unlock()
-	if canceler, ok := j.jobCancelers[jobID]; ok {
-		if cancel {
-			canceler()
-		}
+	if !cancel {
+		return nil
+	} // Worker completion uses its generation token.
+	if j.jobOwners == nil {
+		j.jobOwners = make(map[string]*batchJobOwner)
 	}
-	if cancel {
-		delete(j.jobCancelers, jobID)
+	if owner := j.jobOwners[jobID]; owner != nil {
+		if owner.cancel != nil {
+			owner.cancel()
+		}
+		j.jobOwners[jobID] = &batchJobOwner{state: "canceled"}
+	} else {
+		j.jobOwners[jobID] = &batchJobOwner{state: "canceled"}
 	}
 	return nil
 }

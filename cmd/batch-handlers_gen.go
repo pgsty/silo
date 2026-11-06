@@ -655,6 +655,12 @@ func (z *batchJobInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "FailureReason")
 				return
 			}
+		case "pr":
+			z.PausedReason, err = dc.ReadString()
+			if err != nil {
+				err = msgp.WrapError(err, "PausedReason")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -668,9 +674,9 @@ func (z *batchJobInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 20
+	// map header, size 21
 	// write "v"
-	err = en.Append(0xde, 0x0, 0x14, 0xa1, 0x76)
+	err = en.Append(0xde, 0x0, 0x15, 0xa1, 0x76)
 	if err != nil {
 		return
 	}
@@ -869,15 +875,25 @@ func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "FailureReason")
 		return
 	}
+	// write "pr"
+	err = en.Append(0xa2, 0x70, 0x72)
+	if err != nil {
+		return
+	}
+	err = en.WriteString(z.PausedReason)
+	if err != nil {
+		err = msgp.WrapError(err, "PausedReason")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *batchJobInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 20
+	// map header, size 21
 	// string "v"
-	o = append(o, 0xde, 0x0, 0x14, 0xa1, 0x76)
+	o = append(o, 0xde, 0x0, 0x15, 0xa1, 0x76)
 	o = msgp.AppendInt(o, z.Version)
 	// string "jid"
 	o = append(o, 0xa3, 0x6a, 0x69, 0x64)
@@ -936,6 +952,9 @@ func (z *batchJobInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "fr"
 	o = append(o, 0xa2, 0x66, 0x72)
 	o = msgp.AppendString(o, z.FailureReason)
+	// string "pr"
+	o = append(o, 0xa2, 0x70, 0x72)
+	o = msgp.AppendString(o, z.PausedReason)
 	return
 }
 
@@ -1077,6 +1096,12 @@ func (z *batchJobInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "FailureReason")
 				return
 			}
+		case "pr":
+			z.PausedReason, bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "PausedReason")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -1091,6 +1116,6 @@ func (z *batchJobInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *batchJobInfo) Msgsize() (s int) {
-	s = 3 + 2 + msgp.IntSize + 4 + msgp.StringPrefixSize + len(z.JobID) + 3 + msgp.StringPrefixSize + len(z.JobType) + 3 + msgp.TimeSize + 3 + msgp.TimeSize + 3 + msgp.IntSize + 3 + msgp.IntSize + 4 + msgp.BoolSize + 4 + msgp.BoolSize + 5 + msgp.StringPrefixSize + len(z.Bucket) + 5 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.StringPrefixSize + len(z.FailureReason)
+	s = 3 + 2 + msgp.IntSize + 4 + msgp.StringPrefixSize + len(z.JobID) + 3 + msgp.StringPrefixSize + len(z.JobType) + 3 + msgp.TimeSize + 3 + msgp.TimeSize + 3 + msgp.IntSize + 3 + msgp.IntSize + 4 + msgp.BoolSize + 4 + msgp.BoolSize + 5 + msgp.StringPrefixSize + len(z.Bucket) + 5 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.StringPrefixSize + len(z.FailureReason) + 3 + msgp.StringPrefixSize + len(z.PausedReason)
 	return
 }

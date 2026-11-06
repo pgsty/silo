@@ -150,7 +150,7 @@ func newBatchJobSubmitter(cred auth.Credentials) (*batchJobSubmitter, error) {
 	}
 	u, ok, err := globalIAMSys.identityRecord(cred.AccessKey)
 	if err != nil {
-		return nil, err
+		return nil, batchUnavailable("IAM identity lookup", err)
 	}
 	// The record must be the one the request was authenticated with.
 	if !ok || u.Credentials.AccessKey != cred.AccessKey || u.Credentials.ParentUser != cred.ParentUser ||
@@ -174,6 +174,7 @@ func newBatchJobSubmitter(cred auth.Credentials) (*batchJobSubmitter, error) {
 
 // batchJobPrincipal is a submitter resolved against current IAM state.
 type batchJobPrincipal struct {
+	ctx        context.Context
 	typ        string
 	accessKey  string
 	parentUser string
@@ -194,6 +195,9 @@ func (s *batchJobSubmitter) principal(ctx context.Context) (batchJobPrincipal, e
 	if s.Version != batchJobSubmitterVersion {
 		return batchJobPrincipal{}, batchJobAuthzError{reason: fmt.Sprintf("unsupported batch job submitter version %d; submit the job again", s.Version)}
 	}
+	if !batchIAMReady() {
+		return batchJobPrincipal{}, batchUnavailable("IAM is not initialized", errServerNotInitialized)
+	}
 	root := globalActiveCred
 	if s.Type == batchSubmitterRoot {
 		if s.AccessKey != root.AccessKey || !hmac.Equal(s.Binding, batchSubmitterBinding(batchSubmitterRoot, root)) {
@@ -202,7 +206,7 @@ func (s *batchJobSubmitter) principal(ctx context.Context) (batchJobPrincipal, e
 		if !globalAPIConfig.permitRootAccess() {
 			return batchJobPrincipal{}, errBatchJobInvalid
 		}
-		return batchJobPrincipal{typ: batchSubmitterRoot, accessKey: root.AccessKey, owner: true}, nil
+		return batchJobPrincipal{ctx: ctx, typ: batchSubmitterRoot, accessKey: root.AccessKey, owner: true}, nil
 	}
 	switch s.Type {
 	case batchSubmitterUser, batchSubmitterTemporary, batchSubmitterService:
@@ -214,7 +218,7 @@ func (s *batchJobSubmitter) principal(ctx context.Context) (batchJobPrincipal, e
 	}
 	u, ok, err := globalIAMSys.CheckKey(ctx, s.AccessKey)
 	if err != nil {
-		return batchJobPrincipal{}, err
+		return batchJobPrincipal{}, batchUnavailable("IAM credential lookup", err)
 	}
 	if !ok {
 		// Deleted, disabled, expired or revoked.
@@ -231,6 +235,7 @@ func (s *batchJobSubmitter) principal(ctx context.Context) (batchJobPrincipal, e
 		return batchJobPrincipal{}, errBatchJobInvalid
 	}
 	p := batchJobPrincipal{
+		ctx:        ctx,
 		typ:        typ,
 		accessKey:  cred.AccessKey,
 		parentUser: cred.ParentUser,
@@ -243,6 +248,9 @@ func (s *batchJobSubmitter) principal(ctx context.Context) (batchJobPrincipal, e
 		// Verify the token as a request would, with the current signing keys.
 		jwtClaims, err := extractJWTClaims(u)
 		if err != nil {
+			if errors.Is(err, errTokenSigningKeyUnavailable) {
+				return batchJobPrincipal{}, batchUnavailable("token signing key", err)
+			}
 			return batchJobPrincipal{}, errBatchJobInvalid
 		}
 		p.claims = jwtClaims.Map()
@@ -444,24 +452,47 @@ func (p batchJobPrincipal) authorize(req batchAuthzRequest) error {
 		IsOwner:         p.owner,
 		Claims:          p.claims,
 	}
-	denied := batchJobAuthzError{reason: batchDeniedReason(req)}
-	plugin := newGlobalAuthZPluginFn()
-	policies, err := globalIAMSys.batchLocalPolicies(p, args, plugin == nil)
-	if err != nil {
-		return denied
+	return p.authorizeArgs(args, &req)
+}
+
+// authorizeArgs uses the same policy snapshot for request-context checks and
+// the decision. No boolean IAM evaluator re-reads and silently drops policies.
+func (p batchJobPrincipal) authorizeArgs(args policy.Args, req *batchAuthzRequest) error {
+	denied := batchJobAuthzError{reason: "the batch job submitter is not allowed " + string(args.Action)}
+	if req != nil {
+		denied.reason = batchDeniedReason(*req)
 	}
-	supplied := req.suppliedConditionKeys()
-	for _, pol := range policies {
-		for _, st := range pol.Statements {
-			if batchStatementNeedsRequest(st, args, supplied) {
-				return batchJobAuthzError{reason: denied.reason + ": a policy statement depends on request context that a batch job does not have"}
+	ctx := p.ctx
+	if ctx == nil {
+		ctx = GlobalContext
+	}
+	plugin := newGlobalAuthZPluginFn()
+	var cache *iamCache
+	if plugin == nil && !args.IsOwner {
+		cache = globalIAMSys.store.lock()
+		defer globalIAMSys.store.unlock()
+	}
+	policies, err := globalIAMSys.batchLocalPolicies(ctx, p, args, plugin == nil, cache)
+	if err != nil {
+		if errors.Is(err, errNoSuchPolicy) || errors.Is(err, errAuthentication) || errors.Is(err, errNoSuchUser) || errors.Is(err, errNoSuchGroup) {
+			return denied
+		}
+		return batchUnavailable("IAM policy lookup", err)
+	}
+	if req != nil {
+		supplied := req.suppliedConditionKeys()
+		for _, pol := range policies {
+			for _, st := range pol.Statements {
+				if batchStatementNeedsRequest(st, args, supplied) {
+					return batchJobAuthzError{reason: denied.reason + ": a policy statement depends on request context that a batch job does not have"}
+				}
 			}
 		}
 	}
 	if plugin != nil {
-		ok, err := plugin.IsAllowed(args)
+		ok, err := plugin.IsAllowedContext(ctx, args)
 		if err != nil {
-			authZLogIf(GlobalContext, err)
+			return batchUnavailable("authorization plugin", err)
 		}
 		if !ok {
 			return denied
@@ -472,8 +503,28 @@ func (p batchJobPrincipal) authorize(req batchAuthzRequest) error {
 		}
 		return nil
 	}
-	if !globalIAMSys.isAllowedLocally(args) {
+	if args.IsOwner {
+		return nil
+	}
+	if p.service {
+		if p.claims[parentClaim] != p.parentUser {
+			return denied
+		}
+		if _, ok := p.claims[iamPolicyClaimNameSA()].(string); !ok {
+			return denied
+		}
+	}
+	if has, allowed := p.sessionPolicyDecision(args); has && !allowed {
 		return denied
+	}
+	ownerDerived := (p.temp || p.service) && p.parentUser == globalActiveCred.AccessKey
+	if !ownerDerived {
+		if p.service {
+			args.AccountName = p.parentUser
+		}
+		if len(policies) == 0 || !policies[0].IsAllowed(args) {
+			return denied
+		}
 	}
 	return nil
 }
@@ -507,13 +558,23 @@ func (p batchJobPrincipal) sessionPolicyDecision(args policy.Args) (bool, bool) 
 // batchLocalPolicies returns every local policy that can take part in the
 // decision on args: the mapped policies that IsAllowed would merge when
 // withMapped is set (no authorization plugin), and the session policy.
-func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, withMapped bool) ([]policy.Policy, error) {
+func (sys *IAMSys) batchLocalPolicies(ctx context.Context, p batchJobPrincipal, args policy.Args, withMapped bool, cache *iamCache) ([]policy.Policy, error) {
 	var out []policy.Policy
 	if withMapped && args.IsOwner {
 		// IsAllowed does not evaluate any policy for the owner.
 		return nil, nil
 	}
 	if withMapped {
+		// The caller holds the IAM writer lock through evaluation. Lazy mapping
+		// loads and selected documents therefore belong to one cache revision.
+		mappedPolicies := func(name string) ([]string, error) {
+			names, _, err := cache.policyDBGet(sys.store, name, false, false)
+			if err != nil {
+				return nil, err
+			}
+			groups, err := cache.policyDBGetGroups(sys.store, len(names) > 0, args.Groups...)
+			return append(names, groups...), err
+		}
 		var names []string
 		ownerDerived := (p.temp || p.service) && p.parentUser == globalActiveCred.AccessKey
 		switch {
@@ -526,7 +587,7 @@ func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, wit
 				}
 				names = append(names, newMappedPolicy(sys.rolesMap[a]).toSlice()...)
 			} else {
-				mapped, err := sys.PolicyDBGet(p.parentUser, args.Groups...)
+				mapped, err := mappedPolicies(p.parentUser)
 				if err != nil {
 					return nil, err
 				}
@@ -539,15 +600,31 @@ func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, wit
 				}
 			}
 		default:
-			mapped, err := sys.PolicyDBGet(p.accessKey, args.Groups...)
+			mapped, err := mappedPolicies(p.accessKey)
 			if err != nil {
 				return nil, err
 			}
 			names = append(names, mapped...)
 		}
-		if len(names) > 0 {
-			out = append(out, sys.GetCombinedPolicy(names...))
+		var selected []policy.Policy
+		for _, name := range names {
+			doc, ok := cache.iamPolicyDocsMap[name]
+			if !ok {
+				loaded := make(map[string]PolicyDoc)
+				loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err := sys.store.loadPolicyDoc(loadCtx, name, loaded)
+				cancel()
+				if err != nil {
+					return nil, err
+				}
+				doc, ok = loaded[name]
+				if !ok {
+					return nil, errNoSuchPolicy
+				}
+			}
+			selected = append(selected, doc.Policy)
 		}
+		out = append(out, policy.MergePolicies(selected...))
 	}
 	if p.temp || p.service {
 		if p.service && p.claims[iamPolicyClaimNameSA()] == inheritedPolicyType {
@@ -710,6 +787,7 @@ func (ri *batchJobInfo) refuse(err error) {
 	}
 	ri.Complete = false
 	ri.Failed = true
+	ri.PausedReason = ""
 }
 
 func (ri *batchJobInfo) refused() bool {
@@ -729,7 +807,18 @@ func (ri *batchJobInfo) startAuthorized(ctx context.Context, api ObjectLayer, jo
 			err = errBatchJobSections
 		}
 		if err == nil {
+			ri.mu.Lock()
+			ri.PausedReason = ""
+			ri.mu.Unlock()
+			// Persist the report version before acting. Older binaries must not
+			// resume an authorization-bearing job with server authority.
+			if err := ri.updateAfter(ctx, api, 0, job); err != nil {
+				return true, batchUnavailable("saving job progress", err)
+			}
 			return false, nil
+		}
+		if isBatchJobUnavailable(err) {
+			return true, ri.savePaused(ctx, api, job, err)
 		}
 		if !isBatchJobAuthzError(err) {
 			return true, err
@@ -738,5 +827,8 @@ func (ri *batchJobInfo) startAuthorized(ctx context.Context, api ObjectLayer, jo
 		batchLogIf(ctx, fmt.Errorf("batch job %s refused: %w", job.ID, err))
 	}
 	globalBatchJobsMetrics.save(job.ID, ri)
-	return true, ri.updateAfter(ctx, api, 0, job)
+	if err := ri.updateAfter(ctx, api, 0, job); err != nil {
+		return true, batchUnavailable("saving job refusal", err)
+	}
+	return true, nil
 }

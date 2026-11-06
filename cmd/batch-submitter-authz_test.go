@@ -46,10 +46,10 @@ func batchTestJobPool(ctx context.Context, t *testing.T, obj ObjectLayer) {
 	t.Helper()
 	prevPool := globalBatchJobPool
 	globalBatchJobPool = &BatchJobPool{
-		ctx:          ctx,
-		objLayer:     obj,
-		jobCh:        make(chan *BatchJobRequest, 10),
-		jobCancelers: make(map[string]context.CancelFunc),
+		ctx:       ctx,
+		objLayer:  obj,
+		jobCh:     make(chan *BatchJobRequest, 10),
+		jobOwners: make(map[string]*batchJobOwner),
 	}
 	globalBatchJobsMetrics.Lock()
 	globalBatchJobsMetrics.metrics = make(map[string]*batchJobInfo)

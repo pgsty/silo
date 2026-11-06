@@ -75,9 +75,8 @@ func (w batchWalkError) Walk(context.Context, string, string, chan<- itemOrErr[O
 	return w.err
 }
 
-// A listing that fails before it returns anything fails the run, as a
-// listing error in the results does, and the job is left to a later run.
-func TestBatchReviewExpireWalkErrorFailsRun(t *testing.T) {
+// A listing outage pauses the run, as a streamed listing error does.
+func TestBatchReviewExpireWalkErrorPausesRun(t *testing.T) {
 	f := newBatchAuthzFixture(t)
 	rec, job := f.submit(t, globalActiveCred, f.expireYAML("data/"))
 	if job == nil {
@@ -87,7 +86,7 @@ func TestBatchReviewExpireWalkErrorFailsRun(t *testing.T) {
 	if err := job.Expire.Start(f.ctx, batchWalkError{ObjectLayer: f.obj, err: listErr}, *job); !errors.Is(err, listErr) {
 		t.Fatalf("start returned %v, want %v", err, listErr)
 	}
-	if ri := f.jobInfo(t, job); !ri.Failed || ri.Complete {
+	if ri := f.jobInfo(t, job); ri.Failed || ri.Complete || ri.PausedReason == "" {
 		t.Fatalf("failed listing: complete=%v failed=%v", ri.Complete, ri.Failed)
 	}
 }
@@ -251,6 +250,26 @@ func TestBatchReviewRotationLeavesMovingSource(t *testing.T) {
 	if after.UserDefined[crypto.MetaSealedKeyS3] != beforeInfo.UserDefined[crypto.MetaSealedKeyS3] {
 		t.Fatal("rotation rewrote a draining pool")
 	}
+	// The job pauses and resumes in-process once the selected pool stops moving.
+	job := BatchJobRequest{ID: "rotation-moving-resume", Started: UTCNow(), Submitter: batchRootSubmitter(t), KeyRotate: &r}
+	batchTestJobPool(t.Context(), t, z)
+	if err := r.Start(t.Context(), z, job); !isBatchJobUnavailable(err) {
+		t.Fatalf("moving job did not pause: %v", err)
+	}
+	ri := &batchJobInfo{}
+	mustIAM(t, ri.load(t.Context(), z, job))
+	if ri.PausedReason == "" || ri.Failed || ri.Complete || ri.Object != "" || ri.ObjectsFailed != 0 {
+		t.Fatalf("moving job report: %+v", ri)
+	}
+	z.poolMetaMutex.Lock()
+	z.poolMeta.Pools[0].Decommission = nil
+	z.poolMetaMutex.Unlock()
+	mustIAM(t, r.Start(t.Context(), z, job))
+	mustIAM(t, ri.load(t.Context(), z, job))
+	if !ri.Complete || ri.Failed || ri.PausedReason != "" || ri.Objects != 1 {
+		t.Fatalf("resumed rotation: %+v", ri)
+	}
+
 }
 
 // Once a move copied a version, the rotation leaves it to a later run, so the

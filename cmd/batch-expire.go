@@ -448,7 +448,7 @@ func (r *BatchJobExpire) expireVersions(ctx context.Context, api ObjectLayer, vc
 				ri.countRemoved(r.Bucket, 1, 0)
 			}
 			return nil
-		case isBatchJobAuthzError(err):
+		case isBatchJobStopped(err):
 			return err
 		case isErrObjectLocked(err):
 			// Left in place, not retried and not a failure.
@@ -515,7 +515,7 @@ func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer,
 		switch {
 		case err == nil:
 			return nil
-		case isBatchJobAuthzError(err):
+		case isBatchJobStopped(err):
 			return err
 		case errors.Is(err, errDeleteAllChanged):
 			// Changed since the walk matched it: not expired.
@@ -616,7 +616,7 @@ func batchObjsForDelete(ctx context.Context, refuse func(error), walkDone func()
 				}
 				if err != nil {
 					// The batch is not done; a later run does it again.
-					if isBatchJobAuthzError(err) {
+					if isBatchJobStopped(err) {
 						refuse(err)
 					}
 					globalBatchJobsMetrics.save(ri.JobID, ri)
@@ -639,7 +639,7 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 		StartTime: job.Started,
 	}
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
-		return err
+		return batchUnavailable("loading job progress", err)
 	}
 	// A completed job is not run again, as replication and key rotation
 	// jobs are not: its submitter is not checked again either, so a
@@ -671,7 +671,11 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	defer cancelCause(nil)
 	// refuse ends the job for its submitter: record why before stopping.
 	refuse := func(err error) {
-		ri.refuse(err)
+		if isBatchJobUnavailable(err) {
+			ri.pause(err)
+		} else {
+			ri.refuse(err)
+		}
 		cancelCause(err)
 	}
 
@@ -679,8 +683,6 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	// run, so the cursor cannot move past what was not listed.
 	walkCtx, stopWalk := context.WithCancel(ctx)
 	defer stopWalk()
-	// walkFailed: a listing failed before it returned any result.
-	var walkFailed atomic.Bool
 	results := make(chan itemOrErr[ObjectInfo], workerSize)
 	go func() {
 		// One ascending walk over disjoint prefixes, which the cursor
@@ -697,8 +699,7 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 			})
 			if err != nil {
 				if walkCtx.Err() == nil {
-					walkFailed.Store(true)
-					cancelCause(err)
+					cancelCause(batchListingError(err))
 				}
 				xioutil.SafeClose(results)
 				return
@@ -786,6 +787,7 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 			}
 		}
 	}
+	var listingErr error
 	for {
 		select {
 		case result, ok := <-results:
@@ -795,6 +797,7 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 			}
 			if result.Err != nil {
 				failed = true
+				listingErr = batchListingError(result.Err)
 				batchLogIf(ctx, result.Err)
 				stopWalk()
 				done = true
@@ -889,11 +892,15 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	<-saverDoneCh
 	refused := ri.refused()
 	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = listingErr
+	}
 	if cause != nil && !refused {
-		if walkFailed.Load() {
-			// This run failed; a later run lists again from the cursor.
+		if isBatchJobUnavailable(cause) {
+			return ri.savePaused(ctx, api, job, cause)
+		}
+		if isErrBucketNotFound(cause) {
 			ri.mu.Lock()
-			ri.Complete = false
 			ri.Failed = true
 			ri.mu.Unlock()
 		}
