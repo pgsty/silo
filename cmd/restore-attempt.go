@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,24 +34,16 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 )
 
-// A native restore keeps two private records. The version that POST marks
-// ongoing names the attempt that owns the marker; that attempt's multipart
-// upload names the attempt and the version it rehydrates. Clients cannot
-// set either: requests with reserved metadata are refused, it is never
-// extracted from headers, and uploads only get the marker from the restore.
-const (
-	restoreAttemptKey = ReservedMetadataPrefixLower + "restore-attempt"
-	restoreUploadKey  = ReservedMetadataPrefixLower + "restore-upload"
-)
+// The version that POST marks ongoing names the native restore attempt that
+// owns the marker. Clients cannot set it: requests with reserved metadata are
+// refused, and it is never extracted from headers.
+const restoreAttemptKey = ReservedMetadataPrefixLower + "restore-attempt"
 
 const (
-	// restoreTakeoverWait bounds how long a POST on an ongoing version waits
-	// for the object lock. A running restore holds it for its download.
+	// restoreTakeoverWait bounds how long a POST waits for the restore lock
+	// of its version. A running restore holds it for its whole run.
 	restoreTakeoverWait = 2 * time.Second
-	// restoreCommitGrace is how long stale cleanup keeps an upload whose
-	// completion staged object metadata in it; a commit takes seconds.
-	restoreCommitGrace = time.Hour
-	// restoreCleanupTimeout bounds each status reset and upload abort.
+	// restoreCleanupTimeout bounds each status reset and convergence pass.
 	restoreCleanupTimeout = time.Minute
 )
 
@@ -63,7 +56,7 @@ var (
 	// errRestoreSuperseded: the version no longer belongs to this attempt.
 	// The attempt must not rehydrate, complete or reset anything.
 	errRestoreSuperseded = errors.New("restore attempt superseded")
-	// errRestoreInProgress: a restore holds the object lock of the version.
+	// errRestoreInProgress: a restore holds the restore lock of the version.
 	errRestoreInProgress = errors.New("restore already in progress")
 	// errRestoreUnchanged: a restore status update found nothing to write.
 	errRestoreUnchanged = errors.New("restore status unchanged")
@@ -107,19 +100,6 @@ func (a *restoreAttempt) String() string {
 	return string(b)
 }
 
-func parseRestoreAttempt(s string) (*restoreAttempt, bool) {
-	var a restoreAttempt
-	if s == "" || json.Unmarshal([]byte(s), &a) != nil || a.ID == "" || a.VersionID == "" {
-		return nil, false
-	}
-	return &a, true
-}
-
-func (a *restoreAttempt) equal(b *restoreAttempt) bool {
-	return a != nil && b != nil && a.ID == b.ID && a.VersionID == b.VersionID &&
-		a.ETag == b.ETag && a.Size == b.Size && a.ModTime.Equal(b.ModTime)
-}
-
 // targets reports whether oi is still the version the attempt was made for.
 // A replacement under the same version ID differs in ETag, size or ModTime.
 func (a *restoreAttempt) targets(oi ObjectInfo) bool {
@@ -133,162 +113,16 @@ func (a *restoreAttempt) owns(oi ObjectInfo) bool {
 	return a.targets(oi) && oi.RestoreOngoing && oi.UserDefined[restoreAttemptKey] == a.ID
 }
 
-// rehydrates reports whether completing upload fi, the attempt's private
-// upload, writes back the very version current.
-func (a *restoreAttempt) rehydrates(current ObjectInfo, fi FileInfo) bool {
-	return a.targets(current) && fi.Metadata["etag"] == a.ETag && fi.Size == a.Size && fi.ModTime.Equal(a.ModTime)
-}
-
-// restoreUploadView is the restore marker of an upload as the drives of
-// its set establish it. A marked upload is written to a write quorum, at
-// least a majority of the drives, and its copies never change their marker.
-type restoreUploadView struct {
-	// marker is the attempt of a native restore's upload: one marker that a
-	// majority of the drives hold.
-	marker *restoreAttempt
-	// marked: some readable drive holds a marker.
-	marked bool
-	// known: the marker state is established. Without it, callers fail
-	// closed: nobody lists, uses, aborts or removes the upload.
-	known bool
-	// live: enough drives hold the upload or cannot tell that a written
-	// upload may exist; otherwise only remnants of one are left.
-	live bool
-	// committing: some drive holds object metadata in the upload's place.
-	// Completion stages the committed version's object metadata there,
-	// without the marker, before it renames the upload into the object.
-	committing bool
-	// bucket and object the upload of an established marker belongs to.
-	bucket, object string
-}
-
-// restoreUploadState establishes the marker of an upload from the metadata of
-// every drive. errs may be nil, then a drive without valid metadata is one
-// that cannot tell. A marker is established on a majority of the drives; its
-// absence only when no readable drive shows one and the drives that cannot
-// tell are too few to hold a marked upload.
-func restoreUploadState(metas []FileInfo, errs []error) restoreUploadView {
-	n := len(metas)
-	majority := n/2 + 1
-	markers := make(map[string]int)
-	var unmarked, unknown, committing int
-	for i, fi := range metas {
-		if errs != nil && errs[i] != nil {
-			if !errors.Is(errs[i], errFileNotFound) && !errors.Is(errs[i], errFileVersionNotFound) &&
-				!errors.Is(errs[i], errVolumeNotFound) && !errors.Is(errs[i], errUploadIDNotFound) {
-				unknown++
-			}
-			continue
-		}
-		if !fi.IsValid() {
-			unknown++
-			continue
-		}
-		if restoreUploadStaged(fi) {
-			committing++
-			continue
-		}
-		if m := fi.Metadata[restoreUploadKey]; m != "" {
-			markers[m]++
-		} else {
-			unmarked++
-		}
+// ownsGeneration reports whether the attempt owns the authoritative
+// generation of the version. Where the drives disagree only in their restore
+// fields, see restoreGeneration, it owns the version only when its marker is
+// the only ongoing marker there: holding one of several is not enough.
+func (a *restoreAttempt) ownsGeneration(gen restoreGeneration, bucket, object string) bool {
+	oi := gen.fi.ToObjectInfo(bucket, object, false)
+	if !gen.split {
+		return a.owns(oi)
 	}
-	present := unmarked
-	for _, c := range markers {
-		present += c
-	}
-	v := restoreUploadView{marked: len(markers) > 0, live: present+unknown+committing >= majority, committing: committing > 0}
-	if v.committing {
-		// Nobody but the completion may use or remove it now.
-		return v
-	}
-	for m, c := range markers {
-		if c >= majority {
-			v.marker, v.known = parseRestoreAttempt(m)
-			if v.known {
-				// The marker also names the upload's own target.
-				for _, fi := range metas {
-					if !fi.IsValid() || fi.Metadata[restoreUploadKey] != m {
-						continue
-					}
-					if restoreVersionID(fi.VersionID) != v.marker.VersionID || fi.Metadata["etag"] != v.marker.ETag {
-						v.marker, v.known = nil, false
-						break
-					}
-					v.bucket, v.object = fi.Metadata[multipartMetaBucket], fi.Metadata[multipartMetaObject]
-				}
-			}
-			return v
-		}
-	}
-	// A marker without a majority is established only as a remnant.
-	v.known = !v.live || (!v.marked && unknown < majority)
-	return v
-}
-
-// restoreUploadStaged reports whether an upload's record is object metadata
-// that a completion staged there: an upload record has no parts and no
-// other versions.
-func restoreUploadStaged(fi FileInfo) bool {
-	return fi.Deleted || len(fi.Parts) > 0 || fi.NumVersions > 1
-}
-
-// visible reports whether a caller sees the upload: a native restore its own
-// upload, any other caller only an upload established as unmarked.
-func (v restoreUploadView) visible(opts ObjectOptions) bool {
-	if a := opts.Transition.attempt; a != nil {
-		return v.marker.equal(a)
-	}
-	return v.known && !v.marked
-}
-
-// restoreUploadVisible reports whether a caller sees an upload whose metadata
-// is metas, one entry for each drive.
-func restoreUploadVisible(metas []FileInfo, opts ObjectOptions) bool {
-	return restoreUploadState(metas, nil).visible(opts)
-}
-
-// readRestoreUpload reads the metadata of an upload from every drive.
-func (er erasureObjects) readRestoreUpload(ctx context.Context, bucket, uploadIDPath string) restoreUploadView {
-	metas, errs := readAllFileInfo(ctx, er.getDisks(), bucket, minioMetaMultipartBucket, uploadIDPath, "", false, false)
-	return restoreUploadState(metas, errs)
-}
-
-// restoreCommitLock is held by a completion from staging through its commit;
-// it is named by the upload's own path, which an upload whose copies all
-// hold staged object metadata still has.
-func (er erasureObjects) restoreCommitLock(uploadIDPath string) RWLocker {
-	return er.NewNSLock(minioMetaMultipartBucket, uploadIDPath)
-}
-
-// restoreCommitAbandoned reports whether an upload holds only what a failed
-// commit left: every drive answers, and every copy that is there is staged
-// object metadata, see restoreUploadStaged, older than restoreCommitGrace by
-// that drive's own metadata file. A copy that cannot be read, or that is not
-// staged yet, may belong to a commit still running. The caller holds the
-// upload's restoreCommitLock.
-func (er erasureObjects) restoreCommitAbandoned(ctx context.Context, bucket, uploadIDPath string) bool {
-	disks := er.getDisks()
-	metas, errs := readAllFileInfo(ctx, disks, bucket, minioMetaMultipartBucket, uploadIDPath, "", false, false)
-	staged := 0
-	for i, fi := range metas {
-		if errs[i] != nil {
-			if errors.Is(errs[i], errFileNotFound) || errors.Is(errs[i], errFileVersionNotFound) {
-				continue
-			}
-			return false
-		}
-		if !fi.IsValid() || !restoreUploadStaged(fi) {
-			return false
-		}
-		st, err := disks[i].StatInfoFile(ctx, minioMetaMultipartBucket, pathJoin(uploadIDPath, xlStorageFormatFile), false)
-		if err != nil || len(st) == 0 || time.Since(st[0].ModTime) < restoreCommitGrace {
-			return false
-		}
-		staged++
-	}
-	return staged > 0
+	return a.targets(oi) && len(gen.ongoing) == 1 && gen.ongoing[a.ID]
 }
 
 // restoreGeneration is the metadata generation of one version that the drives
@@ -304,12 +138,18 @@ func (er erasureObjects) restoreCommitAbandoned(ctx context.Context, bucket, upl
 // out: fi has no restore fields, and ongoing names the attempts whose
 // ongoing marker some of its drives hold ("" for one without an attempt).
 // Every other field, protection included, still needs the quorum.
+//
+// revs has, for every drive that holds the version, the full revision of the
+// entry it holds, whether or not that revision is the generation; nil where a
+// drive does not hold the version or cannot be read. A native restore's
+// commit compares the drives against it later, see restorePublication.
 type restoreGeneration struct {
 	fi      FileInfo
 	drives  []FileInfo
 	disks   []StorageAPI
 	split   bool
 	ongoing map[string]bool
+	revs    []*revisionKey
 }
 
 // restoreFieldKeys are the metadata keys a restore status write sets.
@@ -464,7 +304,7 @@ func (er erasureObjects) readRestoreGeneration(ctx context.Context, bucket, obje
 		return bestKey, best != nil && best.count >= majority &&
 			best.count >= er.versionReadQuorum(ctx, bucket, object, best.ver, best.metaV, make([]FileInfo, n), make([]error, n))
 	}
-	gen := restoreGeneration{drives: make([]FileInfo, n), disks: make([]StorageAPI, n)}
+	gen := restoreGeneration{drives: make([]FileInfo, n), disks: make([]StorageAPI, n), revs: slices.Clone(keys)}
 	bestKey, ok := accepted(revisions)
 	if !ok {
 		if bestKey, ok = accepted(neutrals); !ok {
@@ -593,60 +433,6 @@ func (er erasureObjects) clearRestoreStatus(ctx context.Context, bucket, object,
 	return err
 }
 
-// restoreFailed clears the ongoing marker of a failed attempt while the
-// object lock is held. A lost lock or an ended context leaves that to the
-// bounded retries of the pools layer, which take the lock afresh.
-func (er erasureObjects) restoreFailed(ctx context.Context, bucket, object, versionID string, published *restoreAttempt, cause error) error {
-	if ctx.Err() != nil {
-		return restoreResetError{cause}
-	}
-	if err := er.clearRestoreStatus(ctx, bucket, object, versionID, published); err != nil {
-		storageLogIf(ctx, fmt.Errorf("Unable to clear the restore status of %s/%s(%s): %w", bucket, object, versionID, err))
-		return restoreResetError{cause}
-	}
-	return cause
-}
-
-// abortRestoreUpload removes the private upload of a failed attempt, or
-// leaves it to stale-upload cleanup. The restore's own context may have
-// ended, so it uses a fresh bounded one, and the upload lock as any abort.
-// It matches the upload to its own attempt rather than to the version, which
-// a newer attempt may own by now, and it never touches the version.
-func (er erasureObjects) abortRestoreUpload(bucket, object, uploadID string, a *restoreAttempt) {
-	ctx, cancel := context.WithTimeout(GlobalContext, restoreCleanupTimeout)
-	defer cancel()
-	lk := er.NewNSLock(bucket, pathJoin(object, uploadID))
-	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-	if err == nil {
-		defer lk.Unlock(lkctx)
-		_, err = er.abortMultipartUpload(lkctx.Context(), bucket, object, uploadID, ObjectOptions{
-			NoAuditLog: true,
-			Transition: TransitionOptions{attempt: a},
-		})
-	}
-	if err != nil {
-		storageLogIf(ctx, fmt.Errorf("Unable to abort the restore upload of %s/%s: %w", bucket, object, err))
-	}
-}
-
-// restoreUploadActive reports whether the restore that owns a stale-aged
-// upload still runs: its attempt owns the version's ongoing marker. A long
-// download keeps its upload; one whose attempt ended loses it, and an
-// ongoing marker alone keeps nothing.
-func (er erasureObjects) restoreUploadActive(ctx context.Context, v restoreUploadView) bool {
-	gen, err := er.readRestoreGeneration(ctx, v.bucket, v.object, v.marker.VersionID)
-	if err != nil {
-		// An unreadable version may still be restoring; retry next round.
-		return !errors.Is(err, errFileVersionNotFound) && !errors.Is(err, errFileNotFound)
-	}
-	if gen.split {
-		// Drives disagree on the restore status: that the attempt ended
-		// is not established.
-		return gen.ongoing[v.marker.ID]
-	}
-	return v.marker.owns(gen.fi.ToObjectInfo(v.bucket, v.object, false))
-}
-
 // restoreLock is the object lock that restores and their status updates
 // share: the lock every write of the object takes.
 func (z *erasureServerPools) restoreLock(bucket, object string) RWLocker {
@@ -659,36 +445,50 @@ type restoreRequestStatus struct {
 	// attempt is the restore that must rehydrate the version; nil when a
 	// restored copy was still there and its expiry was renewed.
 	attempt *restoreAttempt
+	// owner is the restore lock of the version, held for attempt. The
+	// caller hands it to the worker that runs attempt, or releases it.
+	owner *restoreOwner
+	// date is the request date recorded with attempt.
+	date string
 }
 
 // restoreRequest records a POST restore on target, the version that POST
 // resolved, on a fresh read under the object lock. The version must still
 // be target: a replacement under the same version ID is refused. A copy that
 // still holds its restored data is renewed. Otherwise the version is marked
-// ongoing for a new attempt; that also takes over a marker no running
-// restore holds, as a running restore holds the object lock for its whole
-// download. Only the copy that is to be restored is written, so no copy
+// ongoing for a new attempt, which also takes over a marker that no running
+// restore holds. Only the copy that is to be restored is written, so no copy
 // claims a restored copy it does not hold.
-func (z *erasureServerPools) restoreRequest(ctx context.Context, bucket, object string, opts ObjectOptions, target ObjectInfo) (restoreRequestStatus, error) {
+//
+// It takes the restore lock R of the version before the object lock O. A
+// running restore holds R for its whole run, so a POST that cannot take R
+// within the takeover wait answers from the drives: in progress when they
+// show the version ongoing, and a retryable timeout otherwise, such as while
+// another POST of the version registers. ctx must outlive the request: a new
+// attempt keeps R in the returned status.
+func (z *erasureServerPools) restoreRequest(ctx context.Context, bucket, object string, opts ObjectOptions, target ObjectInfo) (status restoreRequestStatus, err error) {
 	object = encodeDirObject(object)
 	versionID := restoreVersionID(target.VersionID)
-	lk := z.restoreLock(bucket, object)
-	// Wait only briefly first, whatever the lockless read before saw: a
-	// restore of this version holds the lock for its whole download. Then
-	// wait as usual only if the drives show no restore of it running.
-	lkctx, err := lk.GetLock(ctx, newDynamicTimeout(restoreTakeoverWait, restoreTakeoverWait))
-	if errors.As(err, &OperationTimedOut{}) && ctx.Err() == nil {
-		running, rerr := z.restoreRunning(ctx, bucket, object, versionID)
-		switch {
-		case rerr != nil:
-			// Whether it is restoring is unknown: answer now, not after
-			// the lock frees.
-			return restoreRequestStatus{}, rerr
-		case running:
-			return restoreRequestStatus{}, errRestoreInProgress
+	owner, err := z.takeRestoreOwner(ctx, bucket, object, versionID, newDynamicTimeout(restoreTakeoverWait, restoreTakeoverWait))
+	if err != nil {
+		if errors.As(err, &OperationTimedOut{}) && ctx.Err() == nil {
+			running, rerr := z.restoreRunning(ctx, bucket, object, versionID)
+			switch {
+			case rerr != nil:
+				return restoreRequestStatus{}, rerr
+			case running:
+				return restoreRequestStatus{}, errRestoreInProgress
+			}
 		}
-		lkctx, err = lk.GetLock(ctx, globalOperationTimeout)
+		return restoreRequestStatus{}, err
 	}
+	defer func() {
+		if status.attempt == nil {
+			owner.release()
+		}
+	}()
+	lk := z.restoreLock(bucket, object)
+	lkctx, err := lk.GetLock(owner.ctx, globalOperationTimeout)
 	if err != nil {
 		return restoreRequestStatus{}, err
 	}
@@ -750,7 +550,10 @@ func (z *erasureServerPools) restoreRequest(ctx context.Context, bucket, object 
 		}
 		return restoreRequestStatus{}, err
 	}
-	return restoreRequestStatus{objInfo: oi, attempt: attempt}, nil
+	if attempt == nil {
+		return restoreRequestStatus{objInfo: oi}, nil
+	}
+	return restoreRequestStatus{objInfo: oi, attempt: attempt, owner: owner, date: date}, nil
 }
 
 // restoreRunning reports, without the object lock and within the takeover
@@ -801,7 +604,7 @@ func (z *erasureServerPools) restorePoolIdx(ctx context.Context, bucket, object 
 			return -1, restoreResetError{toObjectErr(err, bucket, object, a.VersionID)}
 		}
 		found = true
-		if !z.IsSuspended(idx) && a.owns(gen.fi.ToObjectInfo(bucket, object, false)) {
+		if !z.IsSuspended(idx) && a.ownsGeneration(gen, bucket, object) {
 			return idx, nil
 		}
 	}

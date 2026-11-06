@@ -1027,7 +1027,6 @@ func putRestoreOpts(rreq *RestoreObjectRequest, objInfo ObjectInfo, opts ObjectO
 	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
 	meta[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
 	delete(meta, restoreAttemptKey)
-	delete(meta, restoreUploadKey)
 	return ObjectOptions{
 		Versioned:        opts.Versioned,
 		VersionSuspended: opts.VersionSuspended,

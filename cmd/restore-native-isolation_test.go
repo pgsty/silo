@@ -20,7 +20,6 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -41,12 +40,9 @@ import (
 	"github.com/minio/mux"
 )
 
-// The private metadata of a native restore, as stored. Literal names keep
-// these regressions meaningful on a tree without the keys.
-const (
-	restoreIsolationAttemptKey = "x-minio-internal-restore-attempt"
-	restoreIsolationUploadKey  = "x-minio-internal-restore-upload"
-)
+// The private attempt metadata of a native restore, as stored. A literal name
+// keeps these regressions meaningful on a tree without the key.
+const restoreIsolationAttemptKey = "x-minio-internal-restore-attempt"
 
 // restoreIsolationLayer hooks the object layer a POST restore handler uses.
 // afterRead runs once POST has read the version, before POST records its
@@ -177,30 +173,6 @@ func restoreIsolationUploads(t *testing.T, r *restoreTest, pool int) map[string]
 	return found
 }
 
-// restoreIsolationUpload finds the single upload of the object in a pool on
-// disk, with its first part, and returns its public upload ID.
-func restoreIsolationUpload(t *testing.T, r *restoreTest, pool int) (string, ObjectPartInfo) {
-	t.Helper()
-	uploads := restoreIsolationUploads(t, r, pool)
-	if len(uploads) != 1 {
-		t.Fatalf("want one upload on disk, found %v", uploads)
-	}
-	var uploadUUID string
-	for uploadUUID = range uploads {
-	}
-	er := r.z.serverPools[pool].getHashedSet(r.object)
-	uploadPath := pathJoin(er.getMultipartSHADir(r.bucket, r.object), uploadUUID)
-	fi, err := er.getDisks()[0].ReadVersion(t.Context(), "", minioMetaMultipartBucket, uploadPath, "", ReadOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	parts, err := readParts(t.Context(), er.getDisks(), minioMetaMultipartBucket, []string{pathJoin(uploadPath, fi.DataDir, "part.1.meta")}, []int{1}, 1)
-	if err != nil || len(parts) != 1 || parts[0].Error != "" {
-		t.Fatalf("restore must have published its first part: %+v, %v", parts, err)
-	}
-	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "%s.%s", globalDeploymentID(), uploadUUID)), parts[0]
-}
-
 // restoreIsolationGateTier holds a download after its first bytes and can
 // fail it once released.
 type restoreIsolationGateTier struct {
@@ -317,207 +289,6 @@ func installRestoreIsolationFaults(r *restoreTest, pool int, failing int) (reads
 	}
 	er.getDisks = func() []StorageAPI { return wrapped }
 	return reads, writes
-}
-
-// A public client must not replace a part of a native restore's upload,
-// before or after the restore validated it: the bytes would become the
-// COMPLIANCE-protected version under its original ETag.
-func TestRestoreUploadIsolatedFromPublicParts(t *testing.T) {
-	r := newRestoreSafetyTest(t, 2, versioning.Enabled)
-	initConfigSubsystem(t.Context(), r.z)
-	enableBucketObjectLock(t, r.bucket)
-	previous := newObjectLayerFn()
-	t.Cleanup(func() { setObjectLayer(previous) })
-	router := initTestAPIEndPoints(r.z, []string{"PutObjectPart", "GetObject"})
-	oi, body := nativeRestoreSeed(t, r, 0, false, true)
-	if rec := nativeRestoreLockRequest(t.Context(), t, r, oi.VersionID, "retention", retentionBody("COMPLIANCE", UTCNow().Add(48*time.Hour))); rec.Code != http.StatusOK {
-		t.Fatalf("lock: %d %s", rec.Code, rec.Body.String())
-	}
-	// Hold completion after it validated the parts, before it commits.
-	er := r.z.serverPools[0].getHashedSet(r.object)
-	original := er.getDisks
-	gate := &restoreIsolationCompletionGate{entered: make(chan struct{}), release: make(chan struct{})}
-	defer gate.unblock()
-	disks := original()
-	wrapped := make([]StorageAPI, len(disks))
-	for i, d := range disks {
-		wrapped[i] = restoreIsolationCompletionDisk{d, gate}
-	}
-	er.getDisks = func() []StorageAPI { return wrapped }
-	defer func() { er.getDisks = original }()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	restored := make(chan error, 1)
-	go func() {
-		restored <- r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
-	}()
-	select {
-	case <-gate.entered:
-	case err := <-restored:
-		t.Fatalf("restore stopped before validation: %v", err)
-	case <-ctx.Done():
-		t.Fatal("no completion gate")
-	}
-	id, _ := restoreIsolationUpload(t, r, 0)
-	poison := bytes.Repeat([]byte("z"), 5<<20)
-	// The request may wait for the upload lock that completion holds.
-	uploaded := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		uploaded <- attributesPartsSignedRequest(t, router, globalActiveCred, http.MethodPut, "/"+r.bucket+"/"+r.object+"?uploadId="+url.QueryEscape(id)+"&partNumber=1", poison, nil)
-	}()
-	var rec *httptest.ResponseRecorder
-	select {
-	case rec = <-uploaded:
-	case <-time.After(500 * time.Millisecond):
-	}
-	gate.unblock()
-	if err := <-restored; err != nil {
-		t.Fatalf("restore: %v", err)
-	}
-	if rec == nil {
-		rec = <-uploaded
-	}
-	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "NoSuchUpload") {
-		t.Errorf("public UploadPart on a native restore upload: %d %s, want NoSuchUpload", rec.Code, rec.Body.String())
-	}
-	got := attributesPartsSignedRequest(t, router, globalActiveCred, http.MethodGet, "/"+r.bucket+"/"+r.object+"?versionId="+oi.VersionID, nil, nil)
-	if got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), body) {
-		t.Errorf("COMPLIANCE version holds other bytes after restore: GET=%d poisoned=%v", got.Code, bytes.HasPrefix(got.Body.Bytes(), poison))
-	}
-}
-
-type restoreIsolationCompletionGate struct {
-	entered, release chan struct{}
-	enter, open      sync.Once
-}
-
-func (g *restoreIsolationCompletionGate) unblock() { g.open.Do(func() { close(g.release) }) }
-
-type restoreIsolationCompletionDisk struct {
-	StorageAPI
-	gate *restoreIsolationCompletionGate
-}
-
-// Completion removes the part metadata it validated just before it renames
-// the upload into place.
-func (d restoreIsolationCompletionDisk) DeleteBulk(ctx context.Context, bucket string, paths ...string) error {
-	if bucket == minioMetaMultipartBucket && len(paths) == 2 && strings.HasSuffix(paths[0], ".meta") && strings.HasSuffix(paths[1], ".meta") {
-		d.gate.enter.Do(func() { close(d.gate.entered) })
-		select {
-		case <-d.gate.release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return d.StorageAPI.DeleteBulk(ctx, bucket, paths...)
-}
-
-// restoreIsolationValidationDisk holds a completion where it reads the parts
-// it validates: after its object and upload locks, before its commit lock.
-// Stale cleanup then decides on the upload itself, not on a running commit.
-type restoreIsolationValidationDisk struct {
-	StorageAPI
-	gate *restoreIsolationCompletionGate
-}
-
-func (d restoreIsolationValidationDisk) ReadParts(ctx context.Context, bucket string, partMetaPaths ...string) ([]*ObjectPartInfo, error) {
-	if bucket == minioMetaMultipartBucket {
-		d.gate.enter.Do(func() { close(d.gate.entered) })
-		select {
-		case <-d.gate.release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return d.StorageAPI.ReadParts(ctx, bucket, partMetaPaths...)
-}
-
-// Every public multipart entry point finds no native restore upload, and
-// none of them can change it: the restore still completes with its own data.
-func TestRestoreUploadHiddenFromPublicEntryPoints(t *testing.T) {
-	for _, pools := range []int{1, 2} {
-		t.Run(fmt.Sprintf("pools=%d", pools), func(t *testing.T) {
-			r := newRestoreSafetyTest(t, pools, versioning.Enabled)
-			oi, body := nativeRestoreSeed(t, r, 0, false, true)
-			tier := newRestoreIsolationGateTier(5<<20, nil)
-			globalTierConfigMgr.drivercache["WARM"] = tier
-			defer tier.unblock()
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-			defer cancel()
-			restored := make(chan error, 1)
-			go func() {
-				restored <- r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
-			}()
-			restoreIsolationEntered(t, tier)
-			id, part := restoreIsolationUpload(t, r, 0)
-			stored := restoreIsolationUploads(t, r, 0)
-
-			for _, prefix := range []string{r.object, ""} {
-				uploads, err := r.z.ListMultipartUploads(t.Context(), r.bucket, prefix, "", "", "", 100)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, u := range uploads.Uploads {
-					if u.UploadID == id {
-						t.Errorf("ListMultipartUploads(prefix=%q) shows the native restore upload", prefix)
-					}
-				}
-			}
-			poison := bytes.Repeat([]byte("z"), 5<<20)
-			noUpload := func(op string, err error) {
-				t.Helper()
-				if !errors.As(err, &InvalidUploadID{}) {
-					t.Errorf("%s on a native restore upload: %v, want NoSuchUpload", op, err)
-				}
-			}
-			// With one pool, part writes first wait for the object lock the
-			// restore holds; with more they reach the upload at once.
-			written := make(chan error, 2)
-			go func() {
-				_, err := r.z.PutObjectPart(ctx, r.bucket, r.object, id, 1, mustGetPutObjReader(t, bytes.NewReader(poison), int64(len(poison)), "", ""), ObjectOptions{})
-				written <- err
-			}()
-			go func() {
-				src := ObjectInfo{PutObjReader: mustGetPutObjReader(t, bytes.NewReader(poison), int64(len(poison)), "", "")}
-				_, err := r.z.CopyObjectPart(ctx, r.bucket, r.object, r.bucket, r.object, id, 1, 0, int64(len(poison)), src, ObjectOptions{}, ObjectOptions{})
-				written <- err
-			}()
-			var writes []error
-			if pools > 1 {
-				writes = append(writes, <-written, <-written)
-			}
-			_, err := r.z.ListObjectParts(t.Context(), r.bucket, r.object, id, 0, 10, ObjectOptions{})
-			noUpload("ListObjectParts", err)
-			_, err = r.z.GetMultipartInfo(t.Context(), r.bucket, r.object, id, ObjectOptions{})
-			noUpload("GetMultipartInfo", err)
-			err = r.z.AbortMultipartUpload(t.Context(), r.bucket, r.object, id, ObjectOptions{})
-			noUpload("AbortMultipartUpload", err)
-			if after := restoreIsolationUploads(t, r, 0); !reflect.DeepEqual(after, stored) {
-				t.Errorf("public calls changed the restore upload on disk: %v -> %v", stored, after)
-			}
-			// Completion waits for the object lock the restore holds.
-			completed := make(chan error, 1)
-			go func() {
-				_, err := r.z.CompleteMultipartUpload(ctx, r.bucket, r.object, id, []CompletePart{{PartNumber: 1, ETag: part.ETag}}, r.opts(oi.VersionID))
-				completed <- err
-			}()
-			tier.unblock()
-			if err := <-restored; err != nil {
-				t.Fatalf("restore after public calls: %v", err)
-			}
-			for len(writes) < 2 {
-				writes = append(writes, <-written)
-			}
-			for _, err := range writes {
-				noUpload("PutObjectPart/CopyObjectPart", err)
-			}
-			noUpload("CompleteMultipartUpload", <-completed)
-			_, got, err := r.read(oi.VersionID)
-			if err != nil || !bytes.Equal(got, body) {
-				t.Fatalf("restore contents after public calls: %v", err)
-			}
-		})
-	}
 }
 
 // POST records its status on a fresh read under the object lock, so an
@@ -721,6 +492,10 @@ func TestRestoreSupersededAttempt(t *testing.T) {
 			t.Cleanup(unblock)
 			older := newRestoreIsolationLayer(r)
 			older.restore = func(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+				// The queued worker loses the restore lock POST handed it,
+				// as when its refresh found it gone: the marker then belongs
+				// to no running restore.
+				opts.Transition.owner.release()
 				<-release
 				return r.z.RestoreTransitionedObject(ctx, bucket, object, opts)
 			}
@@ -984,204 +759,6 @@ func TestRestoreDuplicatePoolCacheStates(t *testing.T) {
 	}
 }
 
-// Stale-upload cleanup ages an upload by when it started, not by the
-// version's ModTime, keeps the upload of a running restore beyond the stale
-// age, and still removes ordinary stale uploads and those of ended attempts.
-func TestRestoreUploadOutlivesStaleAge(t *testing.T) {
-	cleanup := func(t *testing.T, r *restoreTest) {
-		er := r.z.serverPools[0].getHashedSet(r.object)
-		for _, disk := range er.getDisks() {
-			er.cleanupStaleUploadsOnDisk(t.Context(), disk)
-		}
-	}
-	shortExpiry := func(t *testing.T) {
-		globalAPIConfig.mu.Lock()
-		prev := globalAPIConfig.staleUploadsExpiry
-		globalAPIConfig.staleUploadsExpiry = time.Nanosecond
-		globalAPIConfig.mu.Unlock()
-		t.Cleanup(func() {
-			globalAPIConfig.mu.Lock()
-			globalAPIConfig.staleUploadsExpiry = prev
-			globalAPIConfig.mu.Unlock()
-		})
-	}
-	for _, mode := range []string{"old-version", "past-stale-age", "public-abort", "ordinary-stale", "unowned-marker"} {
-		t.Run(mode, func(t *testing.T) {
-			r := newRestoreSafetyTest(t, 2, versioning.Enabled)
-			initConfigSubsystem(t.Context(), r.z)
-			if mode == "ordinary-stale" {
-				// Control: an abandoned client upload, old by its upload ID.
-				if _, err := r.z.NewMultipartUpload(t.Context(), r.bucket, r.object, ObjectOptions{MTime: UTCNow().Add(-72 * time.Hour)}); err != nil {
-					t.Fatal(err)
-				}
-				cleanup(t, r)
-				if uploads := restoreIsolationUploads(t, r, 0); len(uploads) != 0 {
-					t.Errorf("ordinary stale upload survived cleanup: %v", uploads)
-				}
-				return
-			}
-			var oi ObjectInfo
-			var body []byte
-			if mode == "past-stale-age" {
-				oi, body = restoreIsolationSeed(t, r, 0, false, true)
-			} else {
-				oi, body = nativeRestoreSeed(t, r, 0, false, true)
-			}
-			old := r.opts(oi.VersionID)
-			old.MTime = UTCNow().Add(-72 * time.Hour)
-			old.EvalMetadataFn = func(*ObjectInfo, error) (ReplicateDecision, error) { return ReplicateDecision{}, nil }
-			if _, err := r.z.PutObjectMetadata(t.Context(), r.bucket, r.object, old); err != nil {
-				t.Fatal(err)
-			}
-			// The cleanup with a short stale age also removes in-flight
-			// temporary parts; hold such restores in completion instead,
-			// before their commit.
-			gated := mode == "past-stale-age" || mode == "unowned-marker"
-			tier := newRestoreIsolationGateTier(5<<20, nil)
-			if !gated {
-				globalTierConfigMgr.drivercache["WARM"] = tier
-			}
-			defer tier.unblock()
-			gate := &restoreIsolationCompletionGate{entered: make(chan struct{}), release: make(chan struct{})}
-			defer gate.unblock()
-			if gated {
-				er := r.z.serverPools[0].getHashedSet(r.object)
-				original := er.getDisks
-				disks := original()
-				wrapped := make([]StorageAPI, len(disks))
-				for i, d := range disks {
-					wrapped[i] = restoreIsolationValidationDisk{d, gate}
-				}
-				er.getDisks = func() []StorageAPI { return wrapped }
-				defer func() { er.getDisks = original }()
-			}
-			result := make(chan error, 1)
-			layer := newRestoreIsolationLayer(r)
-			if mode == "past-stale-age" {
-				// A POST publishes the attempt that a running restore owns.
-				if rec := restoreIsolationPOST(t, r, layer, oi.VersionID); rec.Code != http.StatusOK {
-					t.Fatalf("POST: %d %s", rec.Code, rec.Body.String())
-				}
-			} else {
-				go func() {
-					result <- r.z.RestoreTransitionedObject(t.Context(), r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
-				}()
-			}
-			if gated {
-				select {
-				case <-gate.entered:
-				case <-time.After(restoreTestWait):
-					t.Fatal("restore never reached completion")
-				}
-			} else {
-				restoreIsolationEntered(t, tier)
-			}
-			switch mode {
-			case "past-stale-age", "unowned-marker":
-				shortExpiry(t)
-				cleanup(t, r)
-				kept := len(restoreIsolationUploads(t, r, 0)) == 1
-				if mode == "unowned-marker" && kept {
-					// The version is ongoing, but not for this direct restore's
-					// upload: an ongoing marker alone does not keep an upload.
-					t.Error("stale cleanup kept an upload no attempt owns")
-				}
-				if mode == "past-stale-age" && !kept {
-					t.Error("stale cleanup removed the upload of a running restore")
-				}
-			case "old-version":
-				cleanup(t, r)
-			case "public-abort":
-				id, _ := restoreIsolationUpload(t, r, 0)
-				if err := r.z.AbortMultipartUpload(t.Context(), r.bucket, r.object, id, ObjectOptions{}); !errors.As(err, &InvalidUploadID{}) {
-					t.Errorf("public abort of a native restore upload: %v, want NoSuchUpload", err)
-				}
-			}
-			tier.unblock()
-			gate.unblock()
-			var err error
-			if mode == "past-stale-age" {
-				err = layer.wait(t)
-			} else {
-				err = <-result
-			}
-			if mode == "unowned-marker" {
-				if err == nil {
-					t.Error("restore completed without its upload")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("restore lost its upload: %v", err)
-			}
-			_, got, err := r.read(oi.VersionID)
-			if err != nil || !bytes.Equal(got, body) {
-				t.Fatalf("restore contents: %v", err)
-			}
-		})
-	}
-}
-
-// A failed multipart restore removes its own upload from the drives, also
-// when a newer attempt owns the version by then, and leaves that newer
-// attempt's marker alone.
-func TestRestoreFailureAbortsUpload(t *testing.T) {
-	for _, mode := range []string{"download-failure", "superseded-mid-download"} {
-		t.Run(mode, func(t *testing.T) {
-			r := newRestoreSafetyTest(t, 1, versioning.Enabled)
-			initConfigSubsystem(t.Context(), r.z)
-			failure := errors.New("injected remote failure")
-			if mode == "download-failure" {
-				oi, _ := nativeRestoreSeed(t, r, 0, false, true)
-				tier := globalTierConfigMgr.drivercache["WARM"].(*restoreTestTier)
-				globalTierConfigMgr.drivercache["WARM"] = nativeRestoreFailTier{tier, failure}
-				if err := r.z.RestoreTransitionedObject(t.Context(), r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID)); !errors.Is(err, failure) {
-					t.Fatalf("restore error=%v, want %v", err, failure)
-				}
-				if uploads := restoreIsolationUploads(t, r, 0); len(uploads) != 0 {
-					t.Errorf("failed native restore left its upload on disk: %v", uploads)
-				}
-				return
-			}
-			oi, _ := restoreIsolationSeed(t, r, 0, false, true)
-			tier := newRestoreIsolationGateTier(5<<20, failure)
-			globalTierConfigMgr.drivercache["WARM"] = tier
-			defer tier.unblock()
-			layer := newRestoreIsolationLayer(r)
-			if rec := restoreIsolationPOST(t, r, layer, oi.VersionID); rec.Code != http.StatusOK {
-				t.Fatalf("POST: %d %s", rec.Code, rec.Body.String())
-			}
-			restoreIsolationEntered(t, tier)
-			if uploads := restoreIsolationUploads(t, r, 0); len(uploads) != 1 {
-				t.Fatalf("restore upload on disk: %v", uploads)
-			}
-			// Model a newer generation that owns the version by now, such as
-			// one that took over after this restore lost its lock.
-			newer := r.opts(oi.VersionID)
-			newer.MTime = oi.ModTime
-			newer.NoLock = true
-			newer.EvalMetadataFn = func(o *ObjectInfo, _ error) (ReplicateDecision, error) {
-				o.UserDefined[restoreIsolationAttemptKey] = "newer-generation"
-				return ReplicateDecision{}, nil
-			}
-			if _, err := r.z.serverPools[0].getHashedSet(r.object).PutObjectMetadata(t.Context(), r.bucket, r.object, newer); err != nil {
-				t.Fatal(err)
-			}
-			tier.unblock()
-			if err := layer.wait(t); !errors.Is(err, failure) {
-				t.Fatalf("restore error=%v, want %v", err, failure)
-			}
-			if uploads := restoreIsolationUploads(t, r, 0); len(uploads) != 0 {
-				t.Errorf("superseded restore left its upload on disk: %v", uploads)
-			}
-			after := r.fileInfo(oi.VersionID)
-			if !strings.Contains(after.Metadata[xhttp.AmzRestore], "true") || after.Metadata[restoreIsolationAttemptKey] != "newer-generation" {
-				t.Errorf("failed restore cleared a newer attempt's marker: %q %q", after.Metadata[xhttp.AmzRestore], after.Metadata[restoreIsolationAttemptKey])
-			}
-		})
-	}
-}
-
 // A restored copy expires only by its own reason, on a fresh read: its
 // restore deadline passed and nothing else. A renewed deadline survives
 // another rule falling due and an expiry checked across all pools.
@@ -1241,58 +818,6 @@ func TestExpireRestoredNeedsOwnReason(t *testing.T) {
 			t.Logf("cleanup=%v header=%q", err, after.Metadata[xhttp.AmzRestore])
 			if err == nil || after.Metadata[xhttp.AmzRestore] != header || r.dataDirs(before.DataDir) != len(r.z.serverPools[0].getHashedSet(r.object).getDisks()) {
 				t.Error("cache cleanup removed a restored copy whose own deadline has not passed")
-			}
-		})
-	}
-}
-
-// Caller metadata cannot make an upload a native restore upload: the marker
-// is dropped, the upload stays an ordinary one and nothing commits it.
-func TestRestoreUploadMarkerSpoofing(t *testing.T) {
-	r := newRestoreSafetyTest(t, 1, versioning.Enabled)
-	oi, _ := nativeRestoreSeed(t, r, 0, false, true)
-	forged := fmt.Sprintf(`{"id":%q,"v":%q,"e":%q,"s":%d,"m":%q}`, mustGetUUID(), oi.VersionID, oi.ETag, oi.Size, oi.ModTime.UTC().Format(time.RFC3339Nano))
-	for _, target := range []string{"existing-version", "new-object"} {
-		t.Run(target, func(t *testing.T) {
-			opts := ObjectOptions{Versioned: true, UserDefined: map[string]string{restoreIsolationUploadKey: forged}}
-			object := r.object
-			if target == "existing-version" {
-				opts.VersionID = oi.VersionID
-				opts.MTime = oi.ModTime
-				opts.PreserveETag = oi.ETag
-			} else {
-				object = "spoofed-" + r.object
-			}
-			upload, err := r.z.NewMultipartUpload(t.Context(), r.bucket, object, opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			uploads, err := r.z.ListMultipartUploads(t.Context(), r.bucket, object, "", "", "", 100)
-			if err != nil || len(uploads.Uploads) != 1 || uploads.Uploads[0].UploadID != upload.UploadID {
-				t.Fatalf("a caller's upload must stay listed: %+v, %v", uploads.Uploads, err)
-			}
-			data := []byte("spoofed part")
-			part, err := r.z.PutObjectPart(t.Context(), r.bucket, object, upload.UploadID, 1, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), ObjectOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			before := nativeRestoreSnapshot(t, r)
-			done, err := r.z.CompleteMultipartUpload(t.Context(), r.bucket, object, upload.UploadID, []CompletePart{{PartNumber: 1, ETag: part.ETag}}, ObjectOptions{Versioned: true, MTime: opts.MTime})
-			if target == "existing-version" {
-				if !errors.Is(err, errAuthentication) {
-					t.Errorf("spoofed upload overwrote the transitioned version: %v", err)
-				}
-				if !reflect.DeepEqual(before, nativeRestoreSnapshot(t, r)) {
-					t.Error("rejected spoofed completion changed the version")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			info, err := r.z.GetObjectInfo(t.Context(), r.bucket, object, ObjectOptions{VersionID: done.VersionID})
-			if err != nil || info.UserDefined[restoreIsolationUploadKey] != "" {
-				t.Errorf("caller metadata committed a restore upload marker: %q, %v", info.UserDefined[restoreIsolationUploadKey], err)
 			}
 		})
 	}

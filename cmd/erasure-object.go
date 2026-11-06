@@ -45,7 +45,6 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/grid"
-	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
@@ -156,7 +155,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		if dstOpts.replicaObjectInfo != nil {
 			getObjectInfo = dstOpts.replicaObjectInfo
 		}
-		if err := checkObjectLockedForOverwrite(ctx, dstBucket, dstObject, getObjectInfo, dstOpts.Transition); err != nil {
+		if err := checkObjectLockedForOverwrite(ctx, dstBucket, dstObject, getObjectInfo); err != nil {
 			return oi, toObjectErr(err, dstBucket, dstObject)
 		}
 	}
@@ -1673,7 +1672,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		if opts.replicaObjectInfo != nil {
 			getObjectInfo = opts.replicaObjectInfo
 		}
-		if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo, opts.Transition); err != nil {
+		if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 	}
@@ -2663,180 +2662,6 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 	tags := opts.LifecycleAuditEvent.Tags()
 	auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
 	return err
-}
-
-// RestoreTransitionedObject - restore transitioned object content locally on this cluster.
-// This is similar to PostObjectRestore from AWS GLACIER
-// storage class. When PostObjectRestore API is called, a temporary copy of the object
-// is restored locally to the bucket on source cluster until the restore expiry date.
-// The copy that was transitioned continues to reside in the transitioned tier.
-func (er erasureObjects) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
-	return er.restoreTransitionedObject(ctx, bucket, object, opts)
-}
-
-// getRestoreLock waits for a restore's object lock for as long as ctx lives.
-// The POST handler has already marked the version ongoing, and only the
-// restore clears that marker. A restore queued behind another version's
-// download must therefore keep waiting rather than give up after one timeout.
-func getRestoreLock(ctx context.Context, lk RWLocker) (LockContext, error) {
-	for {
-		lkctx, err := lk.GetLock(ctx, globalRestoreLockTimeout)
-		if !errors.As(err, &OperationTimedOut{}) || ctx.Err() != nil {
-			return lkctx, err
-		}
-	}
-}
-
-// restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
-// as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
-//
-// A POST restore publishes its attempt on the version's ongoing marker. The
-// restore rehydrates the version only while that attempt owns the marker, and
-// on failure clears the marker only while it still does. A direct caller
-// publishes no attempt; its attempt only names the private upload.
-func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
-	if !opts.NoLock {
-		// Single-pool and direct callers must protect the metadata snapshot
-		// through download, rehydration and failure cleanup, just like pools.
-		lk := er.NewNSLock(bucket, object)
-		lkctx, err := getRestoreLock(ctx, lk)
-		if err != nil {
-			return restoreResetError{err}
-		}
-		ctx = lkctx.Context()
-		defer lk.Unlock(lkctx)
-		opts.NoLock = true
-	}
-
-	published := opts.Transition.attempt
-	// Restore the authoritative generation of the version, never a revision
-	// that only some drives hold.
-	gen, err := er.readRestoreGeneration(ctx, bucket, object, opts.VersionID)
-	if err != nil {
-		err = toObjectErr(err, bucket, object, opts.VersionID)
-		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-			// No version was read, so there is no restore marker to clear.
-			return err
-		}
-		return restoreResetError{err}
-	}
-	actualfi := gen.fi
-	if actualfi.Deleted {
-		return toObjectErr(errMethodNotAllowed, bucket, object)
-	}
-
-	oi := actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
-	attempt := published
-	if attempt == nil {
-		attempt = newRestoreAttempt(oi)
-	} else if !attempt.owns(oi) {
-		// A later POST took the version over, or it was replaced.
-		return errRestoreSuperseded
-	}
-	opts.Transition.attempt = attempt
-	versionID := restoreVersionID(actualfi.VersionID)
-	fail := func(cause error) error {
-		return er.restoreFailed(ctx, bucket, object, versionID, published, cause)
-	}
-
-	ropts := putRestoreOpts(opts.Transition.RestoreRequest, oi, opts)
-	ropts.NoLock = opts.NoLock
-	ropts.Transition = opts.Transition
-	// Rehydration copies encoded bytes without changing their content identity.
-	ropts.PreserveETag = oi.ETag
-	// Even a one-part multipart upload must retain its original part number:
-	// encrypted multipart data uses that number to derive its decryption key.
-	if len(oi.Parts) == 1 && !oi.isMultipart() {
-		actualSize, err := oi.GetActualSize()
-		if err != nil {
-			return fail(err)
-		}
-		ropts.IndexCB = func() []byte { return oi.Parts[0].Index }
-		var rs *HTTPRangeSpec
-		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
-		if err != nil {
-			return fail(toObjectErr(err, bucket, object))
-		}
-		defer gr.Close()
-		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", actualSize)
-		if err != nil {
-			return fail(toObjectErr(err, bucket, object))
-		}
-		pReader := NewPutObjReader(hashReader)
-		if _, err = er.PutObject(ctx, bucket, object, pReader, ropts); err != nil {
-			return fail(toObjectErr(err, bucket, object))
-		}
-		return nil
-	}
-
-	// Every server must keep the upload private, also a queued restore's.
-	if err := nativeRestoreAvailable(ctx); err != nil {
-		return fail(err)
-	}
-	// The upload records when it starts, which the stale-upload cleanup ages;
-	// completion still commits the version's own ModTime.
-	uopts := ropts
-	uopts.MTime = time.Time{}
-	res, err := er.NewMultipartUpload(ctx, bucket, object, uopts)
-	if err != nil {
-		return fail(err)
-	}
-	completed := false
-	defer func() {
-		if !completed {
-			er.abortRestoreUpload(bucket, object, res.UploadID, attempt)
-		}
-	}()
-
-	var uploadedParts []CompletePart
-	var rs *HTTPRangeSpec
-	// get reader from the warm backend - note that even in the case of encrypted objects, this stream is still encrypted.
-	gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
-	if err != nil {
-		return fail(err)
-	}
-	defer gr.Close()
-
-	// rehydrate the parts back on disk as per the original xl.meta prior to transition
-	for _, partInfo := range oi.Parts {
-		// Old uncompressed parts may not record ActualSize. Encrypted parts
-		// derive it from the written ciphertext in PutObjectPart; compressed
-		// parts need their recorded logical length, including valid zero sizes.
-		actualSize := partInfo.Size
-		if oi.IsCompressed() {
-			actualSize = partInfo.ActualSize
-		}
-		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", actualSize)
-		if err != nil {
-			return fail(err)
-		}
-		pInfo, err := er.PutObjectPart(ctx, bucket, object, res.UploadID, partInfo.Number, NewPutObjReader(hr), ObjectOptions{
-			IndexCB:    func() []byte { return partInfo.Index },
-			Transition: TransitionOptions{attempt: attempt},
-		})
-		if err != nil {
-			return fail(err)
-		}
-		if pInfo.Size != partInfo.Size {
-			return fail(InvalidObjectState{Bucket: bucket, Object: object})
-		}
-		uploadedParts = append(uploadedParts, CompletePart{
-			PartNumber: pInfo.PartNumber,
-			ETag:       pInfo.ETag,
-		})
-	}
-	_, err = er.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{
-		MTime:            oi.ModTime,
-		NoLock:           opts.NoLock,
-		Versioned:        opts.Versioned,
-		VersionSuspended: opts.VersionSuspended,
-		Transition:       opts.Transition,
-	})
-	if err != nil {
-		return fail(err)
-	}
-	completed = true
-	return nil
 }
 
 // DecomTieredObject - moves tiered object to another pool during decommissioning.

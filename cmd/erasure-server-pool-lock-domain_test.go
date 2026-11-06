@@ -760,8 +760,10 @@ func TestLockDomainBulkDeleteMapping(t *testing.T) {
 	}
 }
 
-// A restore holds the object lock of its set for its download. DELETE and COPY
-// of the object must wait for it.
+// A restore takes the object lock of its set only to commit, not for its
+// download. DELETE and COPY of the object wait for that commit, also where
+// the sets of the pool lock with lockers of their own, and the restore still
+// completes.
 func TestLockDomainRestoreExcludesDeleteAndCopy(t *testing.T) {
 	for _, mode := range ldModes {
 		for _, op := range []string{"delete", "copy"} {
@@ -769,59 +771,40 @@ func TestLockDomainRestoreExcludesDeleteAndCopy(t *testing.T) {
 				r := newRestoreSafetyTest(t, 1, versioning.Enabled)
 				ldSplit(t, r.z, mode)
 				r.object = ldKey(t, r.z, "restore-"+op, 1)
-				oi, _ := nativeRestoreSeed(t, r, 0, false, false)
-				blocked := &nativeRestoreBlockedTier{WarmBackend: globalTierConfigMgr.drivercache["WARM"], entered: make(chan struct{}), release: make(chan struct{})}
-				globalTierConfigMgr.drivercache["WARM"] = blocked
-				var once sync.Once
-				unblock := func() { once.Do(func() { close(blocked.release) }) }
-				defer unblock()
-				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-				defer cancel()
-				restored := make(chan error, 1)
-				go func() {
-					restored <- r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
-				}()
-				select {
-				case <-blocked.entered:
-				case <-ctx.Done():
-					t.Fatal("restore never started its download")
-				}
-				done := make(chan error, 1)
-				go func() {
+				oi, body := nativeRestoreSeed(t, r, 0, false, false)
+				waited, restoreErr, opErr := ldOverlapRun(t, func(ctx context.Context) error {
+					return r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
+				}, func(ctx context.Context) error {
 					switch op {
 					case "delete":
 						_, err := r.z.DeleteObject(ctx, r.bucket, r.object, r.opts(""))
-						done <- err
-					case "copy":
+						return err
+					default:
 						ropts := r.opts(oi.VersionID)
 						ropts.NoLock = true
 						cur, err := r.z.GetObjectInfo(ctx, r.bucket, r.object, ropts)
 						if err != nil {
-							done <- err
-							return
+							return err
 						}
 						cur.metadataOnly = true
 						cur.UserDefined = cloneMSS(cur.UserDefined)
 						cur.UserDefined["x-amz-meta-copied"] = "1"
 						vopts := r.opts(oi.VersionID)
 						_, err = r.z.CopyObject(ctx, r.bucket, r.object, r.bucket, r.object, cur, vopts, vopts)
-						done <- err
+						return err
 					}
-				}()
-				var opErr error
-				select {
-				case opErr = <-done:
-					t.Errorf("%s ran during the restore (%v)", op, opErr)
-				case <-time.After(ldWait):
-					unblock()
-					opErr = <-done
+				})
+				if !waited {
+					t.Errorf("%s ran during the restore's commit (%v)", op, opErr)
 				}
-				unblock()
-				if err := <-restored; err != nil {
-					t.Fatalf("restore: %v", err)
+				if restoreErr != nil {
+					t.Fatalf("restore: %v", restoreErr)
 				}
 				if opErr != nil {
 					t.Fatalf("%s after the restore: %v", op, opErr)
+				}
+				if _, got, err := r.read(oi.VersionID); err != nil || !bytes.Equal(got, body) {
+					t.Fatalf("restored contents: %v", err)
 				}
 			})
 		}

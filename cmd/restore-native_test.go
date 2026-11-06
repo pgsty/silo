@@ -373,10 +373,9 @@ func TestNativeRestorePOSTVersionIdentity(t *testing.T) {
 	}
 }
 
-// A restore request is internal context, not an exception for normal S3
-// multipart overwrites or for a version that has never completed transition.
-// Only the upload of a native restore attempt, whose marker names the very
-// version being completed, may write that version back.
+// A restore request is internal context, not an exception for multipart
+// overwrites: a native restore never completes an upload, so no completion,
+// whatever restore context it carries, writes an existing version back.
 func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
 	for _, mode := range []string{"matching-restore", "ordinary-complete", "restore-without-attempt", "other-attempt", "not-tiered", "changed-time", "changed-size", "changed-etag"} {
 		t.Run(mode, func(t *testing.T) {
@@ -446,24 +445,7 @@ func TestNativeRestoreMultipartOverwriteBoundary(t *testing.T) {
 			}
 			before := nativeRestoreSnapshot(t, r)
 			_, err = pool.CompleteMultipartUpload(t.Context(), r.bucket, r.object, upload.UploadID, complete, opts)
-			if mode == "matching-restore" {
-				if err != nil {
-					t.Fatalf("matching restore rejected: %v", err)
-				}
-				_, got, err := r.read(oi.VersionID)
-				if err != nil || !bytes.Equal(got, body) {
-					t.Fatalf("matching restore contents: %v", err)
-				}
-				if after := r.fileInfo(oi.VersionID); after.Metadata[restoreUploadKey] != "" || after.Metadata[restoreAttemptKey] != "" {
-					t.Error("restore committed its private upload or attempt marker")
-				}
-				return
-			}
-			if mode == "other-attempt" {
-				if !errors.As(err, &InvalidUploadID{}) {
-					t.Fatalf("another attempt completed a private upload: %v", err)
-				}
-			} else if !errors.Is(err, errAuthentication) {
+			if !errors.Is(err, errAuthentication) {
 				t.Fatalf("existing version overwrite: %v", err)
 			}
 			if !reflect.DeepEqual(before, nativeRestoreSnapshot(t, r)) {
@@ -525,7 +507,10 @@ func nativeRestoreLockRequest(ctx context.Context, t *testing.T, r *restoreTest,
 	return rec
 }
 
-func TestNativeRestoreSerializesObjectLock(t *testing.T) {
+// A native restore downloads without the object lock. An Object Lock
+// update made meanwhile commits at once, and the restore, whether it
+// completes or fails, keeps it.
+func TestNativeRestoreKeepsObjectLockUpdate(t *testing.T) {
 	for _, kind := range []string{"legal-hold", "retention"} {
 		for _, fail := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/failure=%v", kind, fail), func(t *testing.T) {
@@ -567,22 +552,19 @@ func TestNativeRestoreSerializesObjectLock(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal("restore never started download")
 				}
-				updateCtx, updateCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+				// The download holds no object lock: an Object Lock update
+				// commits at once, and the restore's commit keeps it.
+				updateCtx, updateCancel := context.WithTimeout(t.Context(), 5*time.Second)
 				rec := nativeRestoreLockRequest(updateCtx, t, r, oi.VersionID, kind, updated)
 				updateCancel()
-				if rec.Code == http.StatusOK {
-					t.Error("Object Lock update committed during restore's metadata snapshot")
-					// On the unfixed path this update commits, and the restore
-					// must not subsequently erase the acknowledged protection.
-					readOpts := r.opts(oi.VersionID)
-					readOpts.NoLock = true
-					before, err = r.z.GetObjectInfo(t.Context(), r.bucket, r.object, readOpts)
-					if err != nil {
-						t.Fatal(err)
-					}
+				if rec.Code != http.StatusOK {
+					t.Fatalf("Object Lock update during the restore download: %d %s", rec.Code, rec.Body.String())
 				}
-				if rec.Code != http.StatusOK && (rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "<Code>RequestTimeout</Code>")) {
-					t.Errorf("update failed for an unrelated reason: %d %s", rec.Code, rec.Body.String())
+				readOpts := r.opts(oi.VersionID)
+				readOpts.NoLock = true
+				during, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, readOpts)
+				if err != nil {
+					t.Fatal(err)
 				}
 				unblock()
 				select {
@@ -598,26 +580,19 @@ func TestNativeRestoreSerializesObjectLock(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, key := range keys {
-					if before.UserDefined[key] == "" || after.UserDefined[key] != before.UserDefined[key] {
-						t.Errorf("restore changed protection %s: %q -> %q", key, before.UserDefined[key], after.UserDefined[key])
+					if during.UserDefined[key] == "" || after.UserDefined[key] != during.UserDefined[key] {
+						t.Errorf("restore changed protection %s: %q -> %q", key, during.UserDefined[key], after.UserDefined[key])
 					}
-				}
-				if rec := nativeRestoreLockRequest(t.Context(), t, r, oi.VersionID, kind, updated); rec.Code != http.StatusOK {
-					t.Fatalf("protection update after restore: %d %s", rec.Code, rec.Body.String())
-				}
-				final, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, r.opts(oi.VersionID))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !final.ModTime.Equal(before.ModTime) || final.ETag != before.ETag || final.Size != before.Size {
-					t.Error("Object Lock update changed content identity")
 				}
 				changed := keys[0]
 				if kind == "retention" {
 					changed = keys[1]
 				}
-				if final.UserDefined[changed] == before.UserDefined[changed] || final.UserDefined[keys[len(keys)-1]] == before.UserDefined[keys[len(keys)-1]] {
-					t.Error("new protection or its timestamp was not stored")
+				if after.UserDefined[changed] == before.UserDefined[changed] {
+					t.Error("the update made during the download was not kept")
+				}
+				if !after.ModTime.Equal(before.ModTime) || after.ETag != before.ETag || after.Size != before.Size {
+					t.Error("Object Lock update changed content identity")
 				}
 			})
 		}
@@ -699,80 +674,6 @@ func TestNativeRestoreQueuedBehindDownload(t *testing.T) {
 			}
 			if tier.gets.Load() != reads {
 				t.Error("queued version was not restored locally")
-			}
-		})
-	}
-}
-
-func TestNativeRestoreConcurrentCompletion(t *testing.T) {
-	for _, separateSets := range []bool{false, true} {
-		t.Run(fmt.Sprintf("separate-set-locks=%v", separateSets), func(t *testing.T) {
-			r := newRestoreSafetyTest(t, 1, versioning.Enabled)
-			if separateSets {
-				// Local production sets share one map. Independent maps model the
-				// distinct locker groups of distributed sets while reusing test disks.
-				pool := r.z.serverPools[0]
-				sets, count := pool.sets, pool.setCount
-				t.Cleanup(func() { pool.sets, pool.setCount = sets, count })
-				first, second := *sets[0], *sets[0]
-				first.nsMutex, second.nsMutex = newNSLock(false), newNSLock(false)
-				second.setIndex = 1
-				pool.sets, pool.setCount = []*erasureObjects{&first, &second}, 2
-				for i := 0; ; i++ {
-					r.object = fmt.Sprintf("second-set-%d", i)
-					if pool.getHashedSetIndex(r.object) == 1 {
-						break
-					}
-				}
-			}
-			oi, body := nativeRestoreSeed(t, r, 0, false, true)
-			blocked := &nativeRestoreBlockedTier{WarmBackend: globalTierConfigMgr.drivercache["WARM"], entered: make(chan struct{}), release: make(chan struct{}), afterFirstPart: true}
-			globalTierConfigMgr.drivercache["WARM"] = blocked
-			var once sync.Once
-			unblock := func() { once.Do(func() { close(blocked.release) }) }
-			defer unblock()
-			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-			defer cancel()
-			restored := make(chan error, 1)
-			go func() {
-				restored <- r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
-			}()
-			select {
-			case <-blocked.entered:
-			case <-ctx.Done():
-				t.Fatal("restore never started")
-			}
-			// A client that learns the internal upload ID, which listings no
-			// longer show, can try to complete the first part while native
-			// restore owns the object.
-			id, part := restoreIsolationUpload(t, r, 0)
-			completed := make(chan struct{})
-			var completeErr error
-			go func() {
-				_, completeErr = r.z.CompleteMultipartUpload(ctx, r.bucket, r.object, id, []CompletePart{{PartNumber: 1, ETag: part.ETag}}, r.opts(oi.VersionID))
-				close(completed)
-			}()
-			waitForListingReadLock(t, r.z.serverPools[0].getHashedSet(r.object).nsMutex, r.bucket, r.object, completed)
-			unblock()
-			select {
-			case err := <-restored:
-				if err != nil {
-					t.Errorf("restore blocked by concurrent completion: %v", err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("restore did not finish")
-			}
-			select {
-			case <-completed:
-			case <-time.After(5 * time.Second):
-				t.Fatal("completion did not finish")
-			}
-			if !errors.As(completeErr, &InvalidUploadID{}) {
-				t.Errorf("completion after native restore: %v, want InvalidUploadID", completeErr)
-			}
-			_, got, err := r.read(oi.VersionID)
-			if err != nil || !bytes.Equal(got, body) {
-				t.Fatalf("restore contents after concurrent completion: %v", err)
 			}
 		})
 	}

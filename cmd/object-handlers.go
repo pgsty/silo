@@ -3988,8 +3988,8 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 
 	// Preserve a failed restore read even before the request body is parsed.
 	opts.Transition.RestoreRequest = &RestoreObjectRequest{}
-	// Resolve the target without the object lock: a running restore holds it
-	// for its download, and the status step bounds its own wait for it.
+	// Resolve the target without the object lock; the status step below
+	// takes the restore lock and then the object lock.
 	preOpts := opts
 	preOpts.NoLock = true
 	objInfo, err := getObjectInfo(ctx, bucket, object, preOpts)
@@ -4023,10 +4023,15 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
 
 	// update self with restore metadata
-	var attempt *restoreAttempt
+	var (
+		attempt     *restoreAttempt
+		owner       *restoreOwner
+		restoreDate string
+	)
 	if rreq.Type != SelectRestoreRequest {
-		// Native restore needs every server to keep its upload private;
-		// refuse it, writing nothing, while that is not established.
+		// Native restore needs every server to follow the restore lock and
+		// the staged commit; refuse it, writing nothing, while that is not
+		// established.
 		if err := nativeRestoreAvailable(ctx); err != nil {
 			apiErr := errorCodes.ToAPIErr(ErrBusy)
 			apiErr.Code, apiErr.Description = "ServiceUnavailable", err.Error()
@@ -4060,6 +4065,8 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 			return
 		}
 		attempt = status.attempt
+		// The restore lock goes to the worker below, which releases it.
+		owner, restoreDate = status.owner, status.date
 	}
 
 	restoreObject := mustGetUUID()
@@ -4079,6 +4086,9 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	// now process the restore in background
 	go func() {
 		rctx := GlobalContext
+		// The restore releases the lock it was handed; this covers a path
+		// that does not reach it. Releasing twice is a no-op.
+		defer owner.release()
 		if !rreq.SelectParameters.IsEmpty() {
 			actualSize, err := objInfo.GetActualSize()
 			if err != nil {
@@ -4130,6 +4140,8 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 				RestoreRequest: rreq,
 				RestoreExpiry:  restoreExpiry,
 				attempt:        attempt,
+				owner:          owner,
+				restoreDate:    restoreDate,
 			},
 			VersionID:        attempt.VersionID,
 			Versioned:        opts.Versioned,

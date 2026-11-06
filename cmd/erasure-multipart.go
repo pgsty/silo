@@ -71,7 +71,6 @@ func (er erasureObjects) getMultipartSHADir(bucket, object string) string {
 }
 
 // checkUploadIDExists - verify if a given uploadID exists and is valid.
-// The metadata read from each drive is returned also with an error.
 func (er erasureObjects) checkUploadIDExists(ctx context.Context, bucket, object, uploadID string, write bool) (fi FileInfo, metArr []FileInfo, err error) {
 	defer func() {
 		if errors.Is(err, errFileNotFound) {
@@ -89,15 +88,15 @@ func (er erasureObjects) checkUploadIDExists(ctx context.Context, bucket, object
 
 	readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, partsMetadata, errs, er.defaultParityCount)
 	if err != nil {
-		return fi, partsMetadata, err
+		return fi, nil, err
 	}
 
 	if readQuorum < 0 {
-		return fi, partsMetadata, errErasureReadQuorum
+		return fi, nil, errErasureReadQuorum
 	}
 
 	if writeQuorum < 0 {
-		return fi, partsMetadata, errErasureWriteQuorum
+		return fi, nil, errErasureWriteQuorum
 	}
 
 	quorum := readQuorum
@@ -114,7 +113,7 @@ func (er erasureObjects) checkUploadIDExists(ctx context.Context, bucket, object
 		err = reduceReadQuorumErrs(ctx, errs, objectOpIgnoredErrs, readQuorum)
 	}
 	if err != nil {
-		return fi, partsMetadata, err
+		return fi, nil, err
 	}
 
 	// Pick one from the first valid metadata.
@@ -217,55 +216,12 @@ func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk Sto
 				hasSkippedUploads = true
 				return nil
 			}
-			// A completion holds this lock from staging its commit in the
-			// upload until the commit ends: decide on a removal only while
-			// holding it, and skip an upload whose commit is running. Only
-			// uploads past the stale age pay for the lock and the read below.
-			lk := er.restoreCommitLock(uploadIDPath)
-			lkctx, err := lk.GetLock(ctx, newDynamicTimeout(time.Second, time.Second))
-			if err != nil {
-				hasSkippedUploads = true
-				return nil
-			}
-			// The rename below releases the lock when it ends, also when it
-			// outlives its deadline; every other exit releases it here.
-			renaming := false
-			defer func() {
-				if !renaming {
-					lk.Unlock(lkctx)
-				}
-			}()
-			// A native restore can run past the stale age: keep its upload
-			// while its attempt still owns the version, and keep any upload
-			// whose marker the drives cannot establish.
-			view := er.readRestoreUpload(lkctx.Context(), "", uploadIDPath)
-			if view.committing {
-				// What a commit staged, with no commit running: only a staged
-				// copy itself shows when it staged, only an old one is a
-				// leftover of a failed commit, and a copy not staged yet
-				// tells nothing.
-				local, err := disk.ReadVersion(lkctx.Context(), "", minioMetaMultipartBucket, uploadIDPath, "", ReadOptions{})
-				st, serr := os.Stat(pathJoin(drivePath, minioMetaMultipartBucket, uploadIDPath, xlStorageFormatFile))
-				if err != nil || serr != nil || !restoreUploadStaged(local) || time.Since(st.ModTime()) < restoreCommitGrace {
-					hasSkippedUploads = true
-					return nil
-				}
-			} else if view.live && (!view.known || (view.marker != nil && er.restoreUploadActive(lkctx.Context(), view))) {
-				hasSkippedUploads = true
-				return nil
-			}
-			renaming = true
 			w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 			return w.Run(func() error {
 				wait := deleteMultipartCleanupSleeper.Timer(ctx)
 				pathUUID := mustGetUUID()
 				targetPath := pathJoin(drivePath, minioMetaTmpDeletedBucket, pathUUID)
-				err := renameAll(pathJoin(drivePath, minioMetaMultipartBucket, uploadIDPath), targetPath, pathJoin(drivePath, minioMetaBucket))
-				lk.Unlock(lkctx)
-				if err != nil {
-					// The next cleanup round tries again.
-					storageLogIf(ctx, fmt.Errorf("Unable to remove stale upload %s on %s: %w", uploadIDPath, drivePath, err))
-				}
+				renameAll(pathJoin(drivePath, minioMetaMultipartBucket, uploadIDPath), targetPath, pathJoin(drivePath, minioMetaBucket))
 				wait()
 				return nil
 			})
@@ -506,13 +462,6 @@ func (er erasureObjects) listMultipartUploadsExact(ctx context.Context, bucket, 
 		if populatedUploadIDs.Contains(uploadID) {
 			continue
 		}
-		// A native restore's upload is private to its attempt; list only an
-		// upload that the drives establish as an ordinary one.
-		metas, errs := readAllFileInfo(ctx, er.getDisks(), bucket, minioMetaMultipartBucket,
-			pathJoin(er.getMultipartSHADir(bucket, object), uploadID), "", false, false)
-		if !restoreUploadState(metas, errs).visible(ObjectOptions{}) {
-			continue
-		}
 		var fallback time.Time
 		if _, ok := multipartUploadTime(uploadID); !ok {
 			fi, err := disk.ReadVersion(ctx, bucket, minioMetaMultipartBucket,
@@ -611,11 +560,6 @@ func (er erasureObjects) newMultipartUpload(ctx context.Context, bucket string, 
 	userDefined[multipartMetaObject] = object
 	if opts.PreserveETag != "" {
 		userDefined["etag"] = opts.PreserveETag
-	}
-	// Only a native restore marks its upload private, never caller metadata.
-	delete(userDefined, restoreUploadKey)
-	if a := opts.Transition.attempt; a != nil {
-		userDefined[restoreUploadKey] = a.String()
 	}
 	onlineDisks := er.getDisks()
 
@@ -798,10 +742,7 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 
 	uploadIDPath := er.getUploadIDDir(bucket, object, uploadID)
 	// Validates if upload ID exists.
-	fi, metas, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, true)
-	if err == nil && !restoreUploadVisible(metas, opts) {
-		err = errUploadIDNotFound
-	}
+	fi, _, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, true)
 	if err != nil {
 		if errors.Is(err, errVolumeNotFound) {
 			return pi, toObjectErr(err, bucket)
@@ -1038,10 +979,7 @@ func (er erasureObjects) GetMultipartInfo(ctx context.Context, bucket, object, u
 		UploadID: uploadID,
 	}
 
-	fi, metas, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, false)
-	if err == nil && !restoreUploadVisible(metas, opts) {
-		err = errUploadIDNotFound
-	}
+	fi, _, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, false)
 	if err != nil {
 		if errors.Is(err, errVolumeNotFound) {
 			return result, toObjectErr(err, bucket)
@@ -1119,10 +1057,7 @@ func (er erasureObjects) ListObjectParts(ctx context.Context, bucket, object, up
 		auditObjectErasureSet(ctx, "ListObjectParts", object, &er)
 	}
 
-	fi, metas, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, false)
-	if err == nil && !restoreUploadVisible(metas, opts) {
-		err = errUploadIDNotFound
-	}
+	fi, _, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, false)
 	if err != nil {
 		return result, toObjectErr(err, bucket, object, uploadID)
 	}
@@ -1335,7 +1270,7 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		auditObjectErasureSet(ctx, "CompleteMultipartUpload", object, &er)
 	}
 
-	if opts.CheckPrecondFn != nil || opts.ReplicaLockReconcile || opts.Transition.attempt != nil {
+	if opts.CheckPrecondFn != nil || opts.ReplicaLockReconcile {
 		if !opts.NoLock {
 			ns := er.NewNSLock(bucket, object)
 			lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
@@ -1368,24 +1303,7 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		}
 	}
 
-	if opts.Transition.attempt != nil {
-		// A native restore holds the upload write lock from validation
-		// through commit, after the object lock and in the lock domain of
-		// PutObjectPart, which takes a part lock and then this lock to read.
-		// NoLock only says that the caller holds the object lock.
-		uploadIDLock := er.NewNSLock(bucket, pathJoin(object, uploadID))
-		ulkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return oi, err
-		}
-		ctx = ulkctx.Context()
-		defer uploadIDLock.Unlock(ulkctx)
-	}
-
 	fi, partsMetadata, err := er.checkUploadIDExists(ctx, bucket, object, uploadID, true)
-	if err == nil && !restoreUploadVisible(partsMetadata, opts) {
-		err = errUploadIDNotFound
-	}
 	if err != nil {
 		if errors.Is(err, errVolumeNotFound) {
 			return oi, toObjectErr(err, bucket)
@@ -1699,7 +1617,6 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 	delete(fi.Metadata, hash.MinIOMultipartChecksumType)
 	delete(fi.Metadata, multipartMetaBucket)
 	delete(fi.Metadata, multipartMetaObject)
-	delete(fi.Metadata, restoreUploadKey)
 
 	// Save the final object size and modtime.
 	fi.Size = objectSize
@@ -1776,36 +1693,17 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			getObjectInfo = opts.replicaObjectInfo
 		}
 		if fi.VersionID == "" || fi.VersionID == nullVersionID {
-			if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo, opts.Transition); err != nil {
+			if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
 				return oi, toObjectErr(err, bucket, object)
 			}
-			if a := opts.Transition.attempt; a != nil {
-				// A native restore writes back only the null version it targets.
-				current, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
-					VersionID:  nullVersionID,
-					Transition: opts.Transition,
-					NoLock:     true,
-				})
-				if gerr != nil {
-					return oi, toObjectErr(gerr, bucket, object)
-				}
-				if !a.rehydrates(current, fi) {
-					return oi, toObjectErr(errAuthentication, bucket, object)
-				}
-			}
 		} else {
-			current, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
+			_, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
 				VersionID:        fi.VersionID,
 				Versioned:        opts.Versioned,
 				VersionSuspended: opts.VersionSuspended,
-				Transition:       opts.Transition,
 				NoLock:           true,
 			})
 			switch {
-			case gerr == nil && opts.Transition.attempt.rehydrates(current, fi):
-				// A native restore's own private upload rehydrates this same
-				// tiered version. Any other completion must still reject a
-				// version overwrite.
 			case gerr == nil, errors.As(gerr, &MethodNotAllowed{}):
 				return oi, toObjectErr(errAuthentication, bucket, object)
 			case isErrVersionNotFound(gerr) || isErrObjectNotFound(gerr):
@@ -1814,16 +1712,6 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 			}
 		}
 	}
-
-	// Stale cleanup and abort judge an upload whose commit staged object
-	// metadata in it by this lock: hold it from staging through the commit.
-	commitLock := er.restoreCommitLock(uploadIDPath)
-	clkctx, err := commitLock.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return oi, err
-	}
-	ctx = clkctx.Context()
-	defer commitLock.Unlock(clkctx)
 
 	er.cleanupMultipartPath(ctx, paths...) // cleanup all part.N.meta, and skipped part.N's before final rename().
 
@@ -1896,38 +1784,7 @@ func (er erasureObjects) abortMultipartUpload(ctx context.Context, bucket, objec
 	if !ok || internalID == "" || internalID == "." || internalID == ".." || strings.ContainsAny(internalID, "/\\") {
 		return false, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
 	}
-	// Authorize before the unconditional cleanup below. A native restore's
-	// upload is absent to every other caller, and an upload whose marker the
-	// drives cannot establish is not removed by anyone.
-	uploadIDPath := er.getUploadIDDir(bucket, object, uploadID)
-	view := er.readRestoreUpload(ctx, bucket, uploadIDPath)
-	if view.committing {
-		// What a failed commit left behind, also after stale cleanup could
-		// not remove it: only with no commit running, and once every copy
-		// shows a staging older than the grace.
-		lk := er.restoreCommitLock(uploadIDPath)
-		lkctx, err := lk.GetLock(ctx, newDynamicTimeout(restoreTakeoverWait, restoreTakeoverWait))
-		if err != nil {
-			return false, toObjectErr(errErasureReadQuorum, bucket, object, uploadID)
-		}
-		defer lk.Unlock(lkctx)
-		if !er.restoreCommitAbandoned(lkctx.Context(), bucket, uploadIDPath) {
-			return false, toObjectErr(errErasureReadQuorum, bucket, object, uploadID)
-		}
-		er.deleteAll(lkctx.Context(), minioMetaMultipartBucket, uploadIDPath)
-		return true, nil
-	}
-	switch {
-	case view.visible(opts):
-	case view.known && view.marked:
-		return false, nil
-	case view.known && opts.Transition.attempt != nil:
-		// A native restore's own abort, of an upload no longer its own.
-		return false, nil
-	default:
-		return false, toObjectErr(errErasureReadQuorum, bucket, object, uploadID)
-	}
-	defer er.deleteAll(ctx, minioMetaMultipartBucket, uploadIDPath)
+	defer er.deleteAll(ctx, minioMetaMultipartBucket, er.getUploadIDDir(bucket, object, uploadID))
 	_, _, err = er.checkUploadIDExists(ctx, bucket, object, uploadID, false)
 	err = toObjectErr(err, bucket, object, uploadID)
 	if _, absent := err.(InvalidUploadID); absent {

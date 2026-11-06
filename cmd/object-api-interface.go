@@ -178,9 +178,14 @@ type TransitionOptions struct {
 	RestoreExpiry  time.Time
 	ExpireRestored bool
 
-	// attempt is the native restore a call belongs to. Only that restore
-	// sees its private upload, see restoreUploadVisible.
+	// attempt is the native restore a call belongs to: the attempt that
+	// POST marked on the version, see restoreRequest.
 	attempt *restoreAttempt
+	// owner is the restore lock of the version, which POST hands to the
+	// worker that runs attempt, see erasureServerPools.RestoreTransitionedObject.
+	owner *restoreOwner
+	// restoreDate is the request date POST recorded with attempt.
+	restoreDate string
 }
 
 // MakeBucketOptions represents bucket options for ObjectLayer bucket operations

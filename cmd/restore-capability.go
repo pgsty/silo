@@ -36,7 +36,7 @@ import (
 // or does not know the question, as an older server does not, blocks it.
 
 // nativeRestoreCapability is the native restore protocol this server speaks.
-const nativeRestoreCapability = "1"
+const nativeRestoreCapability = "2"
 
 const (
 	peerRESTRestoreCapability = "restore"

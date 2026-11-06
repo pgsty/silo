@@ -251,9 +251,8 @@ func enforceRetentionBypassForPut(ctx context.Context, r *http.Request, oi Objec
 
 // checkObjectLockedForOverwrite re-checks under the object write lock whether an
 // in-place write to the null version (such as a directory object) would
-// overwrite a locked version in an Object Lock bucket. Restore context keeps
-// failed reads from deleting the version being rehydrated.
-func checkObjectLockedForOverwrite(ctx context.Context, bucket, object string, getObjectInfoFn GetObjectInfoFn, transition TransitionOptions) error {
+// overwrite a locked version in an Object Lock bucket.
+func checkObjectLockedForOverwrite(ctx context.Context, bucket, object string, getObjectInfoFn GetObjectInfoFn) error {
 	if isMinioMetaBucketName(bucket) {
 		return nil
 	}
@@ -266,7 +265,6 @@ func checkObjectLockedForOverwrite(ctx context.Context, bucket, object string, g
 	}
 	objInfo, err := getObjectInfoFn(ctx, bucket, object, ObjectOptions{
 		VersionID:  nullVersionID,
-		Transition: transition,
 		NoLock:     true,
 		NoAuditLog: true,
 	})

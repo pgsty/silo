@@ -2393,22 +2393,21 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		}
 	}()
 
-	// Keep object -> upload lock ordering for single-pool completion too:
-	// native restore holds the object lock while publishing upload parts.
-	// Both locks are in the object's lock domain, the set-local one of
-	// single-pool writes.
-	if !opts.NoLock {
-		lk := z.NewObjectNSLock(bucket, encodeDirObject(object))
-		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return objInfo, err
-		}
-		ctx = lkctx.Context()
-		defer lk.Unlock(lkctx)
-	}
-	opts.NoLock = true
-
+	// Several pools take the object lock first, then the upload lock below.
+	// A single pool takes the upload lock here and the set takes the object
+	// lock, in the object's own erasure set, only right before it commits.
 	if !z.SinglePool() {
+		if !opts.NoLock {
+			lk := z.NewObjectNSLock(bucket, encodeDirObject(object))
+			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+			if err != nil {
+				return objInfo, err
+			}
+			ctx = lkctx.Context()
+			defer lk.Unlock(lkctx)
+		}
+		opts.NoLock = true
+
 		// A conditional completion must be evaluated against the logical
 		// latest object across pools, under the object write lock held for
 		// this operation. The pool hosting the upload may only hold a stale
@@ -2460,8 +2459,9 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	// Hold write locks to verify uploaded parts, also disallows any
 	// parallel PutObjectPart() requests.
-	// An empty upload ID aliases the object lock already held above.
-	// Let the storage layer return its normal missing bucket/upload error.
+	// An empty upload ID would name the object lock itself, which this
+	// completion holds or takes later: let the storage layer return its
+	// normal missing bucket/upload error instead.
 	if uploadID != "" {
 		uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
 		wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
@@ -3398,47 +3398,25 @@ func (z *erasureServerPools) TransitionObject(ctx context.Context, bucket, objec
 	return z.serverPools[idx].TransitionObject(ctx, bucket, object, opts)
 }
 
-// RestoreTransitionedObject - restore transitioned object content locally on this cluster.
-func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) (err error) {
-	object = encodeDirObject(object)
-	defer func() {
-		// The restore stopped before it could clear POST's ongoing marker.
-		var reset restoreResetError
-		if errors.As(err, &reset) {
-			z.recoverRestoreStatus(bucket, object, opts)
-			err = reset.error
-		}
-	}()
-	if z.SinglePool() {
-		return z.serverPools[0].RestoreTransitionedObject(ctx, bucket, object, opts)
-	}
-
-	if !opts.NoLock {
-		// Acquire write lock before restoring transitioned object
-		lk := z.NewNSLock(bucket, object)
-		lkctx, err := getRestoreLock(ctx, lk)
-		if err != nil {
-			return restoreResetError{err}
-		}
-		ctx = lkctx.Context()
-		defer lk.Unlock(lkctx)
-	}
-
-	// Avoid restoring object from a pool being decommissioned.
-	opts.SkipDecommissioned = true
-	opts.NoLock = true
-	idx, err := z.restorePoolIdx(ctx, bucket, object, opts)
-	if err != nil {
-		return err
-	}
-
-	return z.serverPools[idx].RestoreTransitionedObject(ctx, bucket, object, opts)
-}
-
 func (z *erasureServerPools) CheckAbandonedParts(ctx context.Context, bucket, object string, opts madmin.HealOpts) error {
 	object = encodeDirObject(object)
 	if z.SinglePool() {
 		return z.serverPools[0].CheckAbandonedParts(ctx, bucket, object, opts)
+	}
+	// Several pools: remove abandoned data under the pools lock, which every
+	// write of the object takes, as healObjectInPool does. The lock of one
+	// pool's set would not exclude a write that has moved its data directory
+	// in place but not yet published the metadata that references it, such
+	// as a native restore's commit.
+	if opts.Remove && !opts.DryRun && !opts.NoLock {
+		lk := z.NewObjectNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+		opts.NoLock = true
 	}
 	errs := make([]error, len(z.serverPools))
 	var wg sync.WaitGroup
