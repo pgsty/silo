@@ -2511,8 +2511,11 @@ func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, immediate
 	}
 
 	// Delete parent directory obviously not recursively. Errors for
-	// parent directories shouldn't trickle down.
-	s.deleteFile(basePath, pathutil.Dir(pathutil.Clean(deletePath)), false, false)
+	// parent directories shouldn't trickle down. The trailing slash
+	// removes only an empty directory: a concurrent writer can have
+	// replaced the parent with a file, for example the xl.meta of an
+	// object whose name is that parent path, and it must stay.
+	s.deleteFile(basePath, pathutil.Dir(pathutil.Clean(deletePath))+SlashSeparator, false, false)
 
 	return nil
 }
@@ -2578,6 +2581,40 @@ func (s *xlStorage) Delete(ctx context.Context, volume string, path string, dele
 
 func skipAccessChecks(volume string) (ok bool) {
 	return strings.HasPrefix(volume, minioMetaBucket)
+}
+
+// renameDataAll is renameAll for the two renames of RenameData. A failed
+// RenameData, typically one that runs after its caller gave up, removes its
+// object directory and the parents that are empty, so it can remove the
+// directories that renameAll is creating for this rename. The directory
+// creation or the rename then reports "not found" although the source is
+// still in place: retry, which creates the directories again. A cleanup
+// removes each directory of the path at most once and each failed attempt
+// needs at least one such removal, so one retry per path level is enough
+// against any single cleanup. The decision uses the error of the attempt
+// itself, since another write can recreate the directories in between.
+func renameDataAll(srcPath, dstPath, skipParent string) error {
+	if srcPath == "" || dstPath == "" {
+		return errInvalidArgument
+	}
+	if err := checkPathLength(srcPath); err != nil {
+		return err
+	}
+	if err := checkPathLength(dstPath); err != nil {
+		return err
+	}
+	retries := strings.Count(strings.TrimPrefix(pathutil.Clean(dstPath), pathutil.Clean(skipParent)), SlashSeparator)
+	for {
+		err := reliableRename(srcPath, dstPath, skipParent)
+		if err == nil || retries == 0 || !osIsNotExist(err) {
+			return renameAllErr(err, srcPath, dstPath)
+		}
+		if _, serr := Lstat(pathutil.Clean(srcPath)); serr != nil {
+			// The source is gone: a late call, which the caller cleans up.
+			return renameAllErr(err, srcPath, dstPath)
+		}
+		retries--
+	}
 }
 
 // RenameData - rename source path to destination path atomically, metadata and data directory.
@@ -2886,13 +2923,18 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		if contextCanceled(ctx) {
 			return res, ctx.Err()
 		}
-		if err = renameAll(srcDataPath, dstDataPath, skipParent); err != nil {
+		if err = renameDataAll(srcDataPath, dstDataPath, skipParent); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
 				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 			}
 			// if its a partial rename() do not attempt to delete recursively.
 			s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+			// renameAll() creates the object directory before the rename; if the
+			// staged data was already gone, drop it and its parents while empty,
+			// otherwise they outlive the other objects there and are listed as an
+			// empty prefix. The trailing slash removes only an empty directory.
+			s.deleteFile(dstVolumeDir, pathutil.Dir(dstFilePath)+SlashSeparator, false, false)
 			return res, osErrToFileErr(err)
 		}
 		diskHealthCheckOK(ctx, err)
@@ -2920,7 +2962,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	// Commit meta-file
-	if err = renameAll(srcFilePath, dstFilePath, skipParent); err != nil {
+	if err = renameDataAll(srcFilePath, dstFilePath, skipParent); err != nil {
 		if legacyPreserved {
 			// Any failed rename calls un-roll previous transaction.
 			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
@@ -2928,6 +2970,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		// if its a partial rename() do not attempt to delete recursively.
 		// this can be healed since all parts are available.
 		s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+		// As with the data rename above, renameAll() may have created the
+		// object directory; drop it and its parents while empty. A moved
+		// data directory keeps it, since the trailing slash removes only an
+		// empty directory.
+		s.deleteFile(dstVolumeDir, pathutil.Dir(dstFilePath)+SlashSeparator, false, false)
 		err = osErrToFileErr(err)
 		if errors.Is(err, errFileNotFound) {
 			// The staged xl.meta disappeared between staging and commit.
