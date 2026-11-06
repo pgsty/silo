@@ -35,6 +35,7 @@ import (
 	loghttp "github.com/minio/minio/internal/logger/target/http"
 	"github.com/minio/minio/internal/pubsub"
 	xnet "github.com/pgsty/silo-pkg/v3/net"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestILMExpiryNotDoneClassification(t *testing.T) {
@@ -85,7 +86,12 @@ func ilmTestAudit(t *testing.T, bucket string) <-chan map[string]any {
 		var entry struct {
 			Error string         `json:"error"`
 			Tags  map[string]any `json:"tags"`
-			API   struct{ Name, Bucket string }
+			API   struct {
+				Name, Bucket string
+				Objects      []struct {
+					ObjectName string `json:"objectName"`
+				} `json:"objects"`
+			}
 		}
 		if err := json.NewDecoder(r.Body).Decode(&entry); err == nil && entry.API.Name == "ILMExpiry" && entry.API.Bucket == bucket {
 			tags := entry.Tags
@@ -93,6 +99,9 @@ func ilmTestAudit(t *testing.T, bucket string) <-chan map[string]any {
 				tags = map[string]any{}
 			}
 			tags["error"] = entry.Error
+			if len(entry.API.Objects) > 0 {
+				tags["object"] = entry.API.Objects[0].ObjectName
+			}
 			entries <- tags
 		}
 		w.WriteHeader(http.StatusOK)
@@ -159,6 +168,9 @@ func TestDeleteObjectVersionsReportsRefusalAndFailure(t *testing.T) {
 		case tr := <-traces:
 			if r := tr.Custom["result"]; r != "" {
 				results[tr.Custom["version-id"]] = r
+				if tr.Error == "" {
+					t.Errorf("%s expiry of %s traced without its error", r, tr.Custom["version-id"])
+				}
 			}
 		default:
 			drained = true
@@ -170,20 +182,40 @@ func TestDeleteObjectVersionsReportsRefusalAndFailure(t *testing.T) {
 	if results[toDel[0].VersionID] != "refused" || results[toDel[1].VersionID] != "failed" {
 		t.Errorf("traces %v, want refused and failed", results)
 	}
-	select {
-	case tags := <-audits:
-		if tags["ilm-incomplete-reason"] != ilmIncompleteHistoryUnavailable || tags["error"] == "" {
-			t.Errorf("audit of the failure: %v", tags)
+	// Drain every audit entry of the bucket: until the removal of ncv-c,
+	// audited after the refusal and the failure were reported, has arrived,
+	// and then while the target empties its queue.
+	var got []map[string]any
+	deadline := time.After(10 * time.Second)
+	for removal := false; !removal; {
+		select {
+		case tags := <-audits:
+			got = append(got, tags)
+			removal = removal || tags["object"] == "ncv-c"
+		case <-deadline:
+			t.Fatalf("audits %v: the removal of ncv-c was not audited", got)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the failure was not audited")
 	}
-	select {
-	case tags := <-audits:
-		if _, failed := tags["ilm-incomplete-reason"]; failed {
-			t.Errorf("a second incomplete expiry was audited: %v", tags)
+	for idle := time.After(time.Second); idle != nil; {
+		select {
+		case tags := <-audits:
+			got = append(got, tags)
+		case <-idle:
+			idle = nil
 		}
-	case <-time.After(500 * time.Millisecond):
+	}
+	perObject := map[any][]map[string]any{}
+	for _, tags := range got {
+		perObject[tags["object"]] = append(perObject[tags["object"]], tags)
+	}
+	if a := perObject["ncv-a"]; len(a) != 0 {
+		t.Errorf("the refusal was audited: %v", a)
+	}
+	if b := perObject["ncv-b"]; len(b) != 1 || b[0]["ilm-incomplete-reason"] != ilmIncompleteHistoryUnavailable || b[0]["error"] == "" {
+		t.Errorf("audits of the failure: %v, want one with its reason and error", b)
+	}
+	if c := perObject["ncv-c"]; len(c) != 1 || c[0]["ilm-incomplete-reason"] != nil {
+		t.Errorf("audits of the removal: %v, want one", c)
 	}
 }
 
@@ -288,24 +320,31 @@ func TestILMExpiryIncompleteMetrics(t *testing.T) {
 	for _, r := range ilmIncompleteReasons {
 		globalILMIncomplete.add(r)
 	}
-	if md := ilmExpiryIncompleteTotalMD; md.Type != CounterMT || !slices.Equal(md.VariableLabels, []string{"reason"}) {
-		t.Fatalf("v3 descriptor %+v", md)
-	}
-	d := map[MetricName]MetricDescriptor{}
-	for _, md := range []MetricDescriptor{ilmExpiryPendingTasksMD, ilmTransitionActiveTasksMD, ilmTransitionPendingTasksMD, ilmTransitionMissedImmediateTasksMD, ilmVersionsScannedMD, ilmExpiryIncompleteTotalMD} {
-		d[md.Name] = md
-	}
-	m := newMetricValues(d)
-	if err := loadILMMetrics(t.Context(), m, nil); err != nil {
+	// v3, through the collector the metrics handler registers.
+	families, err := newMetricGroups(prometheus.NewRegistry()).mgGatherers[ilmCollectorPath].Gather()
+	if err != nil {
 		t.Fatal(err)
 	}
+	want := ilmCollectorPath.metricPrefix() + "_" + string(expiryIncompleteTotal)
 	reasons := map[string]bool{}
-	for _, v := range m.values[expiryIncompleteTotal] {
-		reasons[v.Labels["reason"]] = true
+	for _, family := range families {
+		if family.GetName() != want {
+			continue
+		}
+		for _, m := range family.Metric {
+			if m.Counter == nil || m.GetCounter().GetValue() <= 0 {
+				t.Errorf("v3 %s: %v, want a counter above zero", want, m)
+			}
+			for _, l := range m.Label {
+				if l.GetName() == "reason" {
+					reasons[l.GetValue()] = true
+				}
+			}
+		}
 	}
 	for _, r := range ilmIncompleteReasons {
 		if !reasons[r] {
-			t.Errorf("v3: reason %q not exported", r)
+			t.Errorf("v3: %s{reason=%q} not exported", want, r)
 		}
 	}
 	reasons = map[string]bool{}

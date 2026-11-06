@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -862,9 +863,7 @@ func TestRestorePublicationBelowWriteQuorumOnWideSet(t *testing.T) {
 // the convergence path queues too. That heal repairs the null version on the
 // drive that missed the commit, also where the null version is noncurrent.
 func TestRestorePartialCommitQueuesNullVersionHeal(t *testing.T) {
-	saved := globalStorageClass
-	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: 2}})
-	t.Cleanup(func() { globalStorageClass.Update(saved) })
+	setTestStandardParity(t, 2)
 	r := newRestoreSafetyTest(t, 1, versioning.Suspended)
 	oi, body := nativeRestoreSeed(t, r, 0, true, false)
 	// A version written while versioning was enabled makes the null version
@@ -878,22 +877,26 @@ func TestRestorePartialCommitQueuesNullVersionHeal(t *testing.T) {
 	failing := &restoreTwoPhaseFaults{}
 	failing.rename.Store("fail")
 	disks := restoreTwoPhaseFaulty(t, r, nil, nil, nil, failing)
-	// The test owns the MRF queue while the commit runs: the heal routines of
-	// the test servers would otherwise take the entry first.
-	queue := make(chan PartialOperation, mrfOpsQueueSize)
-	previous := globalMRFState.opCh
-	globalMRFState.opCh = queue
+	// Observe the MRF entries in place of the queue, which the heal routines
+	// of the test servers consume.
+	var mu sync.Mutex
+	var queued []PartialOperation
+	hook := func(op PartialOperation) {
+		if op.Bucket == r.bucket && op.Object == r.object {
+			mu.Lock()
+			queued = append(queued, op)
+			mu.Unlock()
+		}
+	}
+	mrfPartialOpHook.Store(&hook)
+	t.Cleanup(func() { mrfPartialOpHook.Store(nil) })
 	err := r.z.RestoreTransitionedObject(t.Context(), r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
-	globalMRFState.opCh = previous
+	mrfPartialOpHook.Store(nil)
 	if err != nil {
 		t.Fatalf("restore with one drive failing its commit: %v", err)
 	}
-	var queued []PartialOperation
-	for len(queue) > 0 {
-		if op := <-queue; op.Bucket == r.bucket && op.Object == r.object {
-			queued = append(queued, op)
-		}
-	}
+	mu.Lock()
+	defer mu.Unlock()
 	if len(queued) != 1 || queued[0].VersionID != nullVersionID {
 		t.Fatalf("queued heals %+v, want one of version %q", queued, nullVersionID)
 	}

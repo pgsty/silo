@@ -140,7 +140,7 @@ func reportILMExpiryNotDone(ctx context.Context, oi ObjectInfo, lcEvent lifecycl
 	}
 	globalILMIncomplete.add(reason)
 	if ilmExpiryRefused(reason) {
-		traceFn(ILMExpiry, map[string]string{"result": "refused", "reason": reason, "version-id": oi.VersionID}, nil)
+		traceFn(ILMExpiry, map[string]string{"result": "refused", "reason": reason, "version-id": oi.VersionID}, err)
 		return true
 	}
 	traceFn(ILMExpiry, map[string]string{"result": "failed", "reason": reason, "version-id": oi.VersionID}, err)

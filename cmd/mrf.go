@@ -74,9 +74,18 @@ func newMRFState() mrfState {
 	}
 }
 
+// mrfPartialOpHook, when set, receives each partial operation in place of
+// the queue, so that a test observes what is queued without racing the heal
+// routines that consume it. Production never sets it.
+var mrfPartialOpHook atomic.Pointer[func(PartialOperation)]
+
 // Add a partial S3 operation (put/delete) when one or more disks are offline.
 func (m *mrfState) addPartialOp(op PartialOperation) {
 	if m == nil {
+		return
+	}
+	if f := mrfPartialOpHook.Load(); f != nil {
+		(*f)(op)
 		return
 	}
 

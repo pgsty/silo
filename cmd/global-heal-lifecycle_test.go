@@ -30,15 +30,29 @@ import (
 // is decided again under the object lock and can be refused, and a version
 // left unhealed would stay without the replaced drive for as long as it is.
 
+// setTestStandardParity sets the standard storage class parity for the test
+// and restores the whole previous configuration after it, also when it was
+// never initialized and so meant the default parity.
+func setTestStandardParity(t *testing.T, parity int) {
+	t.Helper()
+	storageclass.ConfigLock.RLock()
+	saved := globalStorageClass
+	storageclass.ConfigLock.RUnlock()
+	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: parity}})
+	t.Cleanup(func() {
+		storageclass.ConfigLock.Lock()
+		globalStorageClass = saved
+		storageclass.ConfigLock.Unlock()
+	})
+}
+
 // startTestBackgroundHeal registers the background heal sequence and a heal
 // worker, which drive healing needs for its bucket heals.
 func startTestBackgroundHeal(t *testing.T, z *erasureServerPools) {
 	t.Helper()
 	// The healed drive is rebuilt from parity. Earlier tests can leave a
 	// storage class of parity 0 behind (newTestConfig on a single drive).
-	previous := globalStorageClass
-	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: z.serverPools[0].setDriveCount / 2}})
-	t.Cleanup(func() { globalStorageClass.Update(previous) })
+	setTestStandardParity(t, z.serverPools[0].setDriveCount/2)
 	if globalBackgroundHealState == nil {
 		globalBackgroundHealState = newHealState(GlobalContext, false)
 	}
