@@ -1229,10 +1229,16 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(obj.Bucket, obj.Name)
 	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(obj.Bucket, obj.Name)
 
+	// Purge every version of exactly this key, by version ID and under the
+	// object lock, after the pools approved it on the versions they hold;
+	// see erasureServerPools.deleteAllVersions.
+	var purge deleteAllResult
 	if lcEvent.Action.DeleteAll() {
-		opts.DeletePrefix = true
-		// use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-		opts.DeletePrefixObject = true
+		opts = ObjectOptions{
+			Expiration:        ExpirationOptions{Expire: true},
+			DeleteAllVersions: true,
+			DeleteAllResult:   &purge,
+		}
 	}
 
 	// ILM-created delete markers and version purges must carry the same
@@ -1263,13 +1269,16 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		if lcEvent.Action != lifecycle.NoneAction {
 			numVersions := uint64(1)
 			if lcEvent.Action.DeleteAll() {
-				numVersions = uint64(obj.NumVersions)
+				numVersions = uint64(purge.Removed)
 			}
 			timeILM(numVersions)
 		}
 	}()
 
 	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, encodeDirObject(obj.Name), opts)
+	if lcEvent.Action.DeleteAll() && (err != nil || purge.Removed == 0) {
+		return deleteAllNotCompleted(ctx, obj, lcEvent, src, purge, err, traceFn)
+	}
 	if err != nil {
 		if errors.Is(err, errLifecycleNotApplicable) || isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			traceFn(ILMExpiry, nil, nil)
@@ -1310,6 +1319,9 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
 	tags["version-id"] = dobj.VersionID
+	if lcEvent.Action.DeleteAll() {
+		tags[ilmVersionsRemoved] = strconv.Itoa(purge.Removed)
+	}
 
 	// Send audit for the lifecycle delete operation
 	auditLogLifecycle(ctx, dobj, ILMExpiry, tags, traceFn)
@@ -1334,6 +1346,57 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	})
 
 	return true
+}
+
+// ilmVersionsRemoved is the audit tag with the number of versions that an
+// expiry of all versions removed; ilmPartial marks one that began to delete
+// and did not finish.
+const (
+	ilmVersionsRemoved = "ilm-versions-removed"
+	ilmPartial         = "ilm-partial"
+)
+
+// deleteAllNotCompleted reports an expiry of all versions of obj that did
+// not remove them all. A purge that had nothing to remove, or that failed
+// before it deleted anything, reports what a rejected expiry does. One that
+// failed or stopped after it began to delete is audited as partial, with the
+// versions it removed, but sends no removal event: the key is still there.
+func deleteAllNotCompleted(ctx context.Context, obj ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc, purge deleteAllResult, err error, traceFn func(event string, metadata map[string]string, err error)) bool {
+	switch {
+	case err == nil: // there was nothing to remove
+		traceFn(ILMExpiry, nil, nil)
+		return false
+	case purge.Started:
+		tags := newLifecycleAuditEvent(src, lcEvent).Tags()
+		tags["version-id"] = purge.Latest.VersionID
+		tags[ilmVersionsRemoved] = strconv.Itoa(purge.Removed)
+		tags[ilmPartial] = "true"
+		auditLogInternal(ctx, AuditLogOptions{
+			Event:     ILMExpiry,
+			APIName:   "ILMExpiry",
+			Bucket:    obj.Bucket,
+			Object:    obj.Name,
+			VersionID: purge.Latest.VersionID,
+			Error:     err.Error(),
+			Tags:      tags,
+		})
+		traceFn(ILMExpiry, tags, err)
+		if errors.Is(err, errDeleteAllBudget) {
+			return false // a long history; the next expiry continues
+		}
+	case errors.Is(err, errDeleteAllTiered):
+		// Kept until tiered versions can be purged; see deleteAllVersions.
+		traceFn(ILMExpiry, nil, err)
+		return false
+	case errors.Is(err, errLifecycleNotApplicable) || isErrObjectNotFound(err) || isErrVersionNotFound(err):
+		traceFn(ILMExpiry, nil, nil)
+		return false
+	default:
+		traceFn(ILMExpiry, nil, err)
+	}
+	// Assume it is still there.
+	ilmLogOnceIf(ctx, fmt.Errorf("DeleteObject(%s, %s): %w", obj.Bucket, obj.Name, err), "non-transition-expiry"+obj.Name)
+	return false
 }
 
 // Apply object, object version, restored object or restored object version action on the given object

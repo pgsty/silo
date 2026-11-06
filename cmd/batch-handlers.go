@@ -996,10 +996,17 @@ func (ri *batchJobInfo) updateAfter(ctx context.Context, api ObjectLayer, durati
 	return nil
 }
 
-// Note: to be used only with batch jobs that affect multiple versions through
-// a single action. e.g batch-expire has an option to expire all versions of an
-// object which matches the given filters.
-func (ri *batchJobInfo) trackMultipleObjectVersions(info expireObjInfo, success bool) {
+// expireFailures reports whether an expiration job failed to remove an
+// object or a delete marker it matched.
+func (ri *batchJobInfo) expireFailures() bool {
+	return ri.ObjectsFailed > 0 || ri.DeleteMarkersFailed > 0
+}
+
+// trackExpireAll counts the objects and delete markers that an expiry of all
+// versions of info removed and, when it failed, those the walk saw that it
+// did not remove, at least one. Only batch-expire uses it, for a rule that
+// expires all versions of an object.
+func (ri *batchJobInfo) trackExpireAll(info expireObjInfo, objects, markers int64, failed bool) {
 	if ri == nil {
 		return
 	}
@@ -1007,15 +1014,20 @@ func (ri *batchJobInfo) trackMultipleObjectVersions(info expireObjInfo, success 
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 
-	if success {
+	ri.Objects += objects
+	ri.DeleteMarkers += markers
+	if !failed {
 		ri.Bucket = info.Bucket
 		ri.Object = info.Name
-		ri.Objects += int64(info.NumVersions) - info.DeleteMarkerCount
-		ri.DeleteMarkers += info.DeleteMarkerCount
-	} else {
-		ri.ObjectsFailed += int64(info.NumVersions) - info.DeleteMarkerCount
-		ri.DeleteMarkersFailed += info.DeleteMarkerCount
+		return
 	}
+	failedObjects := max(int64(info.NumVersions)-info.DeleteMarkerCount-objects, 0)
+	failedMarkers := max(info.DeleteMarkerCount-markers, 0)
+	if failedObjects+failedMarkers == 0 {
+		failedObjects = 1
+	}
+	ri.ObjectsFailed += failedObjects
+	ri.DeleteMarkersFailed += failedMarkers
 }
 
 func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo, success bool, attempt int) {
