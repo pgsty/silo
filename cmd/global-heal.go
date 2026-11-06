@@ -371,8 +371,14 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				applyExpiryOnTransitionedObject(ctx, newObjectLayerFn(), objInfo, evt, lcEventSrc_Heal)
 				return false
 			case evt.Action.Delete():
+				// Enqueue the expiry, but heal the version: the expiry is
+				// decided again under the object lock, with the versions in
+				// all pools and the protection it reads then, and can be
+				// refused. A skipped version would stay without this drive
+				// for as long as it is refused. One that is deleted later
+				// costs one heal.
 				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Heal)
-				return true
+				return false
 			default:
 				return false
 			}
@@ -450,9 +456,10 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 
 			var versionNotFound int
 			for _, version := range fivs.Versions {
-				// Ignore healing a version if:
-				// - It is uploaded after the drive healing is started
-				// - An object that is already expired by ILM rule.
+				// Ignore healing a version that is uploaded after the drive
+				// healing started. filterLifecycle only schedules the ILM
+				// action due for the version; it reports false for every
+				// version, also one it expires.
 				if !started.IsZero() && version.ModTime.After(started) || filterLifecycle(bucket, version.Name, version) {
 					versionNotFound++
 					if !send(healEntrySkipped(uint64(version.Size))) {
