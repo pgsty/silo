@@ -641,6 +641,12 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
 		return err
 	}
+	// A completed job is not run again, as replication and key rotation
+	// jobs are not: its submitter is not checked again either, so a
+	// credential that expired since cannot turn it into a failed job.
+	if ri.Complete {
+		return nil
+	}
 	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
 		return err
 	}
