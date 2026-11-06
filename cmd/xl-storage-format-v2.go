@@ -878,7 +878,9 @@ func isIndexedMetaV2(buf []byte) (meta xlMetaBuf, data xlMetaInlineData, err err
 		// Read metadata CRC
 		buf = nbuf
 		if got := uint32(xxhash.Sum64(meta)); got != crc {
-			return nil, nil, fmt.Errorf("xlMetaV2.Load version(%d), CRC mismatch, want 0x%x, got 0x%x", minor, crc, got)
+			// Use the storage sentinel so corruption retains its classification
+			// across both local storage and storage RPC.
+			return nil, nil, errFileCorrupt
 		}
 	} else {
 		return nil, nil, err
@@ -1054,7 +1056,7 @@ func (x *xlMetaV2) loadLegacy(buf []byte) error {
 					// Read metadata CRC (added in v2)
 					buf = nbuf
 					if got := uint32(xxhash.Sum64(v)); got != crc {
-						return fmt.Errorf("xlMetaV2.Load version(%d), CRC mismatch, want 0x%x, got 0x%x", minor, crc, got)
+						return errFileCorrupt
 					}
 				} else {
 					return fmt.Errorf("xlMetaV2.Load version(%d), loading CRC: %w", minor, err)

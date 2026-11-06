@@ -18,11 +18,13 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"slices"
 	"strings"
 	"testing"
 
+	madmin "github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 )
 
@@ -136,8 +138,8 @@ func TestPurgeAllVersionsRefusalReasons(t *testing.T) {
 }
 
 // A drive whose metadata does not decode refuses the purge, as an
-// unreadable one does. Object heal does not rewrite such metadata; once the
-// drive holds readable metadata again, the next purge removes the key.
+// unreadable one does. Healing each surviving version restores the metadata
+// from a quorum before the next purge can remove the key.
 func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 	z := purgeSinglePool(t, 16)
 	p := newPurgeTest(t, z, "purge-corrupt", MakeBucketOptions{VersioningEnabled: true}, purgeRules)
@@ -156,14 +158,20 @@ func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := slices.Clone(good)
-	buf[len(buf)/2] ^= 0xff
+	meta, _, err := isIndexedMetaV2(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta[len(meta)-1] ^= 1
 	if err := bad.WriteAll(ctx, p.bucket, metaPath, buf); err != nil {
 		t.Fatal(err)
 	}
 	if raw, err := bad.ReadXL(ctx, p.bucket, key, false); err != nil {
 		t.Fatalf("the corrupted metadata is not read: %v", err)
-	} else if err := (&xlMetaV2{}).LoadOrConvert(raw.Buf); err == nil {
-		t.Fatal("the corrupted metadata still decodes")
+	} else if err := (&xlMetaV2{}).LoadOrConvert(raw.Buf); !errors.Is(err, errFileCorrupt) {
+		t.Fatalf("CRC classification: %v", err)
+	} else if got := toStorageErr(errors.New(err.Error())); got != errFileCorrupt {
+		t.Fatalf("CRC classification after storage RPC: %v", got)
 	}
 
 	delta := incompleteDelta(func() { p.run(ops) })
@@ -179,8 +187,36 @@ func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 		t.Fatalf("the refused purge left %s readable", got)
 	}
 
-	if err := bad.WriteAll(ctx, p.bucket, metaPath, good); err != nil {
+	versions, err := getFileInfoVersions(good, p.bucket, key, false)
+	if err != nil {
 		t.Fatal(err)
+	}
+	for _, mode := range []madmin.HealScanMode{madmin.HealNormalScan, madmin.HealDeepScan} {
+		if err := bad.WriteAll(ctx, p.bucket, metaPath, buf); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := z.HealObject(ctx, p.bucket, key, nullVersionID, madmin.HealOpts{DryRun: true, ScanMode: mode}); err != nil {
+			t.Fatal(err)
+		}
+		unchanged, err := bad.ReadAll(ctx, p.bucket, metaPath)
+		if err != nil || !bytes.Equal(unchanged, buf) {
+			t.Fatalf("dry-run changed corrupt metadata: %v", err)
+		}
+		for _, fi := range versions.Versions {
+			id := fi.VersionID
+			if id == "" {
+				id = nullVersionID
+			}
+			if _, err := z.HealObject(ctx, p.bucket, key, id, madmin.HealOpts{ScanMode: mode}); err != nil {
+				t.Fatalf("heal %s: %v", id, err)
+			}
+			if _, err := bad.ReadVersion(ctx, "", p.bucket, key, id, ReadOptions{}); err != nil {
+				t.Fatalf("repaired version %s unreadable: %v", id, err)
+			}
+		}
+		if got := p.get(key); got != "v2" {
+			t.Fatalf("heal changed latest data: %s", got)
+		}
 	}
 	p.run([]expiryOp{p.deleteAllTask(0, key, lifecycle.DeleteAllVersionsAction)})
 	if got := p.held(0, key); got != nil {
