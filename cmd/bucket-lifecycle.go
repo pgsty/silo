@@ -37,6 +37,7 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
@@ -611,8 +612,9 @@ func enqueueTransitionImmediate(obj ObjectInfo, src lcEventSrc) {
 func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) error {
 	traceFn := globalLifecycleSys.trace(*oi)
 	opts := ObjectOptions{
-		Versioned:  globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
-		Expiration: ExpirationOptions{Expire: true},
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		Expiration:       ExpirationOptions{Expire: true},
 	}
 	if lcEvent.Action.DeleteVersioned() {
 		opts.VersionID = oi.VersionID
@@ -622,6 +624,17 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		// delete locally restored copy of object or object version
 		// from the source, while leaving metadata behind. The data on
 		// transitioned tier lies untouched and still accessible
+		//
+		// The restored copy belongs to this version, also when it is the
+		// latest one (DeleteRestoredAction). Without its version ID the
+		// delete applies to the object: a versioned bucket gets a delete
+		// marker that hides it, a suspended one strips the null version.
+		// An empty version ID is the null version, as callers that read
+		// it without the versioning of the bucket leave it.
+		opts.VersionID = oi.VersionID
+		if opts.VersionID == "" {
+			opts.VersionID = nullVersionID
+		}
 		opts.Transition.ExpireRestored = true
 		_, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
 		if err == nil {
@@ -636,7 +649,6 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	// touching the remote tier. If the lifecycle configuration changed after
 	// the scanner queued this task, DeleteObject rejects the stale action while
 	// the remote object is still protected.
-	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name)
 	keepRemote := opts.VersionID == "" &&
 		(opts.Versioned || (opts.VersionSuspended && oi.VersionID != "" && oi.VersionID != nullVersionID))
 	if lcEvent.Action == lifecycle.DeleteAction || lcEvent.Action == lifecycle.DeleteVersionAction {
@@ -976,8 +988,10 @@ func postRestoreOpts(ctx context.Context, r *http.Request, bucket, object string
 	}, nil
 }
 
-// set ObjectOptions for PUT call to restore temporary copy of transitioned data
-func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo ObjectInfo) (putOpts ObjectOptions) {
+// set ObjectOptions for PUT call to restore temporary copy of transitioned data.
+// opts are the restore's options, with the versioning POST captured: the
+// bucket's versioning may have changed since, and must not mint a new version.
+func putRestoreOpts(rreq *RestoreObjectRequest, objInfo ObjectInfo, opts ObjectOptions) (putOpts ObjectOptions) {
 	meta := make(map[string]string)
 	sc := rreq.OutputLocation.S3.StorageClass
 	if sc == "" {
@@ -1000,8 +1014,8 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 			meta[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
 		}
 		return ObjectOptions{
-			Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, object),
-			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, object),
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
 			UserDefined:      meta,
 		}
 	}
@@ -1009,17 +1023,35 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 	if len(objInfo.UserTags) != 0 {
 		meta[xhttp.AmzObjectTagging] = objInfo.UserTags
 	}
-	// Set restore object status
+	// Set restore object status; a completed restore has no attempt.
 	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
 	meta[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
+	delete(meta, restoreAttemptKey)
 	return ObjectOptions{
-		Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, object),
-		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, object),
+		Versioned:        opts.Versioned,
+		VersionSuspended: opts.VersionSuspended,
 		UserDefined:      meta,
-		VersionID:        objInfo.VersionID,
+		VersionID:        restoreVersionID(objInfo.VersionID),
 		MTime:            objInfo.ModTime,
 		Expires:          objInfo.Expires,
 	}
+}
+
+// restoredCopyExpires reports whether the restored copy of oi, as read now,
+// expires by its own reason: lifecycle expires the restored copy of this
+// version, its restore deadline is valid and has passed, its transition is
+// complete and no restore is running. Another rule falling due is no reason.
+func restoredCopyExpires(ctx context.Context, lc lifecycle.Lifecycle, lr lock.Retention, rcfg *replication.Config, oi ObjectInfo) bool {
+	if !evalActionFromLifecycle(ctx, lc, lr, rcfg, oi).Action.DeleteRestored() {
+		return false
+	}
+	status, err := parseRestoreObjStatus(oi.UserDefined[xhttp.AmzRestore])
+	if err != nil {
+		return false
+	}
+	expiry, completed := status.Expiry()
+	return completed && !expiry.IsZero() && UTCNow().After(expiry) &&
+		oi.TransitionedObject.Status == lifecycle.TransitionComplete && !oi.RestoreOngoing
 }
 
 var errRestoreHDRMalformed = fmt.Errorf("x-amz-restore header malformed")

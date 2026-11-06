@@ -1239,14 +1239,45 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		object = encodeDirObject(object)
 	}
 
-	// Serialize logical deletion with pooled writes and metadata updates.
-	lk := z.NewNSLock(bucket, object)
+	// Serialize logical deletion with the writes and metadata updates of the
+	// object: take the lock they take (see NewObjectNSLock). With one pool
+	// that is the object's own erasure set, which is where PutObject,
+	// multipart commit and the metadata updates lock, so a pool whose sets
+	// use different hosts still excludes them. With several pools it is the
+	// pools lock, as before. Exact-key deletes that use prefix deletion
+	// (DeletePrefixObject) are deletes of one object. A true prefix deletion
+	// keeps the pools lock on the prefix name, which never covered the
+	// objects below it.
+	//
+	// Nodes that still run a release before this routing lock single-pool
+	// deletes and copies in the first set. In a pool whose sets use different
+	// hosts they do not exclude the deletes and copies of updated nodes, nor
+	// their writes, so such a pool must not run mixed versions.
+	var lk RWLocker
+	if opts.DeletePrefix && !opts.DeletePrefixObject {
+		lk = z.NewNSLock(bucket, object)
+	} else {
+		lk = z.NewObjectNSLock(bucket, object)
+	}
 	lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
+
+	// An ILM expiry is decided on the versions in one pool. Under the lock,
+	// check it with the versions in all pools; the sets then take it as
+	// decided, without a recheck by the versions each one holds. They only
+	// keep a version whose protection they read differently.
+	if z.expiryNeedsAllPools(opts) {
+		var approved objectLockState
+		if approved, err = z.checkExpiryAllPools(ctx, bucket, object, opts); err != nil {
+			return ObjectInfo{Name: decodeDirObject(object), VersionID: opts.VersionID}, err
+		}
+		opts.Expiration.CheckedAllPools = true
+		opts.Expiration.ApprovedProtection = approved
+	}
 
 	if opts.DeletePrefix {
 		return ObjectInfo{}, z.deletePrefix(ctx, bucket, object)
@@ -1309,10 +1340,10 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	// Evaluate the conditional (If-Match) precondition while the write lock
 	// acquired above is held, before the delete-marker short-circuit and before
-	// any version is removed, so the object cannot change between the check and
-	// the delete. This is scoped to a single erasure set (see the note at the
-	// lock above): only there do the delete lock and the write path share the
-	// same lock namespace, making the check-then-delete atomic.
+	// any version is removed. The object's writers take the same lock (see the
+	// note at the lock above), so the object cannot change between the check
+	// and the delete. Multi-pool conditional deletes return above, through
+	// deleteObjectReconciled, under the same pools lock.
 	if opts.CheckPrecondFn != nil {
 		// pinfo.ObjInfo is the current latest version. getPoolInfoExistingWithOpts
 		// intentionally strips VersionID, so for a version-scoped delete read the
@@ -1496,6 +1527,18 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 		objSets.Add(objects[i].ObjectName)
 	}
 
+	// A single pool locks each name in the set its writers lock it in, one
+	// set at a time. A single node keeps one lock table for all sets, so it
+	// keeps the one bulk lock below: its local lock takes the names one by
+	// one and holds the earlier names while it waits.
+	if z.SinglePool() && !z.serverPools[0].sharesLocalNSLock() {
+		z.deleteObjectsInSets(ctx, bucket, objects, opts, dobjects, derrs, globalOperationTimeout)
+		for i := range dobjects {
+			dobjects[i].ObjectName = decodeDirObject(dobjects[i].ObjectName)
+		}
+		return dobjects, derrs
+	}
+
 	// Acquire a bulk write lock across 'objects'
 	multiDeleteLock := z.NewNSLock(bucket, objSets.ToSlice()...)
 	lkctx, err := multiDeleteLock.GetLock(ctx, globalOperationTimeout)
@@ -1517,9 +1560,30 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 		batch = make([]ObjectToDelete, 0, len(objects))
 		batchIdx = make([]int, 0, len(objects))
 		data, dataIdx := make([]ObjectToDelete, 0, len(objects)), make([]int, 0, len(objects))
+		approved := make([]objectLockState, 0, len(objects))
+		ilm := make(map[string]lifecycleAllPools)
 		for i, obj := range objects {
 			if derrs[i] != nil {
 				continue
+			}
+			// A version that ILM expires is checked with the versions of
+			// its object in all pools, see checkExpiryAllPools. When the
+			// expiry no longer applies, nothing is deleted and nothing is
+			// left to replicate.
+			var protection objectLockState
+			vopts := ObjectOptions{Expiration: opts.Expiration, VersionID: obj.VersionID}
+			if obj.VersionID != "" && z.expiryNeedsAllPools(vopts) {
+				all, ok := ilm[obj.ObjectName]
+				if !ok {
+					all.versions, all.events, all.err = z.lifecycleEventsAllPools(ctx, bucket, obj.ObjectName)
+					ilm[obj.ObjectName] = all
+				}
+				if err := all.expiryApplies(bucket, obj.ObjectName, vopts); err != nil {
+					dobjects[i] = DeletedObject{ObjectName: obj.ObjectName, VersionID: obj.VersionID}
+					derrs[i] = err
+					continue
+				}
+				protection = all.protection(obj.VersionID)
 			}
 			if deletesData(obj, opts) {
 				if z.copyWithoutDeleteQuorum(ctx, bucket, obj.ObjectName, obj.VersionID) {
@@ -1528,13 +1592,14 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 				}
 				data = append(data, obj)
 				dataIdx = append(dataIdx, i)
+				approved = append(approved, protection)
 				continue
 			}
 			batch = append(batch, obj)
 			batchIdx = append(batchIdx, i)
 		}
 		if len(data) > 0 {
-			deleted, errs := z.deleteObjectsReconciled(ctx, bucket, data, opts)
+			deleted, errs := z.deleteObjectsReconciled(ctx, bucket, data, approved, opts)
 			for j, i := range dataIdx {
 				dobjects[i], derrs[i] = deleted[j], errs[j]
 			}
@@ -1598,8 +1663,10 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
 
+	// A caller that also locks the source takes both with lockObjects, before
+	// it reads the source, and passes NoLock.
 	if !dstOpts.NoLock {
-		ns := z.NewNSLock(dstBucket, dstObject)
+		ns := z.NewObjectNSLock(dstBucket, dstObject)
 		lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return ObjectInfo{}, err
@@ -1625,7 +1692,21 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		return oi, err
 	}
 
-	poolIdx, err := z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
+	var poolIdx int
+	if dstOpts.MetadataChg && cpSrcDstSame && srcInfo.metadataOnly && srcOpts.VersionID == dstOpts.VersionID {
+		// Restore status updates address an existing version. Keep ordinary
+		// copy/write allocation unchanged, including its latest-version lookup.
+		poolIdx, err = z.getPoolIdxExistingWithOpts(ctx, dstBucket, dstObject, ObjectOptions{
+			VersionID:          dstOpts.VersionID,
+			MetadataChg:        true,
+			NoLock:             true,
+			Transition:         dstOpts.Transition,
+			SkipDecommissioned: true,
+			SkipRebalancing:    true,
+		})
+	} else {
+		poolIdx, err = z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
+	}
 	if err != nil {
 		return objInfo, err
 	}
@@ -2182,7 +2263,7 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 		return MultipartInfo{}, err
 	}
 
-	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
 	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return MultipartInfo{}, err
@@ -2223,7 +2304,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 		return ListPartsInfo{}, err
 	}
 
-	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
 	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return ListPartsInfo{}, err
@@ -2274,7 +2355,7 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 		}
 	}(ctx)
 
-	lk := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	lk := z.uploadIDNSLock(bucket, object, uploadID)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return err
@@ -2312,9 +2393,12 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		}
 	}()
 
+	// Several pools take the object lock first, then the upload lock below.
+	// A single pool takes the upload lock here and the set takes the object
+	// lock, in the object's own erasure set, only right before it commits.
 	if !z.SinglePool() {
 		if !opts.NoLock {
-			lk := z.NewNSLock(bucket, encodeDirObject(object))
+			lk := z.NewObjectNSLock(bucket, encodeDirObject(object))
 			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 			if err != nil {
 				return objInfo, err
@@ -2375,13 +2459,18 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	// Hold write locks to verify uploaded parts, also disallows any
 	// parallel PutObjectPart() requests.
-	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
-	wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return objInfo, err
+	// An empty upload ID would name the object lock itself, which this
+	// completion holds or takes later: let the storage layer return its
+	// normal missing bucket/upload error instead.
+	if uploadID != "" {
+		uploadIDLock := z.uploadIDNSLock(bucket, object, uploadID)
+		wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return objInfo, err
+		}
+		ctx = wlkctx.Context()
+		defer uploadIDLock.Unlock(wlkctx)
 	}
-	ctx = wlkctx.Context()
-	defer uploadIDLock.Unlock(wlkctx)
 
 	if z.SinglePool() {
 		return z.serverPools[0].CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
@@ -3309,39 +3398,25 @@ func (z *erasureServerPools) TransitionObject(ctx context.Context, bucket, objec
 	return z.serverPools[idx].TransitionObject(ctx, bucket, object, opts)
 }
 
-// RestoreTransitionedObject - restore transitioned object content locally on this cluster.
-func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+func (z *erasureServerPools) CheckAbandonedParts(ctx context.Context, bucket, object string, opts madmin.HealOpts) error {
 	object = encodeDirObject(object)
 	if z.SinglePool() {
-		return z.serverPools[0].RestoreTransitionedObject(ctx, bucket, object, opts)
+		return z.serverPools[0].CheckAbandonedParts(ctx, bucket, object, opts)
 	}
-
-	if !opts.NoLock {
-		// Acquire write lock before restoring transitioned object
-		lk := z.NewNSLock(bucket, object)
-		lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
+	// Several pools: remove abandoned data under the pools lock, which every
+	// write of the object takes, as healObjectInPool does. The lock of one
+	// pool's set would not exclude a write that has moved its data directory
+	// in place but not yet published the metadata that references it, such
+	// as a native restore's commit.
+	if opts.Remove && !opts.DryRun && !opts.NoLock {
+		lk := z.NewObjectNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 		if err != nil {
 			return err
 		}
 		ctx = lkctx.Context()
 		defer lk.Unlock(lkctx)
-	}
-
-	// Avoid restoring object from a pool being decommissioned.
-	opts.SkipDecommissioned = true
-	opts.NoLock = true
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
-	if err != nil {
-		return err
-	}
-
-	return z.serverPools[idx].RestoreTransitionedObject(ctx, bucket, object, opts)
-}
-
-func (z *erasureServerPools) CheckAbandonedParts(ctx context.Context, bucket, object string, opts madmin.HealOpts) error {
-	object = encodeDirObject(object)
-	if z.SinglePool() {
-		return z.serverPools[0].CheckAbandonedParts(ctx, bucket, object, opts)
+		opts.NoLock = true
 	}
 	errs := make([]error, len(z.serverPools))
 	var wg sync.WaitGroup

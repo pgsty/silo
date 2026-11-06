@@ -467,9 +467,17 @@ func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toD
 		deletedObjs, errs := o.DeleteObjects(ctx, bucket, toDel, ObjectOptions{
 			PrefixEnabledFn:  vc.PrefixEnabled,
 			VersionSuspended: vc.Suspended(),
+			Expiration:       ExpirationOptions{Expire: true},
 		})
 
 		for i, dobj := range deletedObjs {
+			if errs[i] != nil && !isErrObjectNotFound(errs[i]) && !isErrVersionNotFound(errs[i]) {
+				// Only a completed delete, or one confirmed already absent, is
+				// a removal. After a refusal, a quorum, configuration or any
+				// other error the version may remain; do not audit or announce
+				// it. The next scan re-evaluates it.
+				continue
+			}
 			oi := ObjectInfo{
 				Bucket:    bucket,
 				Name:      dobj.ObjectName,

@@ -1372,6 +1372,26 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		}
 	}
 
+	if fi.ExpireRestored {
+		i, ver, err := x.findVersion(uv)
+		if err != nil {
+			return "", err
+		}
+		// Check the stored type and transition before any marker, legacy or
+		// replication mutation. Only completed tiered objects own a cache.
+		if ver.Type != ObjectType || string(ver.ObjectV2.MetaSys[metaTierStatus]) != lifecycle.TransitionComplete {
+			return "", nil
+		}
+		ver.ObjectV2.RemoveRestoreHdrs()
+		if err := x.setIdx(i, *ver); err != nil {
+			return "", err
+		}
+		if x.SharedDataDirCount(ver.ObjectV2.VersionID, ver.ObjectV2.DataDir) > 0 {
+			return "", nil
+		}
+		return uuid.UUID(ver.ObjectV2.DataDir).String(), nil
+	}
+
 	var ventry xlMetaV2Version
 	if fi.Deleted {
 		ventry = xlMetaV2Version{
@@ -1496,11 +1516,8 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		switch {
-		case fi.ExpireRestored:
-			ver.ObjectV2.RemoveRestoreHdrs()
-			err = x.setIdx(i, *ver)
-		case fi.TransitionStatus == lifecycle.TransitionComplete:
+		switch fi.TransitionStatus {
+		case lifecycle.TransitionComplete:
 			ver.ObjectV2.SetTransition(fi)
 			ver.ObjectV2.ResetInlineData()
 			err = x.setIdx(i, *ver)

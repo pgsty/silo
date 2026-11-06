@@ -116,6 +116,7 @@ var (
 	stopRebalanceRPC               = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerStopRebalance, grid.NewMSS, grid.NewNoPayload)
 	updateMetacacheListingRPC      = grid.NewSingleHandler[*metacache, *metacache](grid.HandlerUpdateMetacacheListing, func() *metacache { return &metacache{} }, func() *metacache { return &metacache{} })
 	cleanupUploadIDCacheMetaRPC    = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerClearUploadID, grid.NewMSS, grid.NewNoPayload)
+	restoreCapabilityRPC           = grid.NewSingleHandler[*grid.MSS, *grid.MSS](grid.HandlerRestoreCapability, grid.NewMSS, grid.NewMSS)
 
 	// STREAMS
 	// Set an output capacity of 100 for consoleLog and listenRPC
@@ -1440,6 +1441,7 @@ func registerPeerRESTHandlers(router *mux.Router, gm *grid.Manager) {
 	logger.FatalIf(stopRebalanceRPC.Register(gm, server.StopRebalanceHandler), "unable to register handler")
 	logger.FatalIf(updateMetacacheListingRPC.Register(gm, server.UpdateMetacacheListingHandler), "unable to register handler")
 	logger.FatalIf(cleanupUploadIDCacheMetaRPC.Register(gm, server.HandlerClearUploadID), "unable to register handler")
+	logger.FatalIf(restoreCapabilityRPC.Register(gm, restoreCapabilityHandler), "unable to register handler")
 
 	logger.FatalIf(gm.RegisterStreamingHandler(grid.HandlerTrace, grid.StreamHandler{
 		Handle:      server.TraceHandler,

@@ -159,6 +159,14 @@ type WalkOptions struct {
 // ExpirationOptions represents object options for object expiration at objectLayer.
 type ExpirationOptions struct {
 	Expire bool
+	// CheckedAllPools: the expiry was checked with the versions of the
+	// object in all pools (checkExpiryAllPools). A set does not check it
+	// again with the versions it holds alone.
+	CheckedAllPools bool
+	// ApprovedProtection: the Object Lock state of the version with which
+	// the check approved its expiry. The set compares it with the state it
+	// reads (checkedExpiryRefused). In memory only.
+	ApprovedProtection objectLockState `msg:"-"`
 }
 
 // TransitionOptions represents object options for transition ObjectLayer operation
@@ -169,6 +177,15 @@ type TransitionOptions struct {
 	RestoreRequest *RestoreObjectRequest
 	RestoreExpiry  time.Time
 	ExpireRestored bool
+
+	// attempt is the native restore a call belongs to: the attempt that
+	// POST marked on the version, see restoreRequest.
+	attempt *restoreAttempt
+	// owner is the restore lock of the version, which POST hands to the
+	// worker that runs attempt, see erasureServerPools.RestoreTransitionedObject.
+	owner *restoreOwner
+	// restoreDate is the request date POST recorded with attempt.
+	restoreDate string
 }
 
 // MakeBucketOptions represents bucket options for ObjectLayer bucket operations
@@ -250,7 +267,13 @@ func (o *ObjectOptions) SetEvalRetentionBypassFn(f EvalRetentionBypassFn) {
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
 	// Locking operations on object.
+	// NewNSLock locks names in one stable domain. It is for names that are
+	// not objects, such as bucket and IAM metadata locks.
 	NewNSLock(bucket string, objects ...string) RWLocker
+	// NewObjectNSLock locks one object in the lock domain of its writes.
+	NewObjectNSLock(bucket, object string) RWLocker
+	// lockObjects locks several objects together, see erasureServerPools.
+	lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error)
 
 	// Storage operations.
 	Shutdown(context.Context) error
@@ -287,6 +310,8 @@ type ObjectLayer interface {
 	DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error)
 	TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error
 	RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error
+	// restoreRequest records a POST restore on a version, see erasureServerPools.
+	restoreRequest(ctx context.Context, bucket, object string, opts ObjectOptions, target ObjectInfo) (restoreRequestStatus, error)
 
 	// Multipart operations.
 	ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error)

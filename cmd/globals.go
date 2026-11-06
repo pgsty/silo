@@ -319,6 +319,8 @@ var (
 
 	globalOperationTimeout       = newDynamicTimeout(10*time.Minute, 5*time.Minute) // default timeout for general ops
 	globalDeleteOperationTimeout = newDynamicTimeout(5*time.Minute, 1*time.Minute)  // default time for delete ops
+	// Queued restores retry this wait; keep their failures out of delete timeouts.
+	globalRestoreLockTimeout = newDynamicTimeout(5*time.Minute, 1*time.Minute)
 	// Listing recovery has its own failure history and a five-second caller budget.
 	globalListingOperationTimeout = newDynamicTimeout(5*time.Second, 5*time.Second)
 

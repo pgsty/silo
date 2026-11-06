@@ -34,6 +34,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -183,7 +184,7 @@ func (api objectAPIHandlers) SelectObjectContentHandler(w http.ResponseWriter, r
 
 	// Take read lock on object, here so subsequent lower-level
 	// calls do not need to.
-	lock := objectAPI.NewNSLock(bucket, object)
+	lock := objectAPI.NewObjectNSLock(bucket, object)
 	lkctx, err := lock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -492,9 +493,10 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 				return
 			}
 			event := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, objInfo)
+			expiryInfo, event := recheckReadExpiry(ctx, objectAPI, objInfo, event)
 			if event.Action.Delete() {
 				// apply whatever the expiry rule is.
-				applyExpiryRule(event, lcEventSrc_s3GetObject, objInfo)
+				applyExpiryRule(event, lcEventSrc_s3GetObject, expiryInfo)
 				if !event.Action.DeleteRestored() {
 					// If the ILM action is not on restored object return error.
 					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNoSuchKey), r.URL)
@@ -972,9 +974,10 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 				return
 			}
 			event := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, objInfo)
+			expiryInfo, event := recheckReadExpiry(ctx, objectAPI, objInfo, event)
 			if event.Action.Delete() {
 				// apply whatever the expiry rule is.
-				applyExpiryRule(event, lcEventSrc_s3HeadObject, objInfo)
+				applyExpiryRule(event, lcEventSrc_s3HeadObject, expiryInfo)
 				if !event.Action.DeleteRestored() {
 					// If the ILM action is not on restored object return error.
 					writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrNoSuchKey))
@@ -1468,12 +1471,35 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		return checkCopyObjectPreconditions(ctx, w, r, o)
 	}
 	getOpts.CheckPrecondFn = checkCopyPrecondFn
-	if cpSrcDstSame {
-		getOpts.NoLock = true
+
+	// Lock the source for reading and a local destination for writing before
+	// the source is opened, both in the lock domain of their writers. Taking
+	// them together in one order keeps copies in opposite directions from
+	// holding each other; a copy onto itself takes one write lock. The source
+	// is then read, preconditions and inline data included, and the
+	// destination looked up and written, all under these locks and without
+	// taking them again. That work runs in lockCtx, which ends when either
+	// lock is lost and so aborts the copy; errors are still reported in the
+	// request's context. Both locks are released once the copy has been
+	// written: a synchronous replication below reads the destination with its
+	// own lock.
+	locks := []objectLockRequest{{bucket: srcBucket, object: srcObject}}
+	if !remoteCallRequired {
+		locks = append(locks, objectLockRequest{bucket: dstBucket, object: dstObject, write: true})
 	}
+	lkctx, unlock, err := objectAPI.lockObjects(ctx, locks...)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	unlockCopy := sync.OnceFunc(unlock)
+	defer unlockCopy()
+	lockCtx := lkctx.Context()
+	getOpts.NoLock = true
+	dstOpts.NoLock = true
 
 	var rs *HTTPRangeSpec
-	gr, err := getObjectNInfo(ctx, srcBucket, srcObject, rs, r.Header, getOpts)
+	gr, err := getObjectNInfo(lockCtx, srcBucket, srcObject, rs, r.Header, getOpts)
 	if err != nil {
 		if isErrPreconditionFailed(err) {
 			return
@@ -1540,7 +1566,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	length := actualSize
 
 	if !cpSrcDstSame {
-		if err := enforceBucketQuotaHard(ctx, dstBucket, actualSize); err != nil {
+		if err := enforceBucketQuotaHard(lockCtx, dstBucket, actualSize); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
@@ -1558,12 +1584,12 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		compressMetadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
 		compressMetadata[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(actualSize, 10)
 
-		reader = etag.NewReader(ctx, reader, nil, nil)
+		reader = etag.NewReader(lockCtx, reader, nil, nil)
 	} else {
 		reader = gr
 	}
 
-	srcInfo.Reader, err = hash.NewReader(ctx, reader, length, "", "", actualSize)
+	srcInfo.Reader, err = hash.NewReader(lockCtx, reader, length, "", "", actualSize)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -1658,7 +1684,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			}
 		}
 
-		if err = rotateKey(ctx, oldKey, newKeyID, newKey, srcBucket, srcObject, encMetadata, kmsCtx); err != nil {
+		if err = rotateKey(lockCtx, oldKey, newKeyID, newKey, srcBucket, srcObject, encMetadata, kmsCtx); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
@@ -1743,7 +1769,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			dstOpts.IndexCB = cb
 			defer s2c.Close()
 			reader = etag.Wrap(s2c, checksumReader)
-			srcInfo.Reader, err = hash.NewReader(ctx, reader, -1, "", "", actualSize)
+			srcInfo.Reader, err = hash.NewReader(lockCtx, reader, -1, "", "", actualSize)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -1756,7 +1782,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		if isTargetEncrypted && !remoteCallRequired {
 			var encReader io.Reader
 			kind, _ := crypto.IsRequested(r.Header)
-			encReader, objEncKey, err = newEncryptReader(ctx, srcInfo.Reader, kind, newKeyID, newKey, dstBucket, dstObject, encMetadata, kmsCtx)
+			encReader, objEncKey, err = newEncryptReader(lockCtx, srcInfo.Reader, kind, newKeyID, newKey, dstBucket, dstObject, encMetadata, kmsCtx)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -1771,7 +1797,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		}
 
 		// do not try to verify encrypted content
-		srcInfo.Reader, err = hash.NewReader(ctx, reader, targetSize, "", "", actualSize)
+		srcInfo.Reader, err = hash.NewReader(lockCtx, reader, targetSize, "", "", actualSize)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -1843,7 +1869,12 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	srcInfo.UserDefined = objectlock.FilterObjectLockMetadata(srcInfo.UserDefined, true, true)
 	retPerms := isPutActionAllowed(ctx, getRequestAuthType(r), dstBucket, dstObject, r, policy.PutObjectRetentionAction)
 	holdPerms := isPutActionAllowed(ctx, getRequestAuthType(r), dstBucket, dstObject, r, policy.PutObjectLegalHoldAction)
-	getObjectInfo := objectAPI.GetObjectInfo
+	// The destination is locked above: look it up without its lock, in the
+	// locks' context.
+	getObjectInfo := func(_ context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+		opts.NoLock = true
+		return objectAPI.GetObjectInfo(lockCtx, bucket, object, opts)
+	}
 
 	// apply default bucket configuration/governance headers for dest side.
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, dstBucket, dstObject, getObjectInfo, retPerms, holdPerms, replicaTrusted)
@@ -2029,9 +2060,11 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		// For an ordinary federated copy, actualSize is the logical plaintext
 		// length to declare. srcInfo.Size is not a reliable wire length because
 		// the read path may already have adjusted it.
-		writeCtx, modified := withFederatedWriteTime(ctx)
+		writeCtx, modified := withFederatedWriteTime(lockCtx)
 		remoteObjInfo, rerr := core.PutObject(writeCtx, dstBucket, dstObject, srcInfo.Reader,
 			actualSize, "", "", opts)
+		gr.Close()
+		unlockCopy()
 		if rerr != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, rerr), r.URL)
 			return
@@ -2078,7 +2111,9 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 		// Copy source object to destination, if source and destination
 		// object is same then only metadata is updated.
-		objInfo, err = copyObjectFn(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, copySrcOpts, dstOpts)
+		objInfo, err = copyObjectFn(lockCtx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, copySrcOpts, dstOpts)
+		gr.Close()
+		unlockCopy()
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -3951,7 +3986,13 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
+	// Preserve a failed restore read even before the request body is parsed.
+	opts.Transition.RestoreRequest = &RestoreObjectRequest{}
+	// Resolve the target without the object lock; the status step below
+	// takes the restore lock and then the object lock.
+	preOpts := opts
+	preOpts.NoLock = true
+	objInfo, err := getObjectInfo(ctx, bucket, object, preOpts)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -3976,46 +4017,56 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		writeErrorResponse(ctx, w, apiErr, r.URL)
 		return
 	}
+	opts.Transition.RestoreRequest = rreq
 	statusCode := http.StatusOK
-	alreadyRestored := false
-	if err == nil {
-		if objInfo.RestoreOngoing && rreq.Type != SelectRestoreRequest {
+	// set or upgrade restore expiry
+	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
+
+	// update self with restore metadata
+	var (
+		attempt     *restoreAttempt
+		owner       *restoreOwner
+		restoreDate string
+	)
+	if rreq.Type != SelectRestoreRequest {
+		// Native restore needs every server to follow the restore lock and
+		// the staged commit; refuse it, writing nothing, while that is not
+		// established.
+		if err := nativeRestoreAvailable(ctx); err != nil {
+			apiErr := errorCodes.ToAPIErr(ErrBusy)
+			apiErr.Code, apiErr.Description = "ServiceUnavailable", err.Error()
+			writeErrorResponse(ctx, w, apiErr, r.URL)
+			return
+		}
+		// Decide on a fresh read under the object lock: renew a restored copy
+		// that is still there, or mark the version ongoing for a new attempt.
+		// Only the version resolved above, with its identity, is restored.
+		statusOpts := opts
+		statusOpts.Transition.RestoreExpiry = restoreExpiry
+		status, err := objectAPI.restoreRequest(GlobalContext, bucket, object, statusOpts, objInfo)
+		if errors.Is(err, errRestoreInProgress) {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrObjectRestoreAlreadyInProgress), r.URL)
 			return
 		}
-		if !objInfo.RestoreOngoing && !objInfo.RestoreExpires.IsZero() {
-			statusCode = http.StatusAccepted
-			alreadyRestored = true
-		}
-	}
-	// set or upgrade restore expiry
-	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
-	metadata := cloneMSS(objInfo.UserDefined)
-
-	// update self with restore metadata
-	if rreq.Type != SelectRestoreRequest {
-		objInfo.metadataOnly = true // Perform only metadata updates.
-		metadata[xhttp.AmzRestoreExpiryDays] = strconv.Itoa(rreq.Days)
-		metadata[xhttp.AmzRestoreRequestDate] = time.Now().UTC().Format(http.TimeFormat)
-		if alreadyRestored {
-			metadata[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
-		} else {
-			metadata[xhttp.AmzRestore] = ongoingRestoreObj().String()
-		}
-		objInfo.UserDefined = metadata
-		if _, err := objectAPI.CopyObject(GlobalContext, bucket, object, bucket, object, objInfo, ObjectOptions{
-			VersionID: objInfo.VersionID,
-		}, ObjectOptions{
-			VersionID: objInfo.VersionID,
-			MTime:     objInfo.ModTime,
-		}); err != nil {
+		if errors.As(err, &InvalidObjectState{}) || errors.As(err, &MethodNotAllowed{}) {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidObjectState), r.URL)
 			return
 		}
-		// for previously restored object, just update the restore expiry
-		if alreadyRestored {
+		if err != nil {
+			// Such as a read quorum error while telling whether it restores.
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
+		// Events keep the version ID as this request resolved it.
+		status.objInfo.VersionID = objInfo.VersionID
+		objInfo = status.objInfo
+		// for previously restored object, just update the restore expiry
+		if status.attempt == nil {
+			return
+		}
+		attempt = status.attempt
+		// The restore lock goes to the worker below, which releases it.
+		owner, restoreDate = status.owner, status.date
 	}
 
 	restoreObject := mustGetUUID()
@@ -4035,6 +4086,9 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	// now process the restore in background
 	go func() {
 		rctx := GlobalContext
+		// The restore releases the lock it was handed; this covers a path
+		// that does not reach it. Releasing twice is a no-op.
+		defer owner.release()
 		if !rreq.SelectParameters.IsEmpty() {
 			actualSize, err := objInfo.GetActualSize()
 			if err != nil {
@@ -4080,14 +4134,20 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 			rreq.SelectParameters.Close()
 			return
 		}
-		opts := ObjectOptions{
+		// The versioning context and the explicit version POST resolved.
+		restoreOpts := ObjectOptions{
 			Transition: TransitionOptions{
 				RestoreRequest: rreq,
 				RestoreExpiry:  restoreExpiry,
+				attempt:        attempt,
+				owner:          owner,
+				restoreDate:    restoreDate,
 			},
-			VersionID: objInfo.VersionID,
+			VersionID:        attempt.VersionID,
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
 		}
-		if err := objectAPI.RestoreTransitionedObject(rctx, bucket, object, opts); err != nil {
+		if err := objectAPI.RestoreTransitionedObject(rctx, bucket, object, restoreOpts); err != nil {
 			s3LogIf(ctx, fmt.Errorf("Unable to restore transitioned bucket/object %s/%s: %w", bucket, object, err))
 			return
 		}

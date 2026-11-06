@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"sort"
 	"strings"
@@ -670,7 +671,9 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 // deleteObjectsReconciled removes data while retaining each item's authoritative
 // copy until every other pool has completed its cleanup. The caller holds the
 // pools-layer write locks and separates marker creation from this batch.
-func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
+// approved holds the Object Lock state each checked ILM expiry was approved
+// with, see ExpirationOptions.ApprovedProtection.
+func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket string, objects []ObjectToDelete, approved []objectLockState, opts ObjectOptions) ([]DeletedObject, []error) {
 	deleted := make([]DeletedObject, len(objects))
 	errs := make([]error, len(objects))
 	primary := make([]int, len(objects))
@@ -760,11 +763,23 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 		}
 		deleteOpts := opts
 		deleteOpts.VersionID, deleteOpts.NoLock = obj.VersionID, true
+		// DeleteObjects already checked ordinary ILM UUID/explicit null
+		// versions against all pools. Empty IDs and user deletes have no such
+		// authorization; restored-copy expiry uses the single-object path.
+		deleteOpts.Expiration.CheckedAllPools = opts.Expiration.Expire && obj.VersionID != ""
+		if deleteOpts.Expiration.CheckedAllPools {
+			deleteOpts.Expiration.ApprovedProtection = approved[i]
+		}
 		deleteOpts.DeleteReplication = obj.ReplicationState()
 		if opts.PrefixEnabledFn != nil {
 			deleteOpts.Versioned = opts.PrefixEnabledFn(obj.ObjectName)
 		}
 		_, err := z.deleteObjectReconciled(ctx, bucket, obj.ObjectName, deleteOpts)
+		if errors.Is(err, errLifecycleNotApplicable) {
+			// A later lifecycle rejection did not commit a local purge. Do
+			// not let the worker replicate the request's pending decision.
+			deleted[i].ReplicationState = ReplicationState{}
+		}
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			errs[i] = err
 		} else {
