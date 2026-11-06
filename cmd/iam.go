@@ -763,13 +763,13 @@ func (sys *IAMSys) DeleteUser(ctx context.Context, accessKey string, notifyPeers
 // CurrentPolicies - returns comma separated policy string, from
 // an input policy after validating if there are any current
 // policies which exist on MinIO corresponding to the input.
-func (sys *IAMSys) CurrentPolicies(policyName string) string {
+func (sys *IAMSys) CurrentPolicies(policyName string) (string, error) {
 	if !sys.Initialized() {
-		return ""
+		return "", errServerNotInitialized
 	}
 
-	policies, _ := sys.store.MergePolicies(policyName)
-	return policies
+	policies, _, err := sys.store.MergePolicies(policyName)
+	return policies, err
 }
 
 func (sys *IAMSys) notifyForUser(ctx context.Context, accessKey string, isTemp bool) {
@@ -2304,7 +2304,11 @@ func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string) 
 	var combinedPolicy policy.Policy
 	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(svcPolicies, ","))
+		availablePoliciesStr, c, err := sys.store.MergePolicies(strings.Join(svcPolicies, ","))
+		if err != nil {
+			iamLogIf(GlobalContext, err)
+			return false
+		}
 		if availablePoliciesStr == "" {
 			return false
 		}
@@ -2397,7 +2401,11 @@ func (sys *IAMSys) IsAllowedSTS(args policy.Args, parentUser string) bool {
 	var combinedPolicy policy.Policy
 	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(policies, ","))
+		availablePoliciesStr, c, err := sys.store.MergePolicies(strings.Join(policies, ","))
+		if err != nil {
+			iamLogIf(GlobalContext, err)
+			return false
+		}
 		if availablePoliciesStr == "" {
 			// all policies presented in the claim should exist
 			iamLogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing from the JWT claim %s, rejecting the request", policies, iamPolicyClaimNameOpenID()))
@@ -2527,16 +2535,21 @@ func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowe
 }
 
 // GetCombinedPolicy returns a combined policy combining all policies
-func (sys *IAMSys) GetCombinedPolicy(policies ...string) policy.Policy {
-	_, policy := sys.store.MergePolicies(strings.Join(policies, ","))
-	return policy
+func (sys *IAMSys) GetCombinedPolicy(policies ...string) (policy.Policy, error) {
+	_, combined, err := sys.store.MergePolicies(strings.Join(policies, ","))
+	return combined, err
 }
 
 // doesPolicyAllow - checks if the given policy allows the passed action with given args. This is rarely needed.
 // Notice there is no account name involved, so this is a dangerous function.
 func (sys *IAMSys) doesPolicyAllow(policy string, args policy.Args) bool {
 	// Policies were found, evaluate all of them.
-	return sys.GetCombinedPolicy(policy).IsAllowed(args)
+	combined, err := sys.GetCombinedPolicy(policy)
+	if err != nil {
+		iamLogIf(GlobalContext, err)
+		return false
+	}
+	return combined.IsAllowed(args)
 }
 
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
@@ -2590,7 +2603,12 @@ func (sys *IAMSys) isAllowedLocally(args policy.Args) bool {
 	}
 
 	// Policies were found, evaluate all of them.
-	return sys.GetCombinedPolicy(policies...).IsAllowed(args)
+	combined, err := sys.GetCombinedPolicy(policies...)
+	if err != nil {
+		iamLogIf(GlobalContext, err)
+		return false
+	}
+	return combined.IsAllowed(args)
 }
 
 // SetUsersSysType - sets the users system type, regular or LDAP.

@@ -1706,48 +1706,64 @@ func filterPolicies(cache *iamCache, policyName string, bucketName string) (stri
 	return strings.Join(policies, ","), policy.MergePolicies(toMerge...)
 }
 
-// MergePolicies - accepts a comma separated list of policy names as a string
-// and returns only policies that currently exist in MinIO. It includes hot loading
-// of policies if not in the memory
-func (store *IAMStoreSys) MergePolicies(policyName string) (string, policy.Policy) {
-	var policies []string
-	var missingPolicies []string
-	var toMerge []policy.Policy
-
+// MergePolicies loads and combines the named policies. Only confirmed absent
+// policies may be omitted: a failed read could hide an explicit Deny.
+func (store *IAMStoreSys) MergePolicies(policyName string) (string, policy.Policy, error) {
+	names := newMappedPolicy(policyName).toSlice()
+	allCached := true
 	cache := store.rlock()
-	for _, policy := range newMappedPolicy(policyName).toSlice() {
-		if policy == "" {
+	for _, name := range names {
+		if name == "" {
 			continue
 		}
-		p, found := cache.iamPolicyDocsMap[policy]
-		if !found {
-			missingPolicies = append(missingPolicies, policy)
-			continue
+		if _, found := cache.iamPolicyDocsMap[name]; !found {
+			allCached = false
+			break
 		}
-		policies = append(policies, policy)
-		toMerge = append(toMerge, p.Policy)
+	}
+	if allCached {
+		names, combined := filterPolicies(cache, policyName, "")
+		store.runlock()
+		return names, combined, nil
 	}
 	store.runlock()
 
-	if len(missingPolicies) > 0 {
-		m := make(map[string]PolicyDoc)
-		for _, policy := range missingPolicies {
+	// Re-read every document under the writer lock so a concurrent edit or
+	// deletion cannot be overwritten by a stale lazy load. Publish the loaded
+	// documents only when the whole selection succeeds.
+	cache = store.lock()
+	defer store.unlock()
+	var policies []string
+	var toMerge []policy.Policy
+	loaded := make(map[string]PolicyDoc)
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		p, found := cache.iamPolicyDocsMap[name]
+		if !found {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = store.loadPolicyDoc(ctx, policy, m)
+			err := store.loadPolicyDoc(ctx, name, loaded)
 			cancel()
+			if errors.Is(err, errNoSuchPolicy) {
+				continue
+			}
+			if err != nil {
+				return "", policy.Policy{}, fmt.Errorf("load IAM policy %q: %w", name, err)
+			}
+			p, found = loaded[name]
+			if !found {
+				return "", policy.Policy{}, fmt.Errorf("load IAM policy %q returned no document", name)
+			}
 		}
-
-		cache := store.lock()
-		maps.Copy(cache.iamPolicyDocsMap, m)
-		store.unlock()
-
-		for policy, p := range m {
-			policies = append(policies, policy)
-			toMerge = append(toMerge, p.Policy)
-		}
+		policies = append(policies, name)
+		toMerge = append(toMerge, p.Policy)
 	}
-
-	return strings.Join(policies, ","), policy.MergePolicies(toMerge...)
+	if len(loaded) > 0 {
+		maps.Copy(cache.iamPolicyDocsMap, loaded)
+		cache.updatedAt = time.Now()
+	}
+	return strings.Join(policies, ","), policy.MergePolicies(toMerge...), nil
 }
 
 // GetBucketUsers - returns users (not STS or service accounts) that have access

@@ -622,7 +622,11 @@ func (a adminAPIHandlers) TemporaryAccountInfo(w http.ResponseWriter, r *http.Re
 			policiesNames = policySet.ToSlice()
 		}
 
-		stsAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		stsAccountPolicy, err = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
 	}
 
 	policyJSON, err := json.MarshalIndent(stsAccountPolicy, "", " ")
@@ -987,7 +991,11 @@ func (a adminAPIHandlers) InfoServiceAccount(w http.ResponseWriter, r *http.Requ
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
 		}
-		svcAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		svcAccountPolicy, err = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
 	}
 
 	policyJSON, err := json.MarshalIndent(svcAccountPolicy, "", " ")
@@ -1466,6 +1474,7 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 	roleArn := policy.Args{Claims: cred.Claims}.GetRoleArn()
 	policySetFromClaims, hasPolicyClaim := policy.GetPoliciesFromClaims(cred.Claims, iamPolicyClaimNameOpenID())
 	var effectivePolicy policy.Policy
+	var policyErr error
 
 	var buf []byte
 	switch {
@@ -1489,10 +1498,10 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		policySlice := newMappedPolicy(policy).toSlice()
-		effectivePolicy = globalIAMSys.GetCombinedPolicy(policySlice...)
+		effectivePolicy, policyErr = globalIAMSys.GetCombinedPolicy(policySlice...)
 
 	case hasPolicyClaim:
-		effectivePolicy = globalIAMSys.GetCombinedPolicy(policySetFromClaims.ToSlice()...)
+		effectivePolicy, policyErr = globalIAMSys.GetCombinedPolicy(policySetFromClaims.ToSlice()...)
 
 	default:
 		policies, err := globalIAMSys.PolicyDBGet(accountName, cred.Groups...)
@@ -1501,7 +1510,11 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
 		}
-		effectivePolicy = globalIAMSys.GetCombinedPolicy(policies...)
+		effectivePolicy, policyErr = globalIAMSys.GetCombinedPolicy(policies...)
+	}
+	if policyErr != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, policyErr), r.URL)
+		return
 	}
 
 	buf, err = json.MarshalIndent(effectivePolicy, "", " ")
@@ -2189,7 +2202,11 @@ func (a adminAPIHandlers) InfoAccessKey(w http.ResponseWriter, r *http.Request) 
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
 		}
-		svcAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		svcAccountPolicy, err = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
 	}
 
 	policyJSON, err := json.MarshalIndent(svcAccountPolicy, "", " ")
@@ -2949,7 +2966,15 @@ func canManageRootCredentials(cred auth.Credentials) bool {
 func isAllowedServiceAccountAction(cred auth.Credentials, args policy.Args) bool {
 	if args.DenyOnly && !args.IsOwner && !cred.IsTemp() && !cred.IsServiceAccount() && newGlobalAuthZPluginFn() == nil {
 		policies, err := globalIAMSys.PolicyDBGet(args.AccountName, args.Groups...)
-		return err == nil && globalIAMSys.GetCombinedPolicy(policies...).IsAllowed(args)
+		if err != nil {
+			return false
+		}
+		combined, err := globalIAMSys.GetCombinedPolicy(policies...)
+		if err != nil {
+			iamLogIf(GlobalContext, err)
+			return false
+		}
+		return combined.IsAllowed(args)
 	}
 	return globalIAMSys.IsAllowed(args)
 }

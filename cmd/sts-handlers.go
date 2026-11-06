@@ -797,7 +797,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		policySet, ok := policy.GetPoliciesFromClaims(claims, iamPolicyClaimNameOpenID())
 		policies := strings.Join(policySet.ToSlice(), ",")
 		if ok {
-			policyName = globalIAMSys.CurrentPolicies(policies)
+			current, err := globalIAMSys.CurrentPolicies(policies)
+			if err != nil {
+				writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+				return
+			}
+			policyName = current
 		}
 
 		if newGlobalAuthZPluginFn() == nil {
@@ -881,7 +886,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			}
 			if newGlobalAuthZPluginFn() == nil {
 				// if authZ is not set - we expect the policies to be present.
-				if globalIAMSys.CurrentPolicies(p) == "" {
+				current, err := globalIAMSys.CurrentPolicies(p)
+				if err != nil {
+					writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+					return
+				}
+				if current == "" {
 					writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 						fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", p))
 					return
@@ -1366,7 +1376,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *h
 	}
 
 	if newGlobalAuthZPluginFn() == nil { // if authZ is not set - we expect the policyname to be present.
-		if globalIAMSys.CurrentPolicies(policyName) == "" {
+		current, err := globalIAMSys.CurrentPolicies(policyName)
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+			return
+		}
+		if current == "" {
 			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 				fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", policyName))
 			return
