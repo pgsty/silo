@@ -1916,12 +1916,18 @@ func (j *BatchJobRequest) load(ctx context.Context, api ObjectLayer, name string
 
 	if bytes.HasPrefix(job, []byte("SILO-BATCH")) {
 		if !bytes.HasPrefix(job, []byte(batchJobEnvelope)) {
-			return errors.New("unsupported batch job envelope version")
+			return fmt.Errorf("%w: unsupported batch job envelope version", errInvalidBatchJobManifest)
 		}
 		job = job[len(batchJobEnvelope):]
 	}
 	_, err = j.UnmarshalMsg(job)
-	return err
+	if err != nil {
+		return fmt.Errorf("%w: %v", errInvalidBatchJobManifest, err)
+	}
+	if j.ID == "" {
+		return fmt.Errorf("%w: missing job ID", errInvalidBatchJobManifest)
+	}
+	return nil
 }
 
 func batchReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts minio.PutObjectOptions, isMP bool, err error) {
@@ -2042,6 +2048,8 @@ func (a adminAPIHandlers) BatchJobStatus(w http.ResponseWriter, r *http.Request)
 }
 
 var errNoSuchJob = errors.New("no such job")
+
+var errInvalidBatchJobManifest = errors.New("invalid batch job manifest")
 
 // DescribeBatchJob returns the currently active batch job definition
 func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Request) {
@@ -2320,22 +2328,48 @@ func (j *BatchJobPool) cleanupReports(randomWait func() time.Duration) {
 func (j *BatchJobPool) resume(randomWait func() time.Duration) {
 	timer := time.NewTimer(randomWait())
 	defer timer.Stop()
-	select {
-	case <-j.ctx.Done():
-		return
-	case <-timer.C:
+	// A retry scans the manifest prefix again, but only unadmitted paths may
+	// create owners. A worker can finish (and release ownership) before a
+	// later scan; re-admitting that manifest could rerun a failed partial job.
+	admitted := make(map[string]struct{})
+	for retries := uint(0); ; retries++ {
+		select {
+		case <-j.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if !j.resumeOnce(admitted) {
+			return
+		}
+		timer.Reset(batchJobRetryDelay(retries))
 	}
+}
 
+// resumeOnce returns whether discovery was incomplete. Already removed or
+// canceled manifests are settled; uncertain reads remain eligible for retry.
+func (j *BatchJobPool) resumeOnce(admitted map[string]struct{}) bool {
 	results := make(chan itemOrErr[ObjectInfo], 100)
 	ctx, cancel := context.WithCancel(j.ctx)
 	defer cancel()
 	if err := j.objLayer.Walk(ctx, minioMetaBucket, batchJobPrefix, results, WalkOptions{}); err != nil {
 		batchLogIf(j.ctx, err)
-		return
+		return true
 	}
-	for result := range results {
+	incomplete := false
+	for {
+		var result itemOrErr[ObjectInfo]
+		select {
+		case <-ctx.Done():
+			return false
+		case next, ok := <-results:
+			if !ok {
+				return incomplete
+			}
+			result = next
+		}
 		if result.Err != nil {
 			batchLogIf(j.ctx, result.Err)
+			incomplete = true
 			continue
 		}
 		if strings.HasPrefix(result.Item.Name, batchJobReportsPrefix+slashSeparator) {
@@ -2345,9 +2379,20 @@ func (j *BatchJobPool) resume(randomWait func() time.Duration) {
 		if strings.HasSuffix(result.Item.Name, slashSeparator) {
 			continue
 		}
+		if _, ok := admitted[result.Item.Name]; ok {
+			continue
+		}
 		req := &BatchJobRequest{}
 		if err := req.load(ctx, j.objLayer, result.Item.Name); err != nil {
-			batchLogIf(ctx, err)
+			if !errors.Is(err, errNoSuchJob) {
+				batchLogIf(ctx, err)
+				// Unsupported or malformed definitions cannot recover through
+				// another storage read. Keep them on disk for inspection, but
+				// do not let one prevent discovery and report cleanup finishing.
+				if !errors.Is(err, errInvalidBatchJobManifest) {
+					incomplete = true
+				}
+			}
 			continue
 		}
 		_, nodeIdx := parseRequestToken(req.ID)
@@ -2356,9 +2401,16 @@ func (j *BatchJobPool) resume(randomWait func() time.Duration) {
 			continue
 		}
 		if err := j.queueJob(req); err != nil {
+			if errors.Is(err, context.Canceled) {
+				// A tombstone is authoritative even if Walk saw the manifest
+				// before cancellation removed it from storage.
+				continue
+			}
 			batchLogIf(ctx, err)
+			incomplete = true
 			continue
 		}
+		admitted[result.Item.Name] = struct{}{}
 	}
 }
 

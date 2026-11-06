@@ -98,7 +98,7 @@ func TestBatchPluginPauseRecoversInProcess(t *testing.T) {
 			}
 			unavailable.Store(false)
 			pool.retryDue(time.Now().Add(time.Hour))
-			waitBatchState(t, pool, job.ID, "")
+			waitBatchState(t, pool, job.ID, "terminal")
 			ri = f.jobInfo(t, job)
 			if !ri.Complete || ri.Failed || ri.PausedReason != "" || ri.Objects != 1 || f.versionExists(t, "data/key", older) {
 				t.Fatalf("resumed report: %+v", ri)
@@ -149,6 +149,10 @@ func TestBatchPoolOwnershipAndCancellation(t *testing.T) {
 		t.Fatal("first not owned")
 	}
 	pool.finishJob(first, nil)
+	mustIAM(t, pool.queueJob(&BatchJobRequest{ID: first.ID}))
+	if len(pool.jobCh) != 0 {
+		t.Fatal("late discovery re-admitted a terminal job")
+	}
 	pool.retryDue(time.Now())
 	next := <-pool.jobCh
 	if next != second || !pool.beginJob(next) {

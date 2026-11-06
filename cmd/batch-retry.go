@@ -105,8 +105,9 @@ func validateBatchJobAdminReq(ctx context.Context, w http.ResponseWriter, r *htt
 }
 
 // One owner record spans queued, running and paused attempts. The request
-// pointer is the generation token. Canceled records are tombstones until
-// process shutdown, so a manifest loaded before cancellation cannot requeue.
+// pointer is the generation token. Canceled and terminal records are small
+// tombstones until process shutdown, so a delayed discovery cannot requeue a
+// job after its owner finished, including a terminal partial failure.
 type batchJobOwner struct {
 	req     *BatchJobRequest
 	cancel  context.CancelFunc
@@ -134,14 +135,18 @@ func (j *BatchJobPool) finishJob(job *BatchJobRequest, err error) {
 		return
 	}
 	if isBatchJobUnavailable(err) && job.ctx.Err() == nil && j.ctx.Err() == nil {
-		delay := 30 * time.Second * time.Duration(1<<min(o.retries, 4))
+		o.due = time.Now().Add(batchJobRetryDelay(o.retries))
 		o.retries++
-		o.due = time.Now().Add(delay/2 + time.Duration(rand.Float64()*float64(delay)))
 		o.state = "paused"
 		return
 	}
 	o.cancel()
-	delete(j.jobOwners, job.ID)
+	j.jobOwners[job.ID] = &batchJobOwner{state: "terminal"}
+}
+
+func batchJobRetryDelay(retries uint) time.Duration {
+	delay := 30 * time.Second * time.Duration(1<<min(retries, 4))
+	return delay/2 + time.Duration(rand.Float64()*float64(delay))
 }
 
 // retryDue holds the ownership lock across the nonblocking handoff. A fast
