@@ -23,6 +23,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -318,16 +319,18 @@ func (s *erasureSets) sharesLocalNSLock() bool {
 
 // deleteObjectsInSets is the bulk delete of a single pool whose sets do not
 // share one lock table. The names are grouped by the set they hash to, the
-// lock domain of their writers. The groups run one after another in ascending
-// set index; each takes its set's lock over all of its names in one
-// acquisition, deletes its sub-batch, and releases the lock before the next
-// group starts. No two sets' locks are held at once.
+// lock domain of their writers. The groups run concurrently, up to
+// deleteSetGroupsLimit at a time, as the sets of one bulk delete did before;
+// each takes its set's lock over all of its names in one acquisition, deletes
+// its sub-batch, and releases the lock. A group holds only its own set's lock
+// and waits for no other, so the groups cannot hold each other.
 //
 // Each group's lock is taken in the request's context. A group whose lock
-// cannot be taken fails as a whole and the next group still runs; once the
-// request is canceled the remaining groups fail without being attempted. The
-// results keep their positions in objects. Replication, events and auditing
-// stay with the callers, on the merged results.
+// cannot be taken fails as a whole and the other groups still run; a group
+// that starts after the request was canceled fails without storage work.
+// Each result is written only by the group of its object and keeps its
+// position in objects. Replication, events and auditing stay with the
+// callers, on the merged results.
 func (z *erasureServerPools) deleteObjectsInSets(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions, dobjects []DeletedObject, derrs []error, timeout *dynamicTimeout) {
 	pool := z.serverPools[0]
 	groups := make(map[int][]int)
@@ -341,45 +344,63 @@ func (z *erasureServerPools) deleteObjectsInSets(ctx context.Context, bucket str
 	}
 	slices.Sort(order)
 
+	sem := make(chan struct{}, min(len(order), deleteSetGroupsLimit))
+	var wg sync.WaitGroup
 	for _, idx := range order {
 		members := groups[idx]
-		fail := func(err error) {
-			for _, i := range members {
-				derrs[i] = err
-			}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			z.deleteObjectsInSet(ctx, bucket, pool.sets[idx], objects, members, opts, dobjects, derrs, timeout)
+		}()
+	}
+	wg.Wait()
+}
+
+// deleteSetGroupsLimit bounds how many sets a bulk delete of one pool works
+// on at once.
+var deleteSetGroupsLimit = 16
+
+// deleteObjectsInSet deletes the members of objects, which all hash to er,
+// under er's lock, and writes their results. Nothing else writes them.
+func (z *erasureServerPools) deleteObjectsInSet(ctx context.Context, bucket string, er *erasureObjects, objects []ObjectToDelete, members []int, opts ObjectOptions, dobjects []DeletedObject, derrs []error, timeout *dynamicTimeout) {
+	fail := func(err error) {
+		for _, i := range members {
+			derrs[i] = err
 		}
-		if err := ctx.Err(); err != nil {
-			fail(err)
+	}
+	if err := ctx.Err(); err != nil {
+		fail(err)
+		return
+	}
+	names := set.NewStringSet()
+	batch := make([]ObjectToDelete, len(members))
+	for j, i := range members {
+		names.Add(objects[i].ObjectName)
+		batch[j] = objects[i]
+	}
+	resources := names.ToSlice()
+	lkctx, unlock, err := getNSLocks(ctx, []nsLockRequest{{
+		newLock: func() RWLocker { return er.NewNSLock(bucket, resources...) },
+		write:   true,
+		atomic:  er.nsMutex.isDistErasure || len(resources) == 1,
+	}}, timeout)
+	if err != nil {
+		fail(err)
+		return
+	}
+	deleted, errs := er.DeleteObjects(lkctx.Context(), bucket, batch, opts)
+	unlock()
+	// Merge as the pools loop of DeleteObjects does for one pool.
+	for j, i := range members {
+		if errs[j] == nil && deleted[j].found {
+			dobjects[i], derrs[i] = deleted[j], nil
 			continue
 		}
-		er := pool.sets[idx]
-		names := set.NewStringSet()
-		batch := make([]ObjectToDelete, len(members))
-		for j, i := range members {
-			names.Add(objects[i].ObjectName)
-			batch[j] = objects[i]
-		}
-		resources := names.ToSlice()
-		lkctx, unlock, err := getNSLocks(ctx, []nsLockRequest{{
-			newLock: func() RWLocker { return er.NewNSLock(bucket, resources...) },
-			write:   true,
-			atomic:  er.nsMutex.isDistErasure || len(resources) == 1,
-		}}, timeout)
-		if err != nil {
-			fail(err)
-			continue
-		}
-		deleted, errs := er.DeleteObjects(lkctx.Context(), bucket, batch, opts)
-		unlock()
-		// Merge as the pools loop of DeleteObjects does for one pool.
-		for j, i := range members {
-			if errs[j] == nil && deleted[j].found {
-				dobjects[i], derrs[i] = deleted[j], nil
-				continue
-			}
-			if derrs[i] == nil {
-				dobjects[i], derrs[i] = deleted[j], errs[j]
-			}
+		if derrs[i] == nil {
+			dobjects[i], derrs[i] = deleted[j], errs[j]
 		}
 	}
 }
