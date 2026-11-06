@@ -149,12 +149,28 @@ const (
 	nsLockRetryWait = 250 * time.Millisecond
 )
 
+// getNSLocksEvent, when a test sets it, is told when getNSLocks gives up a
+// bounded wait ("bounded-timeout"), starts to wait for that lock alone
+// ("idle-wait") and got it ("idle-acquired"), with the index of the lock.
+var getNSLocksEvent func(event string, index int)
+
+func nsLocksEvent(event string, index int) {
+	if f := getNSLocksEvent; f != nil {
+		f(event, index)
+	}
+}
+
 // getNSLocks acquires every lock of locks, in their order, or none. While it
 // holds a lock it waits for the next one only up to nsLockTryTimeout; then it
-// releases what it holds in reverse order, pauses, and tries again with a
-// fresh context, until the timeout of all attempts. A wait that holds nothing
-// can last for the rest of the timeout. Each lock is taken in the context of
-// the one before, so the returned context ends when any lease is lost.
+// releases what it holds in reverse order. It then waits for the lock that
+// timed out alone, holding nothing, releases it once it got it, pauses, and
+// tries again from the first lock with fresh instances, until the timeout of
+// all attempts. So a lock it waits for long never keeps an earlier one from
+// others. A non-atomic request can hold some of its own names while it
+// waits, so it is not waited for alone; it is retried as before. A wait that
+// holds nothing can last for the rest of the timeout. Each lock is taken in
+// the context of the one before, so the returned context ends when any
+// lease is lost.
 func getNSLocks(ctx context.Context, locks []nsLockRequest, timeout *dynamicTimeout) (LockContext, func(), error) {
 	type held struct {
 		lock  RWLocker
@@ -184,7 +200,8 @@ func getNSLocks(ctx context.Context, locks []nsLockRequest, timeout *dynamicTime
 		hs := make([]held, 0, len(locks))
 		lctx := ctx
 		var err error
-		for _, l := range locks {
+		blocked := -1
+		for k, l := range locks {
 			wait := time.Until(deadline)
 			if len(hs) > 0 || !l.atomic {
 				wait = min(wait, nsLockTryTimeout)
@@ -209,6 +226,10 @@ func getNSLocks(ctx context.Context, locks []nsLockRequest, timeout *dynamicTime
 			}
 			cancel()
 			if err != nil {
+				if len(hs) > 0 && l.atomic && errors.As(err, &OperationTimedOut{}) {
+					blocked = k
+					nsLocksEvent("bounded-timeout", k)
+				}
 				break
 			}
 			if !l.atomic {
@@ -229,6 +250,41 @@ func getNSLocks(ctx context.Context, locks []nsLockRequest, timeout *dynamicTime
 		// request's own context ends the attempts.
 		if ctx.Err() != nil || (!errors.As(err, &OperationTimedOut{}) && !errors.Is(err, context.Canceled)) {
 			return LockContext{}, nil, err
+		}
+		if blocked >= 0 {
+			// Wait for the lock that timed out alone, holding nothing, with
+			// a fresh instance, and release it once it is free: the next
+			// attempt takes every lock again in their order.
+			l := locks[blocked]
+			wait := time.Until(deadline)
+			if wait <= 0 {
+				timeout.LogFailure()
+				return LockContext{}, nil, OperationTimedOut{}
+			}
+			nsLocksEvent("idle-wait", blocked)
+			lk := l.newLock()
+			try := newDynamicTimeout(wait, wait)
+			var lkctx LockContext
+			if l.write {
+				lkctx, err = lk.GetLock(ctx, try)
+			} else {
+				lkctx, err = lk.GetRLock(ctx, try)
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					return LockContext{}, nil, failed()
+				}
+				if errors.As(err, &OperationTimedOut{}) {
+					timeout.LogFailure()
+				}
+				return LockContext{}, nil, err
+			}
+			if l.write {
+				lk.Unlock(lkctx)
+			} else {
+				lk.RUnlock(lkctx)
+			}
+			nsLocksEvent("idle-acquired", blocked)
 		}
 		pause := rand.N(nsLockRetryWait) + time.Millisecond
 		if time.Until(deadline) <= pause {
