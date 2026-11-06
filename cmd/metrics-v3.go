@@ -397,6 +397,7 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 			ilmTransitionPendingTasksMD,
 			ilmTransitionMissedImmediateTasksMD,
 			ilmVersionsScannedMD,
+			ilmExpiryIncompleteTotalMD,
 		},
 		loadILMMetrics,
 	)

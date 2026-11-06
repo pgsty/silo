@@ -39,7 +39,6 @@ import (
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
-	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
@@ -656,7 +655,8 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	// leaves a durable free-version record until the remote delete succeeds;
 	// that record is the retry point if the process stops between the two
 	// operations.
-	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
+	dobj, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
+	if err != nil {
 		return err
 	}
 
@@ -669,14 +669,16 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	// Send audit for the lifecycle delete operation
 	defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
-	eventName := event.ObjectRemovedDelete
-	if oi.DeleteMarker {
-		eventName = event.ObjectRemovedDeleteMarkerCreated
-	}
+	// Name what the delete did: a marker it created, or the version it
+	// removed.
+	eventName := ilmExpiryEventName(opts.VersionID, dobj)
 	objInfo := ObjectInfo{
 		Name:         oi.Name,
-		VersionID:    oi.VersionID,
-		DeleteMarker: oi.DeleteMarker,
+		VersionID:    dobj.VersionID,
+		DeleteMarker: dobj.DeleteMarker,
+	}
+	if objInfo.VersionID == "" {
+		objInfo.VersionID = opts.VersionID
 	}
 	// Notify object deleted event.
 	sendEvent(eventArgs{

@@ -1210,10 +1210,7 @@ func applyTransitionRule(event lifecycle.Event, src lcEventSrc, obj ObjectInfo) 
 func applyExpiryOnTransitionedObject(ctx context.Context, objLayer ObjectLayer, obj ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) (ok bool) {
 	timeILM := globalScannerMetrics.timeILM(lcEvent.Action)
 	if err := expireTransitionedObject(ctx, objLayer, &obj, lcEvent, src); err != nil {
-		if errors.Is(err, errLifecycleNotApplicable) || isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-			return false
-		}
-		ilmLogIf(ctx, fmt.Errorf("expireTransitionedObject(%s, %s): %w", obj.Bucket, obj.Name, err))
+		reportILMExpiryNotDone(ctx, obj, lcEvent, src, err, "transition-expiry"+obj.Name, globalLifecycleSys.trace(obj))
 		return false
 	}
 	timeILM(1)
@@ -1272,14 +1269,10 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		return deleteAllNotCompleted(ctx, obj, lcEvent, src, purge, err, traceFn)
 	}
 	if err != nil {
-		if errors.Is(err, errLifecycleNotApplicable) || isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+		// Assume it is still there, unless it is gone already.
+		if !reportILMExpiryNotDone(ctx, obj, lcEvent, src, err, "non-transition-expiry"+obj.Name, traceFn) {
 			traceFn(ILMExpiry, nil, nil)
-			return false
 		}
-		// Assume it is still there.
-		err := fmt.Errorf("DeleteObject(%s, %s): %w", obj.Bucket, obj.Name, err)
-		ilmLogOnceIf(ctx, err, "non-transition-expiry"+obj.Name)
-		traceFn(ILMExpiry, nil, err)
 		return false
 	}
 	if dobj.Name == "" {
@@ -1295,10 +1288,7 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	// Send audit for the lifecycle delete operation
 	auditLogLifecycle(ctx, dobj, ILMExpiry, tags, traceFn)
 
-	eventName := event.ObjectRemovedDelete
-	if obj.DeleteMarker {
-		eventName = event.ObjectRemovedDeleteMarkerCreated
-	}
+	eventName := ilmExpiryEventName(opts.VersionID, dobj)
 	switch lcEvent.Action {
 	case lifecycle.DeleteAllVersionsAction:
 		eventName = event.ObjectRemovedDeleteAllVersions

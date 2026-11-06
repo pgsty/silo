@@ -1246,6 +1246,15 @@ func TestPoolsLifecycleNullGenerations(t *testing.T) {
 // and ILM expiry audit traces report.
 func authoritySideEffects(t *testing.T, run func()) (notified, traced []string) {
 	t.Helper()
+	notified, traced, _ = authoritySideEffectsAll(t, run)
+	return notified, traced
+}
+
+// authoritySideEffectsAll also returns, by version ID, the result an ILM
+// trace reports for an expiry that did not remove its version: "refused" or
+// "failed". Such traces are not removal traces.
+func authoritySideEffectsAll(t *testing.T, run func()) (notified, traced []string, incomplete map[string]string) {
+	t.Helper()
 	done := make(chan struct{})
 	defer close(done)
 	events := make(chan event.Event, 16)
@@ -1257,19 +1266,25 @@ func authoritySideEffects(t *testing.T, run func()) (notified, traced []string) 
 		t.Fatal(err)
 	}
 	run()
+	incomplete = map[string]string{}
 	// Both publishers deliver synchronously, so everything sent is buffered.
 	for {
 		select {
 		case ev := <-events:
 			notified = append(notified, ev.S3.Object.VersionID)
 		case tr := <-traces:
-			if tr.FuncName == ILMExpiry {
-				traced = append(traced, tr.Custom["version-id"])
+			if tr.FuncName != ILMExpiry {
+				continue
 			}
+			if r := tr.Custom["result"]; r != "" {
+				incomplete[tr.Custom["version-id"]] = r
+				continue
+			}
+			traced = append(traced, tr.Custom["version-id"])
 		default:
 			slices.Sort(notified)
 			slices.Sort(traced)
-			return notified, traced
+			return notified, traced, incomplete
 		}
 	}
 }
@@ -1283,9 +1298,12 @@ func TestPoolsLifecycleBatchQuorumNotAnnounced(t *testing.T) {
 	id := s.ids[key+" old"]
 	lifecycleReadDisks(t, s, key, 1, errDiskNotFound)
 	result := &lifecycleBatchResult{ObjectLayer: s.z}
-	notified, traced := authoritySideEffects(t, func() {
+	notified, traced, incomplete := authoritySideEffectsAll(t, func() {
 		deleteObjectVersions(t.Context(), result, s.bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: key, VersionID: id}}}, []lifecycle.Event{{Action: lifecycle.DeleteVersionAction}})
 	})
+	if incomplete[id] != "failed" {
+		t.Errorf("unapplied expiry not reported as failed: %v", incomplete)
+	}
 	if !isErrWriteQuorum(result.errs[0]) {
 		t.Fatalf("fixture result: %v", result.errs[0])
 	}
@@ -1330,9 +1348,15 @@ func TestPoolsLifecycleBatchSideEffects(t *testing.T) {
 				evts[i] = lifecycle.Event{Action: lifecycle.DeleteVersionAction}
 			}
 			result := &lifecycleBatchResult{ObjectLayer: s.z}
-			notified, traced := authoritySideEffects(t, func() {
+			notified, traced, incomplete := authoritySideEffectsAll(t, func() {
 				deleteObjectVersions(t.Context(), result, s.bucket, entries, evts)
 			})
+			if incomplete[entries[1].VersionID] != "failed" {
+				t.Errorf("failed entry: %v", incomplete)
+			}
+			if len(entries) > 3 && incomplete[entries[3].VersionID] != "refused" {
+				t.Errorf("refused entry: %v", incomplete)
+			}
 			if result.errs[0] != nil || !isErrWriteQuorum(result.errs[1]) ||
 				result.errs[2] != nil && !isErrVersionNotFound(result.errs[2]) ||
 				len(entries) > 3 && !errors.Is(result.errs[3], errLifecycleNotApplicable) {

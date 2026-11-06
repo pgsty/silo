@@ -27,6 +27,7 @@ const (
 	transitionPendingTasks         = "transition_pending_tasks"
 	transitionMissedImmediateTasks = "transition_missed_immediate_tasks"
 	versionsScanned                = "versions_scanned"
+	expiryIncompleteTotal          = "expiry_incomplete_total"
 )
 
 var (
@@ -35,6 +36,7 @@ var (
 	ilmTransitionPendingTasksMD         = NewGaugeMD(transitionPendingTasks, "Number of pending ILM transition tasks in the queue")
 	ilmTransitionMissedImmediateTasksMD = NewCounterMD(transitionMissedImmediateTasks, "Number of missed immediate ILM transition tasks")
 	ilmVersionsScannedMD                = NewCounterMD(versionsScanned, "Total number of object versions checked for ILM actions since server start")
+	ilmExpiryIncompleteTotalMD          = NewCounterMD(expiryIncompleteTotal, "Total number of ILM expiry attempts since server start that ended without removing what they addressed, by reason", "reason")
 )
 
 // loadILMMetrics - `MetricsLoaderFn` for ILM metrics.
@@ -48,6 +50,9 @@ func loadILMMetrics(_ context.Context, m MetricValues, _ *metricsCache) error {
 		m.Set(transitionMissedImmediateTasks, float64(globalTransitionState.MissedImmediateTasks()))
 	}
 	m.Set(versionsScanned, float64(globalScannerMetrics.lifetime(scannerMetricILM)))
+	for reason, n := range globalILMIncomplete.snapshot() {
+		m.Set(expiryIncompleteTotal, float64(n), "reason", reason)
+	}
 
 	return nil
 }

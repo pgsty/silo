@@ -2127,7 +2127,7 @@ func getILMNodeMetrics() *MetricsGroupV2 {
 			trActiveTasks.Value = float64(globalTransitionState.ActiveTasks())
 			trMissedTasks.Value = float64(globalTransitionState.MissedImmediateTasks())
 		}
-		return []MetricV2{
+		metrics := []MetricV2{
 			expPendingTasks,
 			expMissedTasks,
 			expMissedFreeVersions,
@@ -2137,6 +2137,20 @@ func getILMNodeMetrics() *MetricsGroupV2 {
 			trActiveTasks,
 			trMissedTasks,
 		}
+		for reason, n := range globalILMIncomplete.snapshot() {
+			metrics = append(metrics, MetricV2{
+				Description: MetricDescription{
+					Namespace: nodeMetricNamespace,
+					Subsystem: ilmSubsystem,
+					Name:      expiryIncompleteTotal,
+					Help:      "Total number of ILM expiry attempts since server start that ended without removing what they addressed, by reason",
+					Type:      counterMetric,
+				},
+				VariableLabels: map[string]string{"reason": reason},
+				Value:          float64(n),
+			})
+		}
+		return metrics
 	})
 	return mg
 }

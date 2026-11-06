@@ -216,12 +216,18 @@ func TestPoolsLifecycleBatchRejectionNotAnnounced(t *testing.T) {
 	}
 	// Both publishers deliver synchronously, so everything sent is buffered.
 	var notified, traced []string
+	refusedTraces := map[string]string{}
 	for drained := false; !drained; {
 		select {
 		case ev := <-events:
 			notified = append(notified, ev.S3.Object.VersionID)
 		case tr := <-traces:
 			if tr.FuncName == ILMExpiry {
+				if r := tr.Custom["result"]; r != "" {
+					// Not a removal: the expiry was refused or failed.
+					refusedTraces[tr.Custom["version-id"]] = r
+					continue
+				}
 				traced = append(traced, tr.Custom["version-id"])
 			}
 		default:
@@ -233,5 +239,8 @@ func TestPoolsLifecycleBatchRejectionNotAnnounced(t *testing.T) {
 	}
 	if len(traced) != 1 || traced[0] != eligible {
 		t.Errorf("ILM expiry traces for %v, want only eligible %s (retained %s)", traced, eligible, retained)
+	}
+	if refusedTraces[retained] != "refused" {
+		t.Errorf("the retained version's refusal is not traced: %v", refusedTraces)
 	}
 }
