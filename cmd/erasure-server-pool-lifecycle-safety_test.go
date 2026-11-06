@@ -133,8 +133,9 @@ func TestPoolsLifecycleDuplicateLockMetadata(t *testing.T) {
 				}
 				for pool := range s.z.serverPools {
 					_, err := s.z.serverPools[pool].GetObjectInfo(t.Context(), s.bucket, key, ObjectOptions{VersionID: id})
-					// Single DeleteObject retains its existing first-copy dispatch.
-					gone := tc.delete && (batch || pool == 0)
+					// An approved expiry removes the version from every pool,
+					// in a batch and as a single delete.
+					gone := tc.delete
 					if gone && !isErrVersionNotFound(err) || !gone && err != nil {
 						t.Errorf("pool=%d err=%v wantGone=%t", pool, err, gone)
 					}

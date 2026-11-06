@@ -1324,10 +1324,15 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	// Resolve a physical purge by its addressed version even on a replica
 	// receiver: latest-key routing can select a different pool or miss copies.
-	// Marker creation and specialized movement/scanner operations retain their
-	// existing routing.
+	// An ILM version expiry that the pools approved above, under this lock and
+	// with the versions in all pools, removes every copy of the version too:
+	// a copy left in another pool would stay readable, and a tiered one would
+	// outlive the remote object its expiry deletes next. Marker creation,
+	// restored-copy expiry and specialized movement/scanner operations retain
+	// their existing routing.
+	approvedExpiry := opts.Expiration.Expire && opts.Expiration.CheckedAllPools && !opts.Transition.ExpireRestored
 	reconcileVersion := opts.VersionID != "" && !opts.DataMovement &&
-		(!opts.ReplicationRequest || opts.isVersionPurge()) && !opts.Expiration.Expire && !opts.InclFreeVersions
+		(!opts.ReplicationRequest || opts.isVersionPurge()) && (!opts.Expiration.Expire || approvedExpiry) && !opts.InclFreeVersions
 	if !z.SinglePool() && (opts.CheckPrecondFn != nil || reconcileVersion) {
 		return z.deleteObjectReconciled(ctx, bucket, object, opts)
 	}
