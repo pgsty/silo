@@ -2242,14 +2242,15 @@ func (a adminAPIHandlers) CancelBatchJob(w http.ResponseWriter, r *http.Request)
 
 // BatchJobPool batch job pool
 type BatchJobPool struct {
-	ctx          context.Context
-	objLayer     ObjectLayer
-	mu           sync.Mutex
-	jobCh        chan *BatchJobRequest
-	jmu          sync.Mutex // protects jobOwners
-	jobOwners    map[string]*batchJobOwner
-	workerKillCh chan struct{}
-	workerSize   int
+	ctx           context.Context
+	objLayer      ObjectLayer
+	mu            sync.Mutex
+	jobCh         chan *BatchJobRequest
+	jmu           sync.Mutex // protects jobOwners and discoveryDone
+	jobOwners     map[string]*batchJobOwner
+	discoveryDone bool
+	workerKillCh  chan struct{}
+	workerSize    int
 }
 
 var globalBatchJobPool *BatchJobPool
@@ -2326,6 +2327,7 @@ func (j *BatchJobPool) cleanupReports(randomWait func() time.Duration) {
 }
 
 func (j *BatchJobPool) resume(randomWait func() time.Duration) {
+	defer j.finishDiscovery()
 	timer := time.NewTimer(randomWait())
 	defer timer.Stop()
 	// A retry scans the manifest prefix again, but only unadmitted paths may

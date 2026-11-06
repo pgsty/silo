@@ -209,6 +209,9 @@ func TestBatchDiscoveryKeepsNewlyFinishedJobsTerminal(t *testing.T) {
 					return errErasureReadQuorum
 				}
 				defer close(results)
+				if owner := pool.jobOwners["new-job"]; owner == nil || owner.state != "terminal" || owner.req != nil || owner.cancel != nil {
+					t.Fatalf("terminal marker lost or retained the job payload: %+v", owner)
+				}
 				results <- itemOrErr[ObjectInfo]{Item: ObjectInfo{Name: "new-job"}}
 				return nil
 			},
@@ -229,8 +232,17 @@ func TestBatchDiscoveryKeepsNewlyFinishedJobsTerminal(t *testing.T) {
 		if attempts != 2 || len(pool.jobCh) != 0 {
 			t.Fatalf("discovery re-admitted a failed job: scans=%d queue=%d", attempts, len(pool.jobCh))
 		}
-		if owner := pool.jobOwners["new-job"]; owner.state != "terminal" || owner.req != nil || owner.cancel != nil {
-			t.Fatalf("terminal marker lost or retained the job payload: %+v", owner)
+		if !pool.discoveryDone || len(pool.jobOwners) != 0 {
+			t.Fatal("completed discovery retained terminal job markers")
+		}
+		job := &BatchJobRequest{ID: "after-discovery"}
+		mustIAM(t, pool.queueJob(job))
+		if !pool.beginJob(<-pool.jobCh) {
+			t.Fatal("new submission after discovery has no owner")
+		}
+		pool.finishJob(job, nil)
+		if len(pool.jobOwners) != 0 {
+			t.Fatal("normal completion after discovery leaked an owner")
 		}
 	})
 }

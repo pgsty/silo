@@ -105,9 +105,9 @@ func validateBatchJobAdminReq(ctx context.Context, w http.ResponseWriter, r *htt
 }
 
 // One owner record spans queued, running and paused attempts. The request
-// pointer is the generation token. Canceled and terminal records are small
-// tombstones until process shutdown, so a delayed discovery cannot requeue a
-// job after its owner finished, including a terminal partial failure.
+// pointer is the generation token. Canceled records fence stale requests until
+// shutdown. Terminal records fence discovery until the startup scan finishes,
+// including jobs submitted and terminated while the scan was unavailable.
 type batchJobOwner struct {
 	req     *BatchJobRequest
 	cancel  context.CancelFunc
@@ -141,7 +141,25 @@ func (j *BatchJobPool) finishJob(job *BatchJobRequest, err error) {
 		return
 	}
 	o.cancel()
-	j.jobOwners[job.ID] = &batchJobOwner{state: "terminal"}
+	if j.discoveryDone {
+		delete(j.jobOwners, job.ID)
+	} else {
+		j.jobOwners[job.ID] = &batchJobOwner{state: "terminal"}
+	}
+}
+
+// After the only startup discovery has returned, no loaded manifest remains
+// to re-admit a terminal job. Release its marker, but keep queued, running,
+// paused and canceled ownership intact. New submissions use new job IDs.
+func (j *BatchJobPool) finishDiscovery() {
+	j.jmu.Lock()
+	defer j.jmu.Unlock()
+	j.discoveryDone = true
+	for id, owner := range j.jobOwners {
+		if owner.state == "terminal" {
+			delete(j.jobOwners, id)
+		}
+	}
 }
 
 func batchJobRetryDelay(retries uint) time.Duration {
