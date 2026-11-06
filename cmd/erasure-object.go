@@ -660,9 +660,15 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 	meta := &xlMetaV2{versions: mergeXLV2Versions(readQuorum, false, 1, metadataShallowVersions...)}
 	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers, true)
 	if err != nil {
+		// No version in quorum proves absence only when every drive answered.
+		// Otherwise a drive holding a version keeps the read retryable.
+		partial := errors.Is(err, errFileNotFound) && !allDrivesAnswered(errs)
 		for i := range errs {
 			if errs[i] == nil {
 				errs[i] = err
+				if partial && hasVersion(metadataArray[i], inclFreeVers) {
+					errs[i] = errErasureReadQuorum
+				}
 			}
 		}
 		return metaFileInfos, errs
@@ -704,6 +710,33 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 
 	// Return all the metadata.
 	return metaFileInfos, errs
+}
+
+// allDrivesAnswered reports whether every drive returned its metadata or a
+// definitive answer that it has none. Offline drives keep errDiskOngoingReq
+// in getObjectFileInfo; unreachable ones return errDiskNotFound or a
+// transport error.
+func allDrivesAnswered(errs []error) bool {
+	for _, err := range errs {
+		if err != nil && !IsErr(err, errFileNotFound, errFileVersionNotFound, errFileCorrupt, errVolumeNotFound) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasVersion reports whether a drive's xl.meta holds a version a read can
+// return.
+func hasVersion(xl *xlMetaV2, inclFreeVers bool) bool {
+	if xl == nil {
+		return false
+	}
+	for _, ver := range xl.versions {
+		if inclFreeVers || !ver.header.FreeVersion() {
+			return true
+		}
+	}
+	return false
 }
 
 // Checking if an object is dangling costs some IOPS; hence implementing this function
@@ -1006,8 +1039,10 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		}
 		// when we have insufficient read quorum and inconsistent metadata return
 		// file not found, since we can't possibly have a way to recover this object
-		// anyway.
-		if v, ok := err.(InsufficientReadQuorum); ok && v.Type == RQInconsistentMeta {
+		// anyway. That holds only when every drive answered: a drive that is
+		// offline or not yet reconnected may hold the copies that make quorum,
+		// and a 404 for an existing object is final to clients.
+		if v, ok := err.(InsufficientReadQuorum); ok && v.Type == RQInconsistentMeta && allDrivesAnswered(errs) {
 			if opts.VersionID != "" {
 				err = errFileVersionNotFound
 			} else {
