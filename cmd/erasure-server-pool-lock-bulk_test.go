@@ -122,9 +122,8 @@ func TestDeleteObjectsInSetsRunsGroupsConcurrently(t *testing.T) {
 // the result its own delete reports, and a group that completed before keeps
 // its success.
 func TestDeleteObjectsInSetsQueuedGroupsCancel(t *testing.T) {
-	prev := deleteSetGroupsLimit
-	deleteSetGroupsLimit = 1
-	t.Cleanup(func() { deleteSetGroupsLimit = prev })
+	deleteSetGroupsLimit.Store(1)
+	t.Cleanup(func() { deleteSetGroupsLimit.Store(0) })
 	for _, blocked := range []int{0, 1} {
 		t.Run(fmt.Sprintf("blocked=%d", blocked), func(t *testing.T) {
 			z, bucket := bulkDeletePools(t, 1)

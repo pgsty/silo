@@ -35,13 +35,14 @@ import (
 func nsLocksEvents(t *testing.T) chan string {
 	t.Helper()
 	events := make(chan string, 256)
-	getNSLocksEvent = func(event string, index int) {
+	f := func(event string, index int) {
 		select {
 		case events <- fmt.Sprintf("%s:%d", event, index):
 		default:
 		}
 	}
-	t.Cleanup(func() { getNSLocksEvent = nil })
+	getNSLocksEvent.Store(&f)
+	t.Cleanup(func() { getNSLocksEvent.Store(nil) })
 	return events
 }
 
@@ -59,6 +60,20 @@ func waitNSLocksEvent(t *testing.T, events chan string, want string) {
 			t.Fatalf("no %q event", want)
 		}
 	}
+}
+
+// ldFreeFresh waits, bounded, until a fresh instance from lock can take the
+// lock: a distributed release can still be on its way after it was asked
+// for, and a late unlock of an earlier instance never releases a new one.
+func ldFreeFresh(t *testing.T, lock func() RWLocker, write bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !ldTry(t, lock(), write) {
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+	return true
 }
 
 type nsLocksResult struct {
@@ -104,7 +119,7 @@ func TestGetNSLocksWaitsHoldingNothing(t *testing.T) {
 			waitNSLocksEvent(t, events, "idle-wait:1")
 			// The event says that a was released; a distributed unlock may
 			// still be on its way.
-			if !ldFree(t, lock("a"), true) {
+			if !ldFreeFresh(t, func() RWLocker { return lock("a") }, true) {
 				t.Fatal("a is not released while b is waited for")
 			}
 			releaseA := ldHoldLock(t, lock("a"))
@@ -137,7 +152,7 @@ func TestGetNSLocksWaitsHoldingNothing(t *testing.T) {
 				t.Error("not both locks held")
 			}
 			res.unlock()
-			if !ldFree(t, lock("a"), true) || !ldFree(t, lock("b"), true) {
+			if !ldFreeFresh(t, func() RWLocker { return lock("a") }, true) || !ldFreeFresh(t, func() RWLocker { return lock("b") }, true) {
 				t.Error("locks left behind")
 			}
 		})
@@ -167,7 +182,7 @@ func TestGetNSLocksIdleWaitCancel(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("a canceled idle wait did not return")
 			}
-			if !ldFree(t, lock("a"), true) {
+			if !ldFreeFresh(t, func() RWLocker { return lock("a") }, true) {
 				t.Error("a left behind")
 			}
 		})
@@ -199,7 +214,7 @@ func TestGetNSLocksIdleWaitDeadline(t *testing.T) {
 			case <-time.After(timeout + 5*time.Second):
 				t.Fatal("the idle wait outlived the deadline")
 			}
-			if !ldFree(t, lock("a"), true) {
+			if !ldFreeFresh(t, func() RWLocker { return lock("a") }, true) {
 				t.Error("a left behind")
 			}
 		})
@@ -264,7 +279,7 @@ func TestLockDomainCopyDoesNotStarveDestination(t *testing.T) {
 				done <- ldCopyRequest(t.Context(), t, router, bucket, src, dst, nil).Code
 			}()
 			waitNSLocksEvent(t, events, "idle-wait:1")
-			if !ldFree(t, z.NewObjectNSLock(bucket, dst), true) {
+			if !ldFreeFresh(t, func() RWLocker { return z.NewObjectNSLock(bucket, dst) }, true) {
 				t.Fatal("the destination is not released while the source is waited for")
 			}
 			for range 3 {

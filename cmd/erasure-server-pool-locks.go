@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -153,11 +154,11 @@ const (
 // getNSLocksEvent, when a test sets it, is told when getNSLocks gives up a
 // bounded wait ("bounded-timeout"), starts to wait for that lock alone
 // ("idle-wait") and got it ("idle-acquired"), with the index of the lock.
-var getNSLocksEvent func(event string, index int)
+var getNSLocksEvent atomic.Pointer[func(event string, index int)]
 
 func nsLocksEvent(event string, index int) {
-	if f := getNSLocksEvent; f != nil {
-		f(event, index)
+	if f := getNSLocksEvent.Load(); f != nil {
+		(*f)(event, index)
 	}
 }
 
@@ -344,7 +345,7 @@ func (z *erasureServerPools) deleteObjectsInSets(ctx context.Context, bucket str
 	}
 	slices.Sort(order)
 
-	sem := make(chan struct{}, min(len(order), deleteSetGroupsLimit))
+	sem := make(chan struct{}, min(len(order), deleteSetGroupsLimitValue()))
 	var wg sync.WaitGroup
 	for _, idx := range order {
 		members := groups[idx]
@@ -359,9 +360,18 @@ func (z *erasureServerPools) deleteObjectsInSets(ctx context.Context, bucket str
 	wg.Wait()
 }
 
-// deleteSetGroupsLimit bounds how many sets a bulk delete of one pool works
-// on at once.
-var deleteSetGroupsLimit = 16
+// deleteSetGroupsDefault bounds how many sets a bulk delete of one pool works
+// on at once; a test can lower it through deleteSetGroupsLimit.
+const deleteSetGroupsDefault = 16
+
+var deleteSetGroupsLimit atomic.Int32
+
+func deleteSetGroupsLimitValue() int {
+	if n := int(deleteSetGroupsLimit.Load()); n > 0 {
+		return n
+	}
+	return deleteSetGroupsDefault
+}
 
 // deleteObjectsInSet deletes the members of objects, which all hash to er,
 // under er's lock, and writes their results. Nothing else writes them.
