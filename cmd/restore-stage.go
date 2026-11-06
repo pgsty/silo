@@ -554,7 +554,7 @@ func (er erasureObjects) commitRestore(ctx context.Context, bucket, object strin
 		er.commitRenameDataDir(ctx, bucket, object, old, cleanup, 1)
 	}
 	if countErrs(errs, nil) < n {
-		er.addPartial(bucket, object, gen.fi.VersionID)
+		er.addPartial(bucket, object, st.versionID)
 	}
 	return nil, nil
 }

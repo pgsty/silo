@@ -28,12 +28,20 @@ import (
 	"github.com/minio/minio/internal/grid"
 )
 
-// A native restore keeps its multipart upload private and marks the version
-// it rehydrates (restore-attempt.go). A server that predates this ignores
-// the marker: it would list, change, abort or complete the upload. Native
-// restore therefore runs only while every server of the cluster positively
-// reports that it understands the marker. A server that does not answer,
-// or does not know the question, as an older server does not, blocks it.
+// Native restore is a protocol among the servers of a cluster
+// (restore-stage.go): the restore lock of a version and the attempt that its
+// ongoing marker names (restore-attempt.go) say which worker owns the
+// restore, the copy is staged in the tmp volume and published under the
+// object lock by a commit that checks the attempt again, and a superseded
+// attempt writes nothing. A server that predates this protocol does not
+// follow it: it would run its own restore of the same version, under other
+// locks or none, and write it in its own way.
+//
+// Native restore therefore runs only while every server of the cluster
+// positively reports that it speaks this protocol. A server that does not
+// answer, or does not know the question, as an older server does not,
+// blocks it: a server that is not reachable now is not proven stopped, and
+// it may still be running an older restore.
 
 // nativeRestoreCapability is the native restore protocol this server speaks.
 const nativeRestoreCapability = "2"

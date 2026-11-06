@@ -856,3 +856,64 @@ func TestRestorePublicationBelowWriteQuorumOnWideSet(t *testing.T) {
 		}
 	}
 }
+
+// A commit that reaches a write quorum but not every drive queues a heal of
+// the version it restored: for the null version, the normalized null ID that
+// the convergence path queues too. That heal repairs the null version on the
+// drive that missed the commit, also where the null version is noncurrent.
+func TestRestorePartialCommitQueuesNullVersionHeal(t *testing.T) {
+	saved := globalStorageClass
+	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: 2}})
+	t.Cleanup(func() { globalStorageClass.Update(saved) })
+	r := newRestoreSafetyTest(t, 1, versioning.Suspended)
+	oi, body := nativeRestoreSeed(t, r, 0, true, false)
+	// A version written while versioning was enabled makes the null version
+	// noncurrent.
+	newer := []byte("newer")
+	if _, err := r.z.PutObject(t.Context(), r.bucket, r.object,
+		mustGetPutObjReader(t, bytes.NewReader(newer), int64(len(newer)), "", ""), ObjectOptions{Versioned: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	failing := &restoreTwoPhaseFaults{}
+	failing.rename.Store("fail")
+	disks := restoreTwoPhaseFaulty(t, r, nil, nil, nil, failing)
+	// The test owns the MRF queue while the commit runs: the heal routines of
+	// the test servers would otherwise take the entry first.
+	queue := make(chan PartialOperation, mrfOpsQueueSize)
+	previous := globalMRFState.opCh
+	globalMRFState.opCh = queue
+	err := r.z.RestoreTransitionedObject(t.Context(), r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
+	globalMRFState.opCh = previous
+	if err != nil {
+		t.Fatalf("restore with one drive failing its commit: %v", err)
+	}
+	var queued []PartialOperation
+	for len(queue) > 0 {
+		if op := <-queue; op.Bucket == r.bucket && op.Object == r.object {
+			queued = append(queued, op)
+		}
+	}
+	if len(queued) != 1 || queued[0].VersionID != nullVersionID {
+		t.Fatalf("queued heals %+v, want one of version %q", queued, nullVersionID)
+	}
+	if restoreTwoPhaseRestored(restoreTwoPhaseEntries(t, r, disks, oi.VersionID)[3]) {
+		t.Fatal("the drive that failed the commit holds the restored copy")
+	}
+
+	failing.rename.Store("")
+	if _, err := r.z.HealObject(t.Context(), r.bucket, r.object, queued[0].VersionID, madmin.HealOpts{ScanMode: madmin.HealNormalScan}); err != nil {
+		t.Fatalf("heal of the queued version: %v", err)
+	}
+	for i, fi := range restoreTwoPhaseEntries(t, r, disks, oi.VersionID) {
+		if !restoreTwoPhaseRestored(fi) {
+			t.Errorf("drive %d: not restored after the heal: %q", i, fi.Metadata[xhttp.AmzRestore])
+		}
+	}
+	if _, got, err := r.read(oi.VersionID); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("restored contents: %v", err)
+	}
+	if latest, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, ObjectOptions{}); err != nil || latest.VersionID == "" || latest.VersionID == nullVersionID {
+		t.Fatalf("latest = %q, %v; want the newer version", latest.VersionID, err)
+	}
+}
