@@ -539,6 +539,10 @@ func TestPoolsLifecycleLegacyHistory(t *testing.T) {
 	}
 }
 
+// authorityDeleteAll is the expiry of all versions of a key as the expiry
+// worker sends it: a purge of all versions, approved by the lifecycle.
+var authorityDeleteAll = ObjectOptions{DeleteAllVersions: true, Expiration: ExpirationOptions{Expire: true}}
+
 // A fresh version committed to 15 of 16 drives, with eight other drives
 // unreadable: only seven answering drives show it.
 func TestPoolsLifecyclePartialHistory(t *testing.T) {
@@ -554,7 +558,7 @@ func TestPoolsLifecyclePartialHistory(t *testing.T) {
 	if _, _, err := s.z.lifecycleEventsAllPools(ctx, s.bucket, key); !isErrReadQuorum(err) {
 		t.Errorf("partial history: %v", err)
 	}
-	_, err := s.z.DeleteObject(ctx, s.bucket, key, ObjectOptions{Versioned: true, DeletePrefix: true, DeletePrefixObject: true, Expiration: ExpirationOptions{Expire: true}})
+	_, err := s.z.DeleteObject(ctx, s.bucket, key, authorityDeleteAll)
 	if !isErrWriteQuorum(err) {
 		t.Errorf("DeleteAll on a partial history: %v", err)
 	}
@@ -615,7 +619,7 @@ func TestPoolsLifecycleMissingVersion(t *testing.T) {
 	if _, _, err := s.z.lifecycleEventsAllPools(ctx, s.bucket, key); !isErrReadQuorum(err) {
 		t.Errorf("history without an observed version: %v", err)
 	}
-	_, err := s.z.DeleteObject(ctx, s.bucket, key, ObjectOptions{Versioned: true, DeletePrefix: true, DeletePrefixObject: true, Expiration: ExpirationOptions{Expire: true}})
+	_, err := s.z.DeleteObject(ctx, s.bucket, key, authorityDeleteAll)
 	if !isErrWriteQuorum(err) {
 		t.Errorf("DeleteAll: %v", err)
 	}
@@ -630,7 +634,6 @@ func TestPoolsLifecycleMissingVersion(t *testing.T) {
 // The completeness checks also hold where a set has fewer answering drives
 // than a read quorum or no version reaches one.
 func TestPoolsLifecycleHistoryEarlyReturns(t *testing.T) {
-	deleteAll := ObjectOptions{Versioned: true, DeletePrefix: true, DeletePrefixObject: true, Expiration: ExpirationOptions{Expire: true}}
 
 	// Seven drives hold the key, the other nine do not have it at all.
 	t.Run("minority-copy-only", func(t *testing.T) {
@@ -648,7 +651,7 @@ func TestPoolsLifecycleHistoryEarlyReturns(t *testing.T) {
 		if _, _, err := s.z.lifecycleEventsAllPools(ctx, s.bucket, key); !isErrReadQuorum(err) {
 			t.Errorf("minority copy: %v", err)
 		}
-		if _, err := s.z.DeleteObject(ctx, s.bucket, key, deleteAll); !isErrWriteQuorum(err) {
+		if _, err := s.z.DeleteObject(ctx, s.bucket, key, authorityDeleteAll); !isErrWriteQuorum(err) {
 			t.Errorf("DeleteAll: %v", err)
 		}
 		for i := 9; i < len(disks); i++ {
@@ -671,7 +674,7 @@ func TestPoolsLifecycleHistoryEarlyReturns(t *testing.T) {
 		if _, _, err := s.z.lifecycleEventsAllPools(ctx, s.bucket, key); !isErrReadQuorum(err) {
 			t.Fatalf("disjoint minorities: %v", err)
 		}
-		if _, err := s.z.DeleteObject(ctx, s.bucket, key, deleteAll); !isErrWriteQuorum(err) {
+		if _, err := s.z.DeleteObject(ctx, s.bucket, key, authorityDeleteAll); !isErrWriteQuorum(err) {
 			t.Fatalf("DeleteAll: %v", err)
 		}
 	})

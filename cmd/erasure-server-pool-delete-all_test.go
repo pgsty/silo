@@ -232,14 +232,13 @@ func (p *purgeTest) childIn(pool int, parent string, same bool) string {
 	}
 }
 
-// scanQueue applies the lifecycle of the bucket to the versions that pool
-// holds of name, as the scanner does, and returns what it queued.
-func (p *purgeTest) scanQueue(pool int, name string) []expiryOp {
+// scanned returns the versions of name that the first drive of its set in
+// pool holds, as the scanner of that drive reads them.
+func (p *purgeTest) scanned(pool int, name string) []ObjectInfo {
 	p.t.Helper()
-	ctx := p.t.Context()
 	enc := encodeDirObject(name)
 	disk := p.z.serverPools[pool].getHashedSet(enc).getDisks()[0]
-	buf, err := disk.ReadAll(ctx, p.bucket, pathJoin(enc, xlStorageFormatFile))
+	buf, err := disk.ReadAll(p.t.Context(), p.bucket, pathJoin(enc, xlStorageFormatFile))
 	if err != nil {
 		p.t.Fatalf("read %s: %v", name, err)
 	}
@@ -252,6 +251,24 @@ func (p *purgeTest) scanQueue(pool int, name string) []expiryOp {
 	for i, fi := range fivs.Versions {
 		objInfos[i] = fi.ToObjectInfo(p.bucket, name, vc != nil && vc.Versioned(name))
 	}
+	return objInfos
+}
+
+// scanQueue applies the lifecycle of the bucket to the versions that pool
+// holds of name, as the scanner does, and returns what it queued.
+func (p *purgeTest) scanQueue(pool int, name string) []expiryOp {
+	p.t.Helper()
+	ops, _ := p.scan(pool, name)
+	return ops
+}
+
+// scan is scanQueue that also returns the size the scanner accounts for
+// each version, by version ID.
+func (p *purgeTest) scan(pool int, name string) ([]expiryOp, map[string]int64) {
+	p.t.Helper()
+	ctx := p.t.Context()
+	enc := encodeDirObject(name)
+	objInfos := p.scanned(pool, name)
 	lc, err := globalLifecycleSys.Get(p.bucket)
 	if err != nil {
 		p.t.Fatal(err)
@@ -268,12 +285,31 @@ func (p *purgeTest) scanQueue(pool int, name string) []expiryOp {
 	globalExpiryState = es
 	defer func() { globalExpiryState = prev }()
 	item := scannerItem{Path: enc, bucket: p.bucket, objectName: path.Base(enc), lifeCycle: lc}
-	item.applyActions(ctx, p.z, objInfos, lr, &sizeSummary{}, nil)
+	sizes := map[string]int64{}
+	item.applyActions(ctx, p.z, objInfos, lr, &sizeSummary{}, func(oi ObjectInfo, sz, _ int64, _ *sizeSummary) {
+		sizes[deleteAllVersionID(oi.VersionID)] += sz
+	})
 	var ops []expiryOp
 	for len(queue) > 0 {
 		ops = append(ops, <-queue)
 	}
-	return ops
+	return ops, sizes
+}
+
+// deleteAllTask is the expiry of all versions of name that a scanner queues
+// for the latest version that pool holds, as the scanner of a drive or a
+// pool that holds no tiered version of the key queues it.
+func (p *purgeTest) deleteAllTask(pool int, name string, action lifecycle.Action) expiryOp {
+	p.t.Helper()
+	return expiryTask{objInfo: p.scanned(pool, name)[0], event: lifecycle.Event{Action: action}, src: lcEventSrc_Scanner}
+}
+
+// queuesDeleteAll reports whether ops holds an expiry of all versions.
+func queuesDeleteAll(ops []expiryOp) bool {
+	return slices.ContainsFunc(ops, func(op expiryOp) bool {
+		task, ok := op.(expiryTask)
+		return ok && task.event.Action.DeleteAll()
+	})
 }
 
 // expire runs what the scanner queues for name in pool with an expiry
@@ -281,10 +317,7 @@ func (p *purgeTest) scanQueue(pool int, name string) []expiryOp {
 func (p *purgeTest) expire(pool int, name string) {
 	p.t.Helper()
 	ops := p.scanQueue(pool, name)
-	if !slices.ContainsFunc(ops, func(op expiryOp) bool {
-		task, ok := op.(expiryTask)
-		return ok && task.event.Action.DeleteAll()
-	}) {
+	if !queuesDeleteAll(ops) {
 		p.t.Fatalf("the scanner queued no expiry of all versions of %s: %v", name, ops)
 	}
 	p.run(ops)
@@ -754,7 +787,12 @@ func TestPurgeAllVersionsRefusesTieredKeys(t *testing.T) {
 	p.tiered(0, "bx/tiered-latest", "v2", 5)
 	remotes := p.remotes()
 
-	p.expire(0, "ea/tiered-older")
+	// The scanner of a pool that holds the tiered version does not queue
+	// the expiry; one that does not hold it queues it, and the purge refuses.
+	if ops := p.scanQueue(0, "ea/tiered-older"); queuesDeleteAll(ops) {
+		t.Errorf("the scanner queued an expiry of all versions that the purge refuses: %v", ops)
+	}
+	p.run([]expiryOp{p.deleteAllTask(0, "ea/tiered-older", lifecycle.DeleteAllVersionsAction)})
 	ri := p.batch(p.matched("bx/tiered-older"), p.matched("bx/tiered-latest"))
 	for name, want := range map[string][]string{
 		"ea/tiered-older":  {"hot", "tiered"},
@@ -900,9 +938,15 @@ func TestPurgeAllVersionsRetiresOlderWritesFirst(t *testing.T) {
 // on: a transitioned or a protected one refuses the key.
 func TestPurgeAllVersionsChecksEveryDrive(t *testing.T) {
 	z := purgeSinglePool(t, 16)
+	// The minority revision is on the last drive; the scanner of the first
+	// drive, which the test runs, does not see it and queues the expiry.
+	minority := func(name string) StorageAPI {
+		disks := z.serverPools[0].getHashedSet(name).getDisks()
+		return disks[len(disks)-1]
+	}
 	rewrite := func(p *purgeTest, name, versionID string, metadata map[string]string) {
 		t.Helper()
-		disk := z.serverPools[0].getHashedSet(name).getDisks()[0]
+		disk := minority(name)
 		if err := disk.UpdateMetadata(t.Context(), p.bucket, name, FileInfo{VersionID: versionID, Metadata: metadata}, UpdateMetadataOpts{}); err != nil {
 			t.Fatal(err)
 		}
@@ -930,7 +974,7 @@ func TestPurgeAllVersionsChecksEveryDrive(t *testing.T) {
 	if got := locked.get("lk/minority"); got != "v2" {
 		t.Errorf("a key with a legal hold on one drive reads %s, want v2", got)
 	}
-	disk := z.serverPools[0].getHashedSet("lk/minority").getDisks()[0]
+	disk := minority("lk/minority")
 	if fi, err := disk.ReadVersion(t.Context(), "", locked.bucket, "lk/minority", v.VersionID, ReadOptions{}); err != nil ||
 		fi.Metadata[strings.ToLower(xhttp.AmzObjectLockLegalHold)] != string(objectlock.LegalHoldOn) {
 		t.Errorf("the held revision: %v", err)

@@ -240,8 +240,10 @@ func TestApplyNewerNoncurrentVersionsLimit(t *testing.T) {
 			},
 		},
 		{
+			// Every version is accounted at its size until the purge
+			// removes it.
 			objInfos:    allVersExpObjInfos,
-			wants:       nil,
+			wants:       allVersExpObjInfos,
 			wantExpired: []ObjectToDelete{{ObjectV: ObjectV{ObjectName: obj, VersionID: allVersExpObjInfos[0].VersionID}}},
 		},
 		{

@@ -33,11 +33,23 @@ import (
 // could not be read, or another error. It is counted by reason, traced with
 // the reason, and, unless it was refused, audited and logged. It never sends
 // a removal notification: what it addressed is still there.
+//
+// An expiry of all versions of a key can also be refused because a version
+// is in a remote tier, or because the latest version changed since a batch
+// matched it, and it can stop at its budget after it removed some versions.
 const (
 	ilmIncompleteNotApplicable      = "not_applicable"
 	ilmIncompleteLocked             = "locked"
 	ilmIncompleteHistoryUnavailable = "history_unavailable"
 	ilmIncompleteError              = "error"
+	ilmIncompleteTierUnsupported    = "tier_unsupported"
+	ilmIncompleteBudget             = "budget"
+	ilmIncompleteChanged            = "changed"
+	// ilmIncompleteTierSkipped counts the scanner's observations of a key
+	// whose expiry of all versions it did not queue, because a version it
+	// holds is in a remote tier and the purge would refuse it. Each drive's
+	// scanner of the key observes it, once per cycle.
+	ilmIncompleteTierSkipped = "tier_unsupported_skipped"
 )
 
 // ilmIncompleteReasons are the reasons expiry_incomplete_total counts, a
@@ -47,6 +59,10 @@ var ilmIncompleteReasons = []string{
 	ilmIncompleteLocked,
 	ilmIncompleteHistoryUnavailable,
 	ilmIncompleteError,
+	ilmIncompleteTierUnsupported,
+	ilmIncompleteBudget,
+	ilmIncompleteChanged,
+	ilmIncompleteTierSkipped,
 }
 
 // ilmIncompleteStats counts incomplete ILM expiries by reason.
@@ -85,6 +101,12 @@ func ilmExpiryNotDone(err error) (reason string, counted bool) {
 	switch {
 	case err == nil || isErrObjectNotFound(err) || isErrVersionNotFound(err):
 		return "", false
+	case errors.Is(err, errDeleteAllTiered):
+		return ilmIncompleteTierUnsupported, true
+	case errors.Is(err, errDeleteAllChanged):
+		return ilmIncompleteChanged, true
+	case errors.Is(err, errDeleteAllBudget):
+		return ilmIncompleteBudget, true
 	case errors.Is(err, errLifecycleNotApplicable):
 		return ilmIncompleteNotApplicable, true
 	}
@@ -101,7 +123,11 @@ func ilmExpiryNotDone(err error) (reason string, counted bool) {
 // ilmExpiryRefused reports whether reason is a refusal, which changes
 // nothing, rather than a failure.
 func ilmExpiryRefused(reason string) bool {
-	return reason == ilmIncompleteNotApplicable || reason == ilmIncompleteLocked
+	switch reason {
+	case ilmIncompleteNotApplicable, ilmIncompleteLocked, ilmIncompleteTierUnsupported, ilmIncompleteChanged:
+		return true
+	}
+	return false
 }
 
 // reportILMExpiryNotDone reports an ILM expiry of oi that ended with err. It

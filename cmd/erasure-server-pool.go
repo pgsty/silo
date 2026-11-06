@@ -1239,6 +1239,11 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 			return objInfo, InvalidArgument{Bucket: bucket, Object: object, Err: err}
 		}
 	}
+	// A lifecycle expiry removes all versions of one key as a purge of all
+	// versions. A prefix delete would also remove the keys under it.
+	if opts.DeletePrefix && opts.Expiration.Expire {
+		return objInfo, InvalidArgument{Bucket: bucket, Object: object, Err: errors.New("a lifecycle expiry never deletes a prefix")}
+	}
 
 	if !opts.DeletePrefix { // DeletePrefix handles dir object encoding differently.
 		object = encodeDirObject(object)

@@ -69,6 +69,10 @@ var (
 	// errDeleteAllBudget: the purge stopped at its budget, before the
 	// latest version.
 	errDeleteAllBudget = errors.New("purge of all versions stopped at its budget")
+	// errDeleteAllHistoryUnavailable: a drive that may hold a revision of
+	// an approved version could not be read or decoded. Callers see a
+	// write quorum error.
+	errDeleteAllHistoryUnavailable = fmt.Errorf("a drive that may hold a version of the key cannot be read or decoded: %w", InsufficientWriteQuorum{})
 	// errDeleteAllUnsupported: only a single-object delete of the pools
 	// purges all versions. Any other layer would turn the request into
 	// another delete.
@@ -377,12 +381,31 @@ func (w *deleteAllWrites) add(fi FileInfo) {
 	w.versions = append(w.versions, fi.ToObjectInfo(w.bucket, w.name, true))
 }
 
+// tierRefusesDeleteAll reports whether a version with these transition
+// fields makes the purge refuse its key: any version that is not a free
+// version and is transitioned, being transitioned, or restored. A free
+// version only records a remote object for the tier cleanup.
+func tierRefusesDeleteAll(freeVersion bool, status, tier, remote string) bool {
+	return !freeVersion && (status != "" || tier != "" || remote != "")
+}
+
+// deleteAllTierRefuses: see tierRefusesDeleteAll.
+func (fi FileInfo) deleteAllTierRefuses() bool {
+	return tierRefusesDeleteAll(fi.TierFreeVersion(), fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName)
+}
+
+// deleteAllTierRefuses: see tierRefusesDeleteAll.
+func (oi ObjectInfo) deleteAllTierRefuses() bool {
+	t := oi.TransitionedObject
+	return tierRefusesDeleteAll(t.FreeVersion, t.Status, t.Tier, t.Name)
+}
+
 // deleteAllRefuses returns why the purge must keep the key that holds the
 // revision fi of an approved version: it is transitioned, whose remote
 // object a later release hands to the tier cleanup, or, with Object Lock,
 // protected by retention or a legal hold.
 func deleteAllRefuses(ctx context.Context, bucket, object string, fi FileInfo, lockEnabled bool) error {
-	if fi.TransitionStatus != "" || fi.TransitionTier != "" || fi.TransitionedObjName != "" {
+	if fi.deleteAllTierRefuses() {
 		return errDeleteAllTiered
 	}
 	if lockEnabled && enforceRetentionForDeletion(ctx, fi.ToObjectInfo(bucket, object, true)) {
@@ -413,15 +436,15 @@ func (er erasureObjects) deleteAllDrives(ctx context.Context, bucket, object str
 			continue
 		}
 		if errs[i] != nil {
-			return nil, toObjectErr(errErasureReadQuorum, bucket, object)
+			return nil, errDeleteAllHistoryUnavailable
 		}
 		var xl xlMetaV2
 		if err := xl.LoadOrConvert(raws[i].Buf); err != nil {
-			return nil, toObjectErr(errErasureReadQuorum, bucket, object)
+			return nil, errDeleteAllHistoryUnavailable
 		}
 		versions, err := xl.ListVersions(bucket, object, false)
 		if err != nil {
-			return nil, toObjectErr(errErasureReadQuorum, bucket, object)
+			return nil, errDeleteAllHistoryUnavailable
 		}
 		for _, fi := range versions {
 			if fi.TierFreeVersion() || !ids[deleteAllVersionID(fi.VersionID)] {
