@@ -2549,7 +2549,12 @@ func (sys *IAMSys) IsAllowed(args policy.Args) bool {
 		}
 		return ok
 	}
+	return sys.isAllowedLocally(args)
+}
 
+// isAllowedLocally evaluates args with the local policies only, as IsAllowed
+// does when no authorization plugin is configured.
+func (sys *IAMSys) isAllowedLocally(args policy.Args) bool {
 	// Policies don't apply to the owner.
 	if args.IsOwner {
 		return true

@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -34,6 +35,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/pgsty/silo-pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/pgsty/silo-pkg/v3/wildcard"
 	"github.com/pgsty/silo-pkg/v3/workers"
 	"github.com/pgsty/silo-pkg/v3/xtime"
@@ -289,16 +291,6 @@ type BatchJobExpire struct {
 
 var _ yaml.Unmarshaler = &BatchJobExpire{}
 
-// RedactSensitive will redact any sensitive information in b.
-func (r *BatchJobExpire) RedactSensitive() {
-	if r == nil {
-		return
-	}
-	if r.NotificationCfg.Token != "" {
-		r.NotificationCfg.Token = redactedText
-	}
-}
-
 // UnmarshalYAML - BatchJobExpire extends default unmarshal to extract line, col information.
 func (r *BatchJobExpire) UnmarshalYAML(val *yaml.Node) error {
 	type expireJob BatchJobExpire
@@ -345,32 +337,6 @@ func (r BatchJobExpire) Notify(ctx context.Context, body io.Reader) error {
 	return nil
 }
 
-// Expire expires object versions which have already matched supplied filter conditions
-func (r *BatchJobExpire) Expire(ctx context.Context, api ObjectLayer, vc *versioning.Versioning, objsToDel []ObjectToDelete) []error {
-	opts := ObjectOptions{
-		PrefixEnabledFn:  vc.PrefixEnabled,
-		VersionSuspended: vc.Suspended(),
-	}
-
-	allErrs := make([]error, 0, len(objsToDel))
-
-	for {
-		count := len(objsToDel)
-		if count == 0 {
-			break
-		}
-		if count > maxDeleteList {
-			count = maxDeleteList
-		}
-		_, errs := api.DeleteObjects(ctx, r.Bucket, objsToDel[:count], opts)
-		allErrs = append(allErrs, errs...)
-		// Next batch of deletion
-		objsToDel = objsToDel[count:]
-	}
-
-	return allErrs
-}
-
 const (
 	batchExpireName                 = "batch-expire.bin"
 	batchExpireFormat               = 1
@@ -381,22 +347,233 @@ const (
 	batchExpireJobDefaultRetryDelay = 250 * time.Millisecond
 )
 
-type objInfoCache map[string]*ObjectInfo
-
-func newObjInfoCache() objInfoCache {
-	return objInfoCache(make(map[string]*ObjectInfo))
+type expireObjInfo struct {
+	ObjectInfo
+	ExpireAll         bool
+	DeleteMarkerCount int64
 }
 
-func (oiCache objInfoCache) Add(toDel ObjectToDelete, oi *ObjectInfo) {
-	oiCache[fmt.Sprintf("%s-%s", toDel.ObjectName, toDel.VersionID)] = oi
+// isErrObjectLocked reports a version that Object Lock protects.
+func isErrObjectLocked(err error) bool {
+	var locked ObjectLocked
+	return errors.As(err, &locked)
 }
 
-func (oiCache objInfoCache) Get(toDel ObjectToDelete) (*ObjectInfo, bool) {
-	oi, ok := oiCache[fmt.Sprintf("%s-%s", toDel.ObjectName, toDel.VersionID)]
-	return oi, ok
+func (r *BatchJobExpire) tagsFiltered() bool {
+	for _, rule := range r.Rules {
+		if len(rule.Tags) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
-func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo, job BatchJobRequest, api ObjectLayer, wk *workers.Workers, expireCh <-chan []expireObjInfo) {
+// expireAuthzRequests are the actions the job takes on one version: it reads
+// the version, and its tags when a rule filters by them, and deletes it.
+func (r *BatchJobExpire) expireAuthzRequests(name, versionID, userTags string) []batchAuthzRequest {
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	reqs := []batchAuthzRequest{
+		{action: policy.GetObjectAction, bucket: r.Bucket, object: name, versionID: versionID, tags: userTags},
+		{action: policy.GetObjectVersionAction, bucket: r.Bucket, object: name, versionID: versionID, tags: userTags},
+		{action: policy.DeleteObjectAction, bucket: r.Bucket, object: name, versionID: versionID, tags: userTags},
+		{action: policy.DeleteObjectVersionAction, bucket: r.Bucket, object: name, versionID: versionID, tags: userTags},
+	}
+	if r.tagsFiltered() {
+		reqs = append(reqs,
+			batchAuthzRequest{action: policy.GetObjectTaggingAction, bucket: r.Bucket, object: name, versionID: versionID, tags: userTags},
+			batchAuthzRequest{action: policy.GetObjectVersionTaggingAction, bucket: r.Bucket, object: name, versionID: versionID, tags: userTags},
+		)
+	}
+	return reqs
+}
+
+// expireVersion deletes one version that is older than the versions the rule
+// retains. Under the object's write lock, with the version as it is then, it
+// leaves a version that Object Lock protects (ObjectLocked) and refuses one
+// that the submitter may not delete (batchJobAuthzError). An unreadable
+// version is not deleted.
+func (r *BatchJobExpire) expireVersion(ctx context.Context, api ObjectLayer, vc *versioning.Versioning, job BatchJobRequest, exp expireObjInfo) error {
+	p, err := job.Submitter.principal(ctx)
+	if err != nil {
+		return err
+	}
+	versionID := exp.VersionID
+	if versionID == "" {
+		// An empty version ID would add a delete marker instead.
+		versionID = nullVersionID
+	}
+	opts := ObjectOptions{
+		VersionID:        versionID,
+		Versioned:        vc.PrefixEnabled(exp.Name),
+		VersionSuspended: vc.Suspended(),
+	}
+	opts.SetEvalRetentionBypassFn(func(goi ObjectInfo, gerr error) error {
+		// A delete marker reads as MethodNotAllowed; any other error,
+		// including a missing version, stops the delete.
+		marker := isErrMethodNotAllowed(gerr) && (goi.DeleteMarker || !goi.VersionPurgeStatus.Empty())
+		if gerr != nil && !marker {
+			return gerr
+		}
+		if enforceRetentionForDeletion(ctx, goi) {
+			return ObjectLocked{Bucket: r.Bucket, Object: exp.Name, VersionID: versionID}
+		}
+		for _, req := range r.expireAuthzRequests(exp.Name, versionID, goi.UserTags) {
+			if err := p.authorize(req); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	_, err = api.DeleteObject(ctx, r.Bucket, exp.Name, opts)
+	return err
+}
+
+// expireVersions deletes the versions of one batch entry and records the
+// outcome in res. It returns an error that ends the job.
+func (r *BatchJobExpire) expireVersions(ctx context.Context, api ObjectLayer, vc *versioning.Versioning, job BatchJobRequest, ri *batchJobInfo, exp expireObjInfo, retryAttempts int, delay time.Duration, res *batchCounts) error {
+	for attempts := 1; attempts <= retryAttempts; attempts++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempts)
+		err := r.expireVersion(ctx, api, vc, job, exp)
+		stopFn(exp, err)
+		switch {
+		case err == nil:
+			if exp.DeleteMarker {
+				ri.countRemoved(r.Bucket, 0, 1)
+			} else {
+				ri.countRemoved(r.Bucket, 1, 0)
+			}
+			return nil
+		case isBatchJobAuthzError(err):
+			return err
+		case isErrObjectLocked(err):
+			// Left in place, not retried and not a failure.
+			res.versionsSkipped++
+			return nil
+		case isErrVersionNotFound(err) || isErrObjectNotFound(err):
+			// Removed concurrently.
+			return nil
+		}
+		batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s versionID=%s due to %v (attempts=%d)", r.Bucket, exp.Name, exp.VersionID, err, attempts))
+		if attempts < retryAttempts {
+			time.Sleep(delay)
+		}
+	}
+	if exp.DeleteMarker {
+		res.deleteMarkersFailed++
+	} else {
+		res.objectsFailed++
+	}
+	return nil
+}
+
+// expireAllVersions purges every version of a key whose rule retains none,
+// with the purge of exactly that key (erasureServerPools.deleteAllVersions),
+// while the version the walk matched is still its latest. Under its lock,
+// before it deletes anything, the purge refuses the key when Object Lock
+// protects a version and has every write it would delete, each copy and
+// each revision a drive holds, authorized for the submitter, with the
+// version ID and tags it has then.
+//
+// What the purge removed is counted at once; a refused key is counted in res
+// as refused, and the versions a failed purge left in res as failures. A
+// failed purge is retried up to retryAttempts times, each time with the
+// version the walk matched; a purge that stopped at its budget after
+// removing versions continues without spending an attempt. A key whose
+// latest version changed since the walk is not expired. It returns an error
+// that ends the job: an authorization failure or the end of ctx.
+func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer, job BatchJobRequest, ri *batchJobInfo, exp expireObjInfo, retryAttempts int, res *batchCounts) error {
+	var objects, markers int64
+	matched := deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime}
+	for attempts := 1; attempts <= retryAttempts; attempts++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempts)
+		latest := matched
+		var purge deleteAllResult
+		p, err := job.Submitter.principal(ctx)
+		if err == nil {
+			_, err = api.DeleteObject(ctx, exp.Bucket, encodeDirObject(exp.Name), ObjectOptions{
+				DeleteAllVersions:  true,
+				DeleteAllLatest:    &latest,
+				DeleteAllResult:    &purge,
+				deleteAllAuthorize: r.expireAllAuthorize(p, exp.Name),
+			})
+		}
+		// Removed versions are gone for any later run: count them now.
+		if purge.Removed > 0 {
+			ri.countRemoved(r.Bucket, int64(purge.Removed-purge.Markers), int64(purge.Markers))
+			objects += int64(purge.Removed - purge.Markers)
+			markers += int64(purge.Markers)
+		}
+		stopFn(exp, err)
+		switch {
+		case err == nil:
+			return nil
+		case isBatchJobAuthzError(err):
+			return err
+		case errors.Is(err, errDeleteAllChanged):
+			// Changed since the walk matched it: not expired.
+			return nil
+		case isErrObjectLocked(err):
+			// Refused as a whole: nothing removed, not retried and not a
+			// failure.
+			res.keysRefused++
+			return nil
+		case errors.Is(err, errDeleteAllBudget) && purge.Removed > 0:
+			attempts-- // progress
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s due to %v (attempts=%d)", exp.Bucket, exp.Name, err, attempts))
+		if errors.Is(err, errDeleteAllTiered) {
+			break // refused; a later run of the job checks again
+		}
+	}
+	res.expireAllFailed(exp, objects, markers)
+	return nil
+}
+
+// expireAllAuthorize returns the authorization of a purge of all versions of
+// name for p: each version the purge would delete, as it holds it, needs the
+// actions of expiring it (expireAuthzRequests).
+func (r *BatchJobExpire) expireAllAuthorize(p batchJobPrincipal, name string) func([]ObjectInfo) error {
+	return func(versions []ObjectInfo) error {
+		for _, v := range versions {
+			for _, req := range r.expireAuthzRequests(name, v.VersionID, v.UserTags) {
+				if err := p.authorize(req); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+}
+
+// expireAllFailed counts the versions of info, as the walk saw them, that a
+// failed purge of all its versions did not remove: those beyond the objects
+// and markers it removed, at least one.
+func (c *batchCounts) expireAllFailed(info expireObjInfo, objects, markers int64) {
+	failedObjects := max(int64(info.NumVersions)-info.DeleteMarkerCount-objects, 0)
+	failedMarkers := max(info.DeleteMarkerCount-markers, 0)
+	if failedObjects+failedMarkers == 0 {
+		failedObjects = 1
+	}
+	c.objectsFailed += failedObjects
+	c.deleteMarkersFailed += failedMarkers
+}
+
+// batchObjsForDelete expires the batches of expireCh. walkDone reports, once
+// expireCh is closed, whether the walk reached its end: only then is its last
+// key known to be complete.
+func batchObjsForDelete(ctx context.Context, refuse func(error), walkDone func() bool, r *BatchJobExpire, ri *batchJobInfo, job BatchJobRequest, api ObjectLayer, wk *workers.Workers, expireCh <-chan []expireObjInfo) {
 	vc, _ := globalBucketVersioningSys.Get(r.Bucket)
 	retryAttempts := job.Expire.Retry.Attempts
 	if retryAttempts <= 0 {
@@ -407,160 +584,51 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 		delay = batchExpireJobDefaultRetryDelay
 	}
 
-	var i int
+	progress := newBatchProgress(ri, r.Bucket)
+	defer func() {
+		wk.Wait()
+		if walkDone() {
+			progress.finish()
+		}
+	}()
 	for toExpire := range expireCh {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if i > 0 {
+		seq := progress.begin()
+		if seq > 0 {
 			if wait := globalBatchConfig.ExpirationWait(); wait > 0 {
 				time.Sleep(wait)
 			}
 		}
-		i++
 		wk.Take()
-		go func(toExpire []expireObjInfo) {
+		go func(seq uint64, toExpire []expireObjInfo) {
 			defer wk.Give()
-
-			toExpireAll := make([]expireObjInfo, 0, len(toExpire))
-			toDel := make([]ObjectToDelete, 0, len(toExpire))
-			oiCache := newObjInfoCache()
+			var res batchCounts
 			for _, exp := range toExpire {
+				var err error
 				if exp.ExpireAll {
-					toExpireAll = append(toExpireAll, exp)
-					continue
+					err = r.expireAllVersions(ctx, api, job, ri, exp, retryAttempts, &res)
+				} else {
+					err = r.expireVersions(ctx, api, vc, job, ri, exp, retryAttempts, delay, &res)
 				}
-				// Cache ObjectInfo value via pointers for
-				// subsequent use to track objects which
-				// couldn't be deleted.
-				od := ObjectToDelete{
-					ObjectV: ObjectV{
-						ObjectName: exp.Name,
-						VersionID:  exp.VersionID,
-					},
-				}
-				toDel = append(toDel, od)
-				oiCache.Add(od, &exp.ObjectInfo)
-			}
-
-			// Purge all versions of exactly each key while the version the
-			// walk matched is still its latest; see
-			// erasureServerPools.deleteAllVersions.
-			for _, exp := range toExpireAll {
-				if !expireAllVersions(ctx, ri, api, exp, retryAttempts) {
-					return
-				}
-			}
-
-			// DeleteMultiple objects
-			toDelCopy := make([]ObjectToDelete, len(toDel))
-			for attempts := 1; attempts <= retryAttempts; attempts++ {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-
-				stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempts)
-				// Copying toDel to select from objects whose
-				// deletion failed
-				copy(toDelCopy, toDel)
-				var failed int
-				errs := r.Expire(ctx, api, vc, toDel)
-				// reslice toDel in preparation for next retry attempt
-				toDel = toDel[:0]
-				for i, err := range errs {
-					if err != nil {
-						stopFn(toDelCopy[i], err)
-						batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s versionID=%s due to %v (attempts=%d)", ri.Bucket, toDelCopy[i].ObjectName, toDelCopy[i].VersionID,
-							err, attempts))
-						failed++
-						if oi, ok := oiCache.Get(toDelCopy[i]); ok {
-							ri.trackCurrentBucketObject(r.Bucket, *oi, false, attempts)
-						}
-						if attempts != retryAttempts {
-							// retry
-							toDel = append(toDel, toDelCopy[i])
-						}
-					} else {
-						stopFn(toDelCopy[i], nil)
-						if oi, ok := oiCache.Get(toDelCopy[i]); ok {
-							ri.trackCurrentBucketObject(r.Bucket, *oi, true, attempts)
-						}
+				if err != nil {
+					// The batch is not done; a later run does it again.
+					if isBatchJobAuthzError(err) {
+						refuse(err)
 					}
-				}
-
-				globalBatchJobsMetrics.save(ri.JobID, ri)
-
-				if failed == 0 {
-					break
-				}
-
-				// Add a delay between retry attempts
-				if attempts < retryAttempts {
-					time.Sleep(delay)
+					globalBatchJobsMetrics.save(ri.JobID, ri)
+					return
 				}
 			}
-		}(toExpire)
+			if n := len(toExpire); n > 0 {
+				progress.done(seq, toExpire[n-1].Name, res)
+			}
+			globalBatchJobsMetrics.save(ri.JobID, ri)
+		}(seq, toExpire)
 	}
-}
-
-// expireAllVersions purges all versions of the key exp, which the walk
-// matched by its latest version, and counts what the purge removed. It
-// retries a failed purge up to attempts times, each time with the version
-// the walk matched; a purge that stopped at its budget continues without
-// spending an attempt. It does not retry once the key no longer has that
-// latest version, which is not an expiry, or once the purge refused the
-// key. It returns false once ctx ends.
-func expireAllVersions(ctx context.Context, ri *batchJobInfo, api ObjectLayer, exp expireObjInfo, attempts int) bool {
-	var objects, markers int64
-	matched := deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime}
-	for attempt := 1; attempt <= attempts; attempt++ {
-		select {
-		case <-ctx.Done():
-			ri.trackExpireAll(exp, objects, markers, true)
-			return false
-		default:
-		}
-		stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempt)
-		latest := matched
-		var purge deleteAllResult
-		_, err := api.DeleteObject(ctx, exp.Bucket, encodeDirObject(exp.Name), ObjectOptions{
-			DeleteAllVersions: true,
-			DeleteAllLatest:   &latest,
-			DeleteAllResult:   &purge,
-		})
-		objects += int64(purge.Removed - purge.Markers)
-		markers += int64(purge.Markers)
-		stopFn(exp, err)
-		switch {
-		case err == nil:
-			ri.trackExpireAll(exp, objects, markers, false)
-			return true
-		case errors.Is(err, errDeleteAllChanged):
-			// Changed since the walk matched it: not expired.
-			ri.trackExpireAll(exp, objects, markers, false)
-			return true
-		case errors.Is(err, errDeleteAllBudget) && purge.Removed > 0:
-			attempt-- // progress
-			continue
-		}
-		batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s due to %v (attempts=%d)", exp.Bucket, exp.Name, err, attempt))
-		var locked ObjectLocked
-		if errors.Is(err, errDeleteAllTiered) || errors.As(err, &locked) {
-			break // refused; a later run of the job checks again
-		}
-	}
-	ri.trackExpireAll(exp, objects, markers, true)
-	return true
-}
-
-type expireObjInfo struct {
-	ObjectInfo
-	ExpireAll         bool
-	DeleteMarkerCount int64
 }
 
 // Start the batch expiration job, resumes if there was a pending job via "job.ID"
@@ -571,6 +639,9 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 		StartTime: job.Started,
 	}
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
+		return err
+	}
+	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
 		return err
 	}
 
@@ -592,27 +663,46 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 
 	ctx, cancelCause := context.WithCancelCause(ctx)
 	defer cancelCause(nil)
+	// refuse ends the job for its submitter: record why before stopping.
+	refuse := func(err error) {
+		ri.refuse(err)
+		cancelCause(err)
+	}
 
+	// The walk stops at a listing failure: work after it is left to a later
+	// run, so the cursor cannot move past what was not listed.
+	walkCtx, stopWalk := context.WithCancel(ctx)
+	defer stopWalk()
+	// walkFailed: a listing failed before it returned any result.
+	var walkFailed atomic.Bool
 	results := make(chan itemOrErr[ObjectInfo], workerSize)
 	go func() {
-		prefixes := r.Prefix.F()
-		if len(prefixes) == 0 {
-			prefixes = []string{""}
-		}
-		for _, prefix := range prefixes {
+		// One ascending walk over disjoint prefixes, which the cursor
+		// describes.
+		for _, prefix := range batchCanonicalPrefixes(r.Prefix.F()) {
+			if walkCtx.Err() != nil {
+				break
+			}
 			prefixResultCh := make(chan itemOrErr[ObjectInfo], workerSize)
-			err := api.Walk(ctx, r.Bucket, prefix, prefixResultCh, WalkOptions{
+			err := api.Walk(walkCtx, r.Bucket, prefix, prefixResultCh, WalkOptions{
 				Marker:       lastObject,
 				LatestOnly:   false, // we need to visit all versions of the object to implement purge: retainVersions
 				VersionsSort: WalkVersionsSortDesc,
 			})
 			if err != nil {
-				cancelCause(err)
+				if walkCtx.Err() == nil {
+					walkFailed.Store(true)
+					cancelCause(err)
+				}
 				xioutil.SafeClose(results)
 				return
 			}
 			for result := range prefixResultCh {
-				results <- result
+				select {
+				case results <- result:
+				case <-walkCtx.Done():
+					// Stopped: let the walk end without a reader.
+				}
 			}
 		}
 		xioutil.SafeClose(results)
@@ -620,7 +710,9 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 
 	// Goroutine to periodically save batch-expire job's in-memory state
 	saverQuitCh := make(chan struct{})
+	saverDoneCh := make(chan struct{})
 	go func() {
+		defer close(saverDoneCh)
 		saveTicker := time.NewTicker(10 * time.Second)
 		defer saveTicker.Stop()
 		quit := false
@@ -647,9 +739,10 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 
 	expireCh := make(chan []expireObjInfo, workerSize)
 	expireDoneCh := make(chan struct{})
+	var walkDone atomic.Bool
 	go func() {
 		defer close(expireDoneCh)
-		batchObjsForDelete(ctx, r, ri, job, api, wk, expireCh)
+		batchObjsForDelete(ctx, refuse, walkDone.Load, r, ri, job, api, wk, expireCh)
 	}()
 
 	var (
@@ -661,6 +754,8 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 		done          bool
 	)
 	deleteMarkerCountMap := map[string]int64{}
+	// pushToExpire is called between keys only, so that a batch holds all
+	// the versions of its keys and its last key is done with it.
 	pushToExpire := func() {
 		// set preObject deleteMarkerCount
 		if len(toDel) > 0 {
@@ -695,6 +790,12 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 			if result.Err != nil {
 				failed = true
 				batchLogIf(ctx, result.Err)
+				stopWalk()
+				done = true
+				break
+			}
+			if !batchResumeAfter(lastObject, result.Item.Name) {
+				// Completed by the run that set the cursor.
 				continue
 			}
 			if result.Item.DeleteMarker {
@@ -752,7 +853,6 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 			toDel = append(toDel, expireObjInfo{
 				ObjectInfo: result.Item,
 			})
-			pushToExpire()
 		case <-ctx.Done():
 			done = true
 		}
@@ -761,16 +861,15 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 		}
 	}
 
-	if context.Cause(ctx) != nil {
-		xioutil.SafeClose(expireCh)
-		return context.Cause(ctx)
-	}
-	pushToExpire()
-	// Send any remaining objects downstream
-	if len(toDel) > 0 {
-		select {
-		case <-ctx.Done():
-		case expireCh <- toDel:
+	if context.Cause(ctx) == nil {
+		walkDone.Store(!failed)
+		pushToExpire()
+		// Send any remaining objects downstream
+		if len(toDel) > 0 {
+			select {
+			case <-ctx.Done():
+			case expireCh <- toDel:
+			}
 		}
 	}
 	xioutil.SafeClose(expireCh)
@@ -778,13 +877,36 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 	<-expireDoneCh // waits for the expire goroutine to complete
 	wk.Wait()      // waits for all expire workers to retire
 
-	ri.Complete = !failed && !ri.expireFailures()
-	ri.Failed = failed || ri.expireFailures()
-	globalBatchJobsMetrics.save(job.ID, ri)
-
-	// Close the saverQuitCh - this also triggers saving in-memory state
-	// immediately one last time before we exit this method.
+	// Persist the final state once the saver has stopped, so that its last
+	// save cannot overwrite it.
 	xioutil.SafeClose(saverQuitCh)
+	<-saverDoneCh
+	refused := ri.refused()
+	cause := context.Cause(ctx)
+	if cause != nil && !refused {
+		if walkFailed.Load() {
+			// This run failed; a later run lists again from the cursor.
+			ri.mu.Lock()
+			ri.Complete = false
+			ri.Failed = true
+			ri.mu.Unlock()
+		}
+		saveCtx, cancel := context.WithTimeout(GlobalContext, 30*time.Second)
+		batchLogIf(saveCtx, ri.updateAfter(saveCtx, api, 0, job))
+		cancel()
+		globalBatchJobsMetrics.save(job.ID, ri)
+		return cause
+	}
+
+	ri.mu.Lock()
+	itemsFailed := ri.expireFailures()
+	ri.Complete = !refused && !failed && !itemsFailed
+	ri.Failed = refused || failed || itemsFailed
+	ri.mu.Unlock()
+	globalBatchJobsMetrics.save(job.ID, ri)
+	saveCtx, cancel := context.WithTimeout(GlobalContext, 30*time.Second)
+	batchLogIf(saveCtx, ri.updateAfter(saveCtx, api, 0, job))
+	cancel()
 
 	// Notify expire jobs final status to the configured endpoint
 	buf, _ := json.Marshal(ri)

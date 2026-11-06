@@ -179,6 +179,24 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+		case "Submitter":
+			if dc.IsNil() {
+				err = dc.ReadNil()
+				if err != nil {
+					err = msgp.WrapError(err, "Submitter")
+					return
+				}
+				z.Submitter = nil
+			} else {
+				if z.Submitter == nil {
+					z.Submitter = new(batchJobSubmitter)
+				}
+				err = z.Submitter.DecodeMsg(dc)
+				if err != nil {
+					err = msgp.WrapError(err, "Submitter")
+					return
+				}
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -192,9 +210,9 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 6
+	// map header, size 7
 	// write "ID"
-	err = en.Append(0x86, 0xa2, 0x49, 0x44)
+	err = en.Append(0x87, 0xa2, 0x49, 0x44)
 	if err != nil {
 		return
 	}
@@ -274,15 +292,32 @@ func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
 			return
 		}
 	}
+	// write "Submitter"
+	err = en.Append(0xa9, 0x53, 0x75, 0x62, 0x6d, 0x69, 0x74, 0x74, 0x65, 0x72)
+	if err != nil {
+		return
+	}
+	if z.Submitter == nil {
+		err = en.WriteNil()
+		if err != nil {
+			return
+		}
+	} else {
+		err = z.Submitter.EncodeMsg(en)
+		if err != nil {
+			err = msgp.WrapError(err, "Submitter")
+			return
+		}
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 6
+	// map header, size 7
 	// string "ID"
-	o = append(o, 0x86, 0xa2, 0x49, 0x44)
+	o = append(o, 0x87, 0xa2, 0x49, 0x44)
 	o = msgp.AppendString(o, z.ID)
 	// string "User"
 	o = append(o, 0xa4, 0x55, 0x73, 0x65, 0x72)
@@ -320,6 +355,17 @@ func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 		o, err = z.Expire.MarshalMsg(o)
 		if err != nil {
 			err = msgp.WrapError(err, "Expire")
+			return
+		}
+	}
+	// string "Submitter"
+	o = append(o, 0xa9, 0x53, 0x75, 0x62, 0x6d, 0x69, 0x74, 0x74, 0x65, 0x72)
+	if z.Submitter == nil {
+		o = msgp.AppendNil(o)
+	} else {
+		o, err = z.Submitter.MarshalMsg(o)
+		if err != nil {
+			err = msgp.WrapError(err, "Submitter")
 			return
 		}
 	}
@@ -413,6 +459,23 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+		case "Submitter":
+			if msgp.IsNil(bts) {
+				bts, err = msgp.ReadNilBytes(bts)
+				if err != nil {
+					return
+				}
+				z.Submitter = nil
+			} else {
+				if z.Submitter == nil {
+					z.Submitter = new(batchJobSubmitter)
+				}
+				bts, err = z.Submitter.UnmarshalMsg(bts)
+				if err != nil {
+					err = msgp.WrapError(err, "Submitter")
+					return
+				}
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -444,6 +507,12 @@ func (z *BatchJobRequest) Msgsize() (s int) {
 		s += msgp.NilSize
 	} else {
 		s += z.Expire.Msgsize()
+	}
+	s += 10
+	if z.Submitter == nil {
+		s += msgp.NilSize
+	} else {
+		s += z.Submitter.Msgsize()
 	}
 	return
 }
@@ -568,6 +637,24 @@ func (z *batchJobInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "BytesFailed")
 				return
 			}
+		case "vsl":
+			z.VersionsSkippedLocked, err = dc.ReadInt64()
+			if err != nil {
+				err = msgp.WrapError(err, "VersionsSkippedLocked")
+				return
+			}
+		case "kr":
+			z.KeysRefused, err = dc.ReadInt64()
+			if err != nil {
+				err = msgp.WrapError(err, "KeysRefused")
+				return
+			}
+		case "fr":
+			z.FailureReason, err = dc.ReadString()
+			if err != nil {
+				err = msgp.WrapError(err, "FailureReason")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -581,9 +668,9 @@ func (z *batchJobInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 17
+	// map header, size 20
 	// write "v"
-	err = en.Append(0xde, 0x0, 0x11, 0xa1, 0x76)
+	err = en.Append(0xde, 0x0, 0x14, 0xa1, 0x76)
 	if err != nil {
 		return
 	}
@@ -752,15 +839,45 @@ func (z *batchJobInfo) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "BytesFailed")
 		return
 	}
+	// write "vsl"
+	err = en.Append(0xa3, 0x76, 0x73, 0x6c)
+	if err != nil {
+		return
+	}
+	err = en.WriteInt64(z.VersionsSkippedLocked)
+	if err != nil {
+		err = msgp.WrapError(err, "VersionsSkippedLocked")
+		return
+	}
+	// write "kr"
+	err = en.Append(0xa2, 0x6b, 0x72)
+	if err != nil {
+		return
+	}
+	err = en.WriteInt64(z.KeysRefused)
+	if err != nil {
+		err = msgp.WrapError(err, "KeysRefused")
+		return
+	}
+	// write "fr"
+	err = en.Append(0xa2, 0x66, 0x72)
+	if err != nil {
+		return
+	}
+	err = en.WriteString(z.FailureReason)
+	if err != nil {
+		err = msgp.WrapError(err, "FailureReason")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *batchJobInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 17
+	// map header, size 20
 	// string "v"
-	o = append(o, 0xde, 0x0, 0x11, 0xa1, 0x76)
+	o = append(o, 0xde, 0x0, 0x14, 0xa1, 0x76)
 	o = msgp.AppendInt(o, z.Version)
 	// string "jid"
 	o = append(o, 0xa3, 0x6a, 0x69, 0x64)
@@ -810,6 +927,15 @@ func (z *batchJobInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "bf"
 	o = append(o, 0xa2, 0x62, 0x66)
 	o = msgp.AppendInt64(o, z.BytesFailed)
+	// string "vsl"
+	o = append(o, 0xa3, 0x76, 0x73, 0x6c)
+	o = msgp.AppendInt64(o, z.VersionsSkippedLocked)
+	// string "kr"
+	o = append(o, 0xa2, 0x6b, 0x72)
+	o = msgp.AppendInt64(o, z.KeysRefused)
+	// string "fr"
+	o = append(o, 0xa2, 0x66, 0x72)
+	o = msgp.AppendString(o, z.FailureReason)
 	return
 }
 
@@ -933,6 +1059,24 @@ func (z *batchJobInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "BytesFailed")
 				return
 			}
+		case "vsl":
+			z.VersionsSkippedLocked, bts, err = msgp.ReadInt64Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "VersionsSkippedLocked")
+				return
+			}
+		case "kr":
+			z.KeysRefused, bts, err = msgp.ReadInt64Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "KeysRefused")
+				return
+			}
+		case "fr":
+			z.FailureReason, bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "FailureReason")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -947,6 +1091,6 @@ func (z *batchJobInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *batchJobInfo) Msgsize() (s int) {
-	s = 3 + 2 + msgp.IntSize + 4 + msgp.StringPrefixSize + len(z.JobID) + 3 + msgp.StringPrefixSize + len(z.JobType) + 3 + msgp.TimeSize + 3 + msgp.TimeSize + 3 + msgp.IntSize + 3 + msgp.IntSize + 4 + msgp.BoolSize + 4 + msgp.BoolSize + 5 + msgp.StringPrefixSize + len(z.Bucket) + 5 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.Int64Size
+	s = 3 + 2 + msgp.IntSize + 4 + msgp.StringPrefixSize + len(z.JobID) + 3 + msgp.StringPrefixSize + len(z.JobType) + 3 + msgp.TimeSize + 3 + msgp.TimeSize + 3 + msgp.IntSize + 3 + msgp.IntSize + 4 + msgp.BoolSize + 4 + msgp.BoolSize + 5 + msgp.StringPrefixSize + len(z.Bucket) + 5 + msgp.StringPrefixSize + len(z.Object) + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.Int64Size + 4 + msgp.Int64Size + 3 + msgp.Int64Size + 3 + msgp.StringPrefixSize + len(z.FailureReason)
 	return
 }

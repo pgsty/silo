@@ -25,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 // The parts of the purge of all versions that need its own options.
@@ -65,16 +67,22 @@ func TestPurgeAllVersionsOptions(t *testing.T) {
 	p.version(0, "ea/key", "v1", 5)
 	match := &deleteAllMatch{}
 	expire := ExpirationOptions{Expire: true}
+	allow := func([]ObjectInfo) error { return nil }
 	for name, opts := range map[string]ObjectOptions{
 		"no approval":   {DeleteAllVersions: true},
-		"two approvals": {DeleteAllVersions: true, Expiration: expire, DeleteAllLatest: match},
-		"prefix":        {DeleteAllVersions: true, Expiration: expire, DeletePrefix: true},
-		"prefix object": {DeleteAllVersions: true, Expiration: expire, DeletePrefixObject: true},
-		"version":       {DeleteAllVersions: true, Expiration: expire, VersionID: mustGetUUID()},
-		"movement":      {DeleteAllVersions: true, Expiration: expire, DataMovement: true},
-		"marker":        {DeleteAllVersions: true, Expiration: expire, DeleteMarker: true},
-		"versioned":     {DeleteAllVersions: true, Expiration: expire, Versioned: true},
-		"suspended":     {DeleteAllVersions: true, Expiration: expire, VersionSuspended: true},
+		"two approvals": {DeleteAllVersions: true, Expiration: expire, DeleteAllLatest: match, deleteAllAuthorize: allow},
+		// A batch purge deletes as the submitter of its job, an ILM purge
+		// as the server, and no other delete takes an authorization.
+		"batch unauthorized": {DeleteAllVersions: true, DeleteAllLatest: match},
+		"ilm authorized":     {DeleteAllVersions: true, Expiration: expire, deleteAllAuthorize: allow},
+		"authorized delete":  {deleteAllAuthorize: allow},
+		"prefix":             {DeleteAllVersions: true, Expiration: expire, DeletePrefix: true},
+		"prefix object":      {DeleteAllVersions: true, Expiration: expire, DeletePrefixObject: true},
+		"version":            {DeleteAllVersions: true, Expiration: expire, VersionID: mustGetUUID()},
+		"movement":           {DeleteAllVersions: true, Expiration: expire, DataMovement: true},
+		"marker":             {DeleteAllVersions: true, Expiration: expire, DeleteMarker: true},
+		"versioned":          {DeleteAllVersions: true, Expiration: expire, Versioned: true},
+		"suspended":          {DeleteAllVersions: true, Expiration: expire, VersionSuspended: true},
 	} {
 		if _, err := z.DeleteObject(t.Context(), p.bucket, "ea/key", opts); !errors.As(err, new(InvalidArgument)) {
 			t.Errorf("%s: %v", name, err)
@@ -134,9 +142,10 @@ func TestPurgeAllVersionsBudgetCoversReads(t *testing.T) {
 	t.Cleanup(func() { pool.erasureDisksMu.Lock(); pool.erasureDisks = prior; pool.erasureDisksMu.Unlock() })
 	var res deleteAllResult
 	_, err := z.DeleteObject(t.Context(), p.bucket, key, ObjectOptions{
-		DeleteAllVersions: true,
-		DeleteAllLatest:   &deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime},
-		DeleteAllResult:   &res,
+		DeleteAllVersions:  true,
+		DeleteAllLatest:    &deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime},
+		DeleteAllResult:    &res,
+		deleteAllAuthorize: func([]ObjectInfo) error { return nil },
 	})
 	if !errors.Is(err, errDeleteAllBudget) || res.Started || res.Removed != 0 {
 		t.Errorf("purge after its budget ran out on reads: err=%v %+v", err, res)
@@ -149,7 +158,11 @@ func TestPurgeAllVersionsBudgetCoversReads(t *testing.T) {
 // A marker that an expiration job failed to remove fails the job.
 func TestPurgeAllVersionsMarkerFailureFailsJob(t *testing.T) {
 	ri := &batchJobInfo{}
-	ri.trackExpireAll(expireObjInfo{ObjectInfo: ObjectInfo{NumVersions: 2}, DeleteMarkerCount: 1}, 1, 0, true)
+	var res batchCounts
+	res.expireAllFailed(expireObjInfo{ObjectInfo: ObjectInfo{Name: "key", NumVersions: 2}, DeleteMarkerCount: 1}, 1, 0)
+	progress := newBatchProgress(ri, "bucket")
+	progress.done(progress.begin(), "key", res)
+	progress.finish()
 	if ri.ObjectsFailed != 0 || ri.DeleteMarkersFailed != 1 || !ri.expireFailures() {
 		t.Errorf("failed=%d/%d failures=%t", ri.ObjectsFailed, ri.DeleteMarkersFailed, ri.expireFailures())
 	}
@@ -209,13 +222,73 @@ func TestPurgeAllVersionsDeletesOnCheckedDrives(t *testing.T) {
 	})
 	var res deleteAllResult
 	if _, err := z.DeleteObject(t.Context(), p.bucket, key, ObjectOptions{
-		DeleteAllVersions: true,
-		DeleteAllLatest:   &deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime},
-		DeleteAllResult:   &res,
+		DeleteAllVersions:  true,
+		DeleteAllLatest:    &deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime},
+		DeleteAllResult:    &res,
+		deleteAllAuthorize: func([]ObjectInfo) error { return nil },
 	}); err != nil || !res.Complete {
 		t.Fatalf("purge: %v %+v", err, res)
 	}
 	if reads.Load() != 2 || deletes.Load() != 0 {
 		t.Errorf("reads=%d deletes on the replacement handle=%d", reads.Load(), deletes.Load())
+	}
+}
+
+// A batch purge has every copy of every version it approved authorized, as
+// the copy is now, before it deletes any; an authorization error deletes
+// nothing and is returned as it is.
+func TestPurgeAllVersionsAuthorizesEveryCopy(t *testing.T) {
+	z, _ := consistencyPools(t)
+	p := newPurgeTest(t, z, "purge-authorize", MakeBucketOptions{VersioningEnabled: true}, "")
+	const key = "bx/authorize"
+	p.put(0, key, "old", daysAgo(6), ObjectOptions{})
+	p.put(1, key, "new", daysAgo(5), ObjectOptions{UserDefined: map[string]string{xhttp.AmzObjectTagging: "copy=new"}})
+	tagged := p.put(0, key, "v1", daysAgo(4), ObjectOptions{Versioned: true, UserDefined: map[string]string{xhttp.AmzObjectTagging: "keep=yes"}})
+	exp := p.matched(key)
+	denied := errors.New("denied")
+	var seen []string // the distinct versions and tags authorized
+	purge := func(authorize func([]ObjectInfo) error) (deleteAllResult, error) {
+		var res deleteAllResult
+		_, err := z.DeleteObject(t.Context(), p.bucket, key, ObjectOptions{
+			DeleteAllVersions:  true,
+			DeleteAllLatest:    &deleteAllMatch{VersionID: exp.VersionID, ModTime: exp.ModTime},
+			DeleteAllResult:    &res,
+			deleteAllAuthorize: authorize,
+		})
+		return res, err
+	}
+	res, err := purge(func(versions []ObjectInfo) error {
+		for _, v := range versions {
+			if got := v.VersionID + " " + v.UserTags; !slices.Contains(seen, got) {
+				seen = append(seen, got)
+			}
+		}
+		return denied
+	})
+	if !errors.Is(err, denied) || res.Started || res.Removed != 0 {
+		t.Errorf("denied purge: err=%v %+v", err, res)
+	}
+	want := []string{"null ", "null copy=new", tagged.VersionID + " keep=yes"}
+	slices.Sort(seen)
+	slices.Sort(want)
+	if !slices.Equal(seen, want) {
+		t.Errorf("authorized %q, want every copy %q", seen, want)
+	}
+	for pool := range z.serverPools {
+		if got := p.held(pool, key); len(got) == 0 {
+			t.Errorf("pool %d lost its copies to a denied purge", pool)
+		}
+	}
+	if got := p.get(key); got != "v1" {
+		t.Errorf("reads %s after a denied purge, want v1", got)
+	}
+	// Control: an allowed purge deletes them all.
+	if res, err = purge(func([]ObjectInfo) error { return nil }); err != nil || !res.Complete {
+		t.Fatalf("allowed purge: %v %+v", err, res)
+	}
+	for pool := range z.serverPools {
+		if got := p.held(pool, key); got != nil {
+			t.Errorf("pool %d keeps %v", pool, got)
+		}
 	}
 }

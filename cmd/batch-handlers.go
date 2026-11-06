@@ -43,6 +43,8 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/amztime"
+	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/config/batch"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
@@ -72,31 +74,46 @@ type BatchJobRequest struct {
 	Replicate *BatchJobReplicateV1 `yaml:"replicate" json:"replicate"`
 	KeyRotate *BatchJobKeyRotateV1 `yaml:"keyrotate" json:"keyrotate"`
 	Expire    *BatchJobExpire      `yaml:"expire" json:"expire"`
-	ctx       context.Context      `msg:"-"`
+	// Submitter is the credential the job acts as. The server assigns it
+	// at submission; a job definition cannot name it.
+	Submitter *batchJobSubmitter `yaml:"-" json:"-"`
+	ctx       context.Context    `msg:"-"`
 }
 
-// RedactSensitive will redact any sensitive information in b.
-func (j *BatchJobRequest) RedactSensitive() {
-	j.Replicate.RedactSensitive()
-	j.Expire.RedactSensitive()
-	j.KeyRotate.RedactSensitive()
+// redacted returns a copy of the job for output outside the server: the
+// describe response, logs and errors. The copy has no secret keys, session
+// tokens or notification tokens, and no submitter binding; the job itself,
+// which a run needs as it is, is not changed.
+func (j BatchJobRequest) redacted() (BatchJobRequest, error) {
+	buf, err := j.MarshalMsg(nil)
+	if err != nil {
+		return BatchJobRequest{}, err
+	}
+	var c BatchJobRequest
+	if _, err = c.UnmarshalMsg(buf); err != nil {
+		return BatchJobRequest{}, err
+	}
+	redact := func(s *string) {
+		if *s != "" {
+			*s = redactedText
+		}
+	}
+	c.Submitter = nil
+	if r := c.Replicate; r != nil {
+		redact(&r.Source.Creds.SecretKey)
+		redact(&r.Source.Creds.SessionToken)
+		redact(&r.Target.Creds.SecretKey)
+		redact(&r.Target.Creds.SessionToken)
+		redact(&r.Flags.Notify.Token)
+	}
+	if r := c.KeyRotate; r != nil {
+		redact(&r.Flags.Notify.Token)
+	}
+	if r := c.Expire; r != nil {
+		redact(&r.NotificationCfg.Token)
+	}
+	return c, nil
 }
-
-// RedactSensitive will redact any sensitive information in b.
-func (r *BatchJobReplicateV1) RedactSensitive() {
-	if r == nil {
-		return
-	}
-	if r.Target.Creds.SecretKey != "" {
-		r.Target.Creds.SecretKey = redactedText
-	}
-	if r.Target.Creds.SessionToken != "" {
-		r.Target.Creds.SessionToken = redactedText
-	}
-}
-
-// RedactSensitive will redact any sensitive information in b.
-func (r *BatchJobKeyRotateV1) RedactSensitive() {}
 
 func notifyEndpoint(ctx context.Context, ri *batchJobInfo, endpoint, token string) error {
 	if endpoint == "" {
@@ -140,8 +157,114 @@ func (r BatchJobReplicateV1) Notify(ctx context.Context, ri *batchJobInfo) error
 	return notifyEndpoint(ctx, ri, r.Flags.Notify.Endpoint, r.Flags.Notify.Token)
 }
 
-// ReplicateFromSource - this is not implemented yet where source is 'remote' and target is local.
-func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api ObjectLayer, core *minio.Core, srcObjInfo ObjectInfo, retry bool) error {
+// batchPullObjectLock prepares the Object Lock metadata that a pull writes
+// with a version, as a PUT would on the destination: Object Lock metadata
+// copied from the source must be valid, a version without retention takes the
+// destination bucket's default retention, and both are dated with the
+// destination's clock. Outside a lock-enabled bucket the metadata has no
+// meaning and is not written. It reports the retention and legal hold that
+// the pull copies from the source.
+func batchPullObjectLock(bucket string, meta map[string]string) (retention, legalHold bool, err error) {
+	cfg, err := globalBucketObjectLockSys.Get(bucket)
+	if err != nil {
+		return false, false, err
+	}
+	h := make(http.Header)
+	for k, v := range meta {
+		for _, name := range []string{xhttp.AmzObjectLockMode, xhttp.AmzObjectLockRetainUntilDate, xhttp.AmzObjectLockLegalHold} {
+			if strings.EqualFold(k, name) {
+				h.Set(name, v)
+				delete(meta, k)
+			}
+		}
+	}
+	if !cfg.LockEnabled {
+		return false, false, nil
+	}
+	if h.Get(xhttp.AmzObjectLockMode) != "" || h.Get(xhttp.AmzObjectLockRetainUntilDate) != "" {
+		// A copied retention may have expired already.
+		mode, until, err := objectlock.ParseObjectLockRetentionHeaders(h, true)
+		if err != nil {
+			return false, false, err
+		}
+		meta[strings.ToLower(xhttp.AmzObjectLockMode)] = string(mode)
+		meta[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(until.UTC())
+		retention = true
+	} else if cfg.Validity > 0 {
+		now, err := objectlock.UTCNowNTP()
+		if err != nil {
+			return false, false, err
+		}
+		meta[strings.ToLower(xhttp.AmzObjectLockMode)] = string(cfg.Mode)
+		meta[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(now.Add(cfg.Validity).UTC())
+	}
+	if _, ok := h[xhttp.AmzObjectLockLegalHold]; ok {
+		hold, err := objectlock.ParseObjectLockLegalHoldHeaders(h)
+		if err != nil {
+			return false, false, err
+		}
+		meta[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = string(hold.Status)
+		legalHold = true
+	}
+	return retention, legalHold, nil
+}
+
+// pullAuthzRequests are the writes of one version that a pull makes to the
+// destination key: the version, with the tags, retention and legal hold it
+// copies, and the replication permission for a version ID it keeps.
+//
+// The pull does not encrypt what it writes, so it supplies no encryption
+// values, whatever the source reports; and it does not read the destination
+// version it may replace, so the tags of that version are unknown.
+func pullAuthzRequests(bucket, object, versionID string, keepsVersion bool, opts ObjectOptions, retention, legalHold bool) []batchAuthzRequest {
+	values := map[string][]string{}
+	meta := caseInsensitiveMap(opts.UserDefined)
+	if retention {
+		mode, _ := meta.Lookup(xhttp.AmzObjectLockMode)
+		until, _ := meta.Lookup(xhttp.AmzObjectLockRetainUntilDate)
+		values[strings.TrimPrefix(strings.ToLower(xhttp.AmzObjectLockMode), "x-amz-")] = []string{mode}
+		values[strings.TrimPrefix(strings.ToLower(xhttp.AmzObjectLockRetainUntilDate), "x-amz-")] = []string{until}
+	}
+	if legalHold {
+		hold, _ := meta.Lookup(xhttp.AmzObjectLockLegalHold)
+		values[strings.TrimPrefix(strings.ToLower(xhttp.AmzObjectLockLegalHold), "x-amz-")] = []string{hold}
+	}
+	tagStr, hasTags := meta.Lookup(xhttp.AmzObjectTagging)
+	if hasTags && tagStr != "" {
+		if t, err := tags.ParseObjectTags(tagStr); err == nil {
+			m := t.ToMap()
+			keys := make([]string, 0, len(m))
+			for k, v := range m {
+				values[pathJoin("RequestObjectTag", k)] = []string{v}
+				keys = append(keys, k)
+			}
+			values["RequestObjectTagKeys"] = keys
+		}
+	}
+	actions := []policy.Action{policy.PutObjectAction}
+	if keepsVersion {
+		actions = append(actions, policy.ReplicateObjectAction)
+	}
+	if hasTags && tagStr != "" {
+		actions = append(actions, policy.PutObjectTaggingAction)
+	}
+	if retention {
+		actions = append(actions, policy.PutObjectRetentionAction)
+	}
+	if legalHold {
+		actions = append(actions, policy.PutObjectLegalHoldAction)
+	}
+	reqs := make([]batchAuthzRequest, 0, len(actions))
+	for _, action := range actions {
+		reqs = append(reqs, batchAuthzRequest{action: action, bucket: bucket, object: object, versionID: versionID, tagsUnknown: true, values: values})
+	}
+	return reqs
+}
+
+// ReplicateFromSource copies one version from the remote source to the local
+// target. A write that would replace a version protected by Object Lock
+// returns ObjectLocked and leaves it.
+func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api ObjectLayer, core *minio.Core, srcObjInfo ObjectInfo, retry bool, sub *batchJobSubmitter) error {
 	srcBucket := r.Source.Bucket
 	tgtBucket := r.Target.Bucket
 	srcObject := srcObjInfo.Name
@@ -150,11 +273,28 @@ func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api Objec
 		tgtObject = pathJoin(r.Target.Prefix, srcObjInfo.Name)
 	}
 
+	p, err := sub.principal(ctx)
+	if err != nil {
+		return err
+	}
 	versionID := srcObjInfo.VersionID
 	if r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3 {
 		versionID = ""
 	}
 	if srcObjInfo.DeleteMarker {
+		markerVersion := versionID
+		if markerVersion == "" {
+			markerVersion = nullVersionID
+		}
+		for _, req := range []batchAuthzRequest{
+			{action: policy.DeleteObjectAction, bucket: tgtBucket, object: tgtObject, versionID: markerVersion, tagsUnknown: true},
+			{action: policy.DeleteObjectVersionAction, bucket: tgtBucket, object: tgtObject, versionID: markerVersion, tagsUnknown: true},
+			{action: policy.ReplicateDeleteAction, bucket: tgtBucket, object: tgtObject, versionID: markerVersion, tagsUnknown: true},
+		} {
+			if err := p.authorize(req); err != nil {
+				return err
+			}
+		}
 		_, err := api.DeleteObject(ctx, tgtBucket, tgtObject, ObjectOptions{
 			VersionID: versionID,
 			// Since we are preserving a delete marker, we have to make sure this is always true.
@@ -164,21 +304,42 @@ func (r *BatchJobReplicateV1) ReplicateFromSource(ctx context.Context, api Objec
 			MTime:              srcObjInfo.ModTime,
 			DeleteMarker:       srcObjInfo.DeleteMarker,
 			ReplicationRequest: true,
+			// A new marker may hide a locked version; one that would replace
+			// it is refused.
+			RefuseLockedOverwrite: true,
 		})
 		return err
 	}
 
-	opts := ObjectOptions{
-		VersionID:    srcObjInfo.VersionID,
-		MTime:        srcObjInfo.ModTime,
-		PreserveETag: srcObjInfo.ETag,
-		UserDefined:  srcObjInfo.UserDefined,
+	userDefined := cloneMSS(srcObjInfo.UserDefined)
+	retention, legalHold, err := batchPullObjectLock(tgtBucket, userDefined)
+	if err != nil {
+		return err
 	}
-	if r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3 {
-		opts.VersionID = ""
+	opts := ObjectOptions{
+		VersionID:        versionID,
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(tgtBucket, tgtObject),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(tgtBucket, tgtObject),
+		MTime:            srcObjInfo.ModTime,
+		PreserveETag:     srcObjInfo.ETag,
+		UserDefined:      userDefined,
+		// Checked with the commit, under the destination's write lock.
+		RefuseLockedOverwrite: true,
 	}
 	if crypto.S3.IsEncrypted(srcObjInfo.UserDefined) {
 		opts.ServerSideEncryption = encrypt.NewSSE()
+	}
+	// The version the write replaces or creates: the source's version ID it
+	// keeps, or the null version of a destination that does not version
+	// the key. A versioned destination gives a write without an ID a new one.
+	writeVersion := versionID
+	if writeVersion == "" && !opts.Versioned {
+		writeVersion = nullVersionID
+	}
+	for _, req := range pullAuthzRequests(tgtBucket, tgtObject, writeVersion, versionID != "", opts, retention, legalHold) {
+		if err := p.authorize(req); err != nil {
+			return err
+		}
 	}
 	slc := strings.Split(srcObjInfo.ETag, "-")
 	if len(slc) == 2 {
@@ -298,6 +459,9 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	if ri.Complete {
 		return nil
 	}
+	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
+		return err
+	}
 	globalBatchJobsMetrics.save(job.ID, ri)
 
 	retryAttempts := job.Replicate.Flags.Retry.Attempts
@@ -411,7 +575,17 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		// one of source/target is s3, skip delete marker and all versions under the same object name.
 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
 		minioSrc := r.Source.Type == BatchJobReplicateResourceMinIO
-		ctx, cancel := context.WithCancel(ctx)
+		ctx, cancelCause := context.WithCancelCause(ctx)
+		// refuse ends the job for its submitter: record why before stopping.
+		refuse := func(err error) {
+			ri.refuse(err)
+			cancelCause(err)
+		}
+		// Each run lists the source from the start and counts every locked
+		// collision again.
+		ri.mu.Lock()
+		ri.VersionsSkippedLocked = 0
+		ri.mu.Unlock()
 
 		objInfoCh := make(chan minio.ObjectInfo, 1)
 		go func() {
@@ -437,6 +611,10 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		skipReplicate := false
 
 		for obj := range objInfoCh {
+			if context.Cause(ctx) != nil {
+				// Refused or canceled: schedule nothing more.
+				continue
+			}
 			oi := toObjectInfo(r.Source.Bucket, obj.Key, obj)
 			if !minioSrc {
 				// Check if metadata filter was requested and it is expected to have
@@ -484,7 +662,19 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 				defer wk.Give()
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricReplication, job.ID, attempts)
 				success := true
-				if err := r.ReplicateFromSource(ctx, api, core, oi, retry); err != nil {
+				if err := r.ReplicateFromSource(ctx, api, core, oi, retry, job.Submitter); err != nil {
+					if isBatchJobAuthzError(err) {
+						refuse(err)
+						return
+					}
+					// A locked destination version is left as it is: the
+					// job completes with it skipped, not replicated.
+					if isErrObjectLocked(err) {
+						stopFn(oi, err)
+						ri.countSkipped()
+						globalBatchJobsMetrics.save(job.ID, ri)
+						return
+					}
 					// object must be deleted concurrently, allow these failures but do not count them
 					if isErrVersionNotFound(err) || isErrObjectNotFound(err) {
 						return
@@ -495,7 +685,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 				} else {
 					stopFn(oi, nil)
 				}
-				ri.trackCurrentBucketObject(r.Target.Bucket, oi, success, attempts)
+				ri.trackCurrentBucketObject(r.Target.Bucket, oi, success)
 				globalBatchJobsMetrics.save(job.ID, ri)
 				// persist in-memory state to disk after every 10secs.
 				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
@@ -507,9 +697,19 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		}
 		wk.Wait()
 
+		if ri.refused() {
+			cancelCause(nil)
+			globalBatchJobsMetrics.save(job.ID, ri)
+			batchLogIf(ctx, ri.updateAfter(GlobalContext, api, 0, job))
+			if err := r.Notify(GlobalContext, ri); err != nil {
+				batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
+			}
+			return nil
+		}
+
 		ri.RetryAttempts = attempts
-		ri.Complete = ri.ObjectsFailed == 0
-		ri.Failed = ri.ObjectsFailed > 0
+		ri.Complete = ri.ObjectsFailed == 0 && ri.DeleteMarkersFailed == 0
+		ri.Failed = !ri.Complete
 
 		globalBatchJobsMetrics.save(job.ID, ri)
 		// persist in-memory state to disk.
@@ -519,12 +719,14 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
 		}
 
-		cancel()
+		cancelCause(nil)
 		if ri.Failed {
 			ri.ObjectsFailed = 0
+			ri.DeleteMarkersFailed = 0
 			ri.Bucket = ""
 			ri.Object = ""
 			ri.Objects = 0
+			ri.DeleteMarkers = 0
 			ri.BytesFailed = 0
 			ri.BytesTransferred = 0
 			retry = true // indicate we are retrying..
@@ -580,7 +782,10 @@ func toObjectInfo(bucket, object string, objInfo minio.ObjectInfo) ObjectInfo {
 	return oi
 }
 
-func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLayer, remoteClnt *minio.Client, entries []ObjectInfo, prefix string) error {
+func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLayer, remoteClnt *minio.Client, entries []ObjectInfo, prefix string, sub *batchJobSubmitter) error {
+	// An entry the submitter may not read ends the archive and the job; an
+	// entry whose metadata cannot be read ends the archive.
+	var refused, readErr error
 	input := make(chan minio.SnowballObject, 1)
 	opts := minio.SnowballOptions{
 		Opts: minio.PutObjectOptions{
@@ -593,17 +798,41 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 		SkipErrs: *r.Source.Snowball.SkipErrs,
 	}
 
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+	producerDone := make(chan struct{})
 	go func() {
+		defer close(producerDone)
 		defer xioutil.SafeClose(input)
 
 		for _, entry := range entries {
-			gr, err := objAPI.GetObjectNInfo(ctx, r.Source.Bucket,
+			gr, err := objAPI.GetObjectNInfo(uploadCtx, r.Source.Bucket,
 				entry.Name, nil, nil, ObjectOptions{
 					VersionID: entry.VersionID,
 				})
 			if err != nil {
 				batchLogIf(ctx, err)
-				continue
+				if isErrObjectNotFound(err) || isErrVersionNotFound(err) || *r.Source.Snowball.SkipErrs {
+					continue
+				}
+				// Not sent and not skippable: the batch goes to the
+				// per-object path.
+				readErr = err
+				return
+			}
+			// Each entry is a decision of its own, for the submitter as it is,
+			// on the metadata of all copies of the version.
+			logical, lerr := batchAuthoritativeRead(uploadCtx, objAPI, r.Source.Bucket, entry.Name, gr.ObjInfo)
+			if lerr != nil {
+				// Not sent: the batch goes to the per-object path.
+				gr.Close()
+				readErr = lerr
+				return
+			}
+			refused = sub.authorize(uploadCtx, append(r.pushAuthzRequests(gr.ObjInfo), r.pushAuthzRequests(logical)...)...)
+			if refused != nil {
+				gr.Close()
+				return
 			}
 
 			if prefix != "" {
@@ -625,6 +854,7 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 
 			opts, _, err := batchReplicationOpts(ctx, "", gr.ObjInfo)
 			if err != nil {
+				gr.Close()
 				batchLogIf(ctx, err)
 				continue
 			}
@@ -635,23 +865,75 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 				}
 			}
 
-			input <- snowballObj
+			select {
+			case input <- snowballObj:
+			case <-uploadCtx.Done():
+				gr.Close()
+				return
+			}
 		}
 	}()
 
 	// Collect and upload all entries.
-	return remoteClnt.PutObjectsSnowball(ctx, r.Target.Bucket, opts, input)
+	err := remoteClnt.PutObjectsSnowball(uploadCtx, r.Target.Bucket, opts, input)
+	cancelUpload()
+	<-producerDone
+	if refused != nil {
+		return refused
+	}
+	if readErr != nil {
+		return readErr
+	}
+	return err
+}
+
+// pushAuthzRequests are the reads of one source version that a push copies to
+// the target: the version itself, and its tags, retention and legal hold.
+func (r *BatchJobReplicateV1) pushAuthzRequests(oi ObjectInfo) []batchAuthzRequest {
+	bucket, object, versionID := r.Source.Bucket, oi.Name, oi.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	reqs := []batchAuthzRequest{
+		{action: policy.GetObjectAction, bucket: bucket, object: object, versionID: versionID, tags: oi.UserTags},
+		{action: policy.GetObjectVersionAction, bucket: bucket, object: object, versionID: versionID, tags: oi.UserTags},
+	}
+	if oi.UserTags != "" {
+		reqs = append(reqs,
+			batchAuthzRequest{action: policy.GetObjectTaggingAction, bucket: bucket, object: object, versionID: versionID, tags: oi.UserTags},
+			batchAuthzRequest{action: policy.GetObjectVersionTaggingAction, bucket: bucket, object: object, versionID: versionID, tags: oi.UserTags},
+		)
+	}
+	meta := caseInsensitiveMap(oi.UserDefined)
+	_, mode := meta.Lookup(xhttp.AmzObjectLockMode)
+	_, until := meta.Lookup(xhttp.AmzObjectLockRetainUntilDate)
+	if mode || until {
+		reqs = append(reqs, batchAuthzRequest{action: policy.GetObjectRetentionAction, bucket: bucket, object: object, versionID: versionID, tags: oi.UserTags})
+	}
+	if _, hold := meta.Lookup(xhttp.AmzObjectLockLegalHold); hold {
+		reqs = append(reqs, batchAuthzRequest{action: policy.GetObjectLegalHoldAction, bucket: bucket, object: object, versionID: versionID, tags: oi.UserTags})
+	}
+	return reqs
 }
 
 // ReplicateToTarget read from source and replicate to configured target
-func (r *BatchJobReplicateV1) ReplicateToTarget(ctx context.Context, api ObjectLayer, c *minio.Core, srcObjInfo ObjectInfo, retry bool) error {
+func (r *BatchJobReplicateV1) ReplicateToTarget(ctx context.Context, api ObjectLayer, c *minio.Core, srcObjInfo ObjectInfo, retry bool, sub *batchJobSubmitter) error {
 	srcBucket := r.Source.Bucket
 	tgtBucket := r.Target.Bucket
 	tgtPrefix := r.Target.Prefix
 	srcObject := srcObjInfo.Name
 	s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
 
+	p, err := sub.principal(ctx)
+	if err != nil {
+		return err
+	}
 	if srcObjInfo.DeleteMarker || !srcObjInfo.VersionPurgeStatus.Empty() {
+		for _, req := range r.pushAuthzRequests(srcObjInfo) {
+			if err := p.authorize(req); err != nil {
+				return err
+			}
+		}
 		if retry && !s3Type {
 			if _, err := c.StatObject(ctx, tgtBucket, pathJoin(tgtPrefix, srcObject), minio.StatObjectOptions{
 				VersionID: srcObjInfo.VersionID,
@@ -707,6 +989,19 @@ func (r *BatchJobReplicateV1) ReplicateToTarget(ctx context.Context, api ObjectL
 	}
 	defer rd.Close()
 	objInfo := rd.ObjInfo
+	// Authorize the version as it is read, with the metadata of all its
+	// copies.
+	logical, err := batchAuthoritativeRead(ctx, api, srcBucket, srcObject, objInfo)
+	if err != nil {
+		return err
+	}
+	// What is sent comes from the opened copy; both it and the version as
+	// all copies describe it must be authorized.
+	for _, req := range append(r.pushAuthzRequests(objInfo), r.pushAuthzRequests(logical)...) {
+		if err := p.authorize(req); err != nil {
+			return err
+		}
+	}
 
 	size, err := objInfo.GetActualSize()
 	if err != nil {
@@ -760,6 +1055,16 @@ type batchJobInfo struct {
 	DeleteMarkersFailed int64 `json:"deleteMarkersFailed" msg:"dmf"`
 	BytesTransferred    int64 `json:"bytesTransferred" msg:"bt"`
 	BytesFailed         int64 `json:"bytesFailed" msg:"bf"`
+
+	// Versions the job left in place because Object Lock protects them,
+	// and keys it refused as a whole for the same reason. A job that
+	// completes with them has not acted on those versions.
+	VersionsSkippedLocked int64 `json:"versionsSkippedLocked" msg:"vsl"`
+	KeysRefused           int64 `json:"keysRefused" msg:"kr"`
+
+	// FailureReason is set when the job was refused for its submitter. It
+	// ends the job: a job that has one does not run again.
+	FailureReason string `json:"failureReason,omitempty" msg:"fr"`
 }
 
 const (
@@ -901,40 +1206,31 @@ func (ri *batchJobInfo) clone() *batchJobInfo {
 		BytesTransferred:    ri.BytesTransferred,
 		BytesFailed:         ri.BytesFailed,
 		Attempts:            ri.Attempts,
+
+		VersionsSkippedLocked: ri.VersionsSkippedLocked,
+		KeysRefused:           ri.KeysRefused,
+		FailureReason:         ri.FailureReason,
 	}
 }
 
-func (ri *batchJobInfo) countItem(size int64, dmarker, success bool, attempt int) {
+// countItem counts the outcome of one item in the current attempt of a
+// replicate job, which resets its counters before it retries.
+func (ri *batchJobInfo) countItem(size int64, dmarker, success bool) {
 	if ri == nil {
 		return
 	}
 	ri.Attempts++
-	if success {
-		if dmarker {
-			ri.DeleteMarkers++
-		} else {
-			ri.Objects++
-			ri.BytesTransferred += size
-		}
-		if attempt > 1 {
-			if dmarker {
-				ri.DeleteMarkersFailed--
-			} else {
-				ri.ObjectsFailed--
-				ri.BytesFailed += size
-			}
-		}
-	} else {
-		if attempt > 1 {
-			// Only count first attempt
-			return
-		}
-		if dmarker {
-			ri.DeleteMarkersFailed++
-		} else {
-			ri.ObjectsFailed++
-			ri.BytesFailed += size
-		}
+	switch {
+	case success && dmarker:
+		ri.DeleteMarkers++
+	case success:
+		ri.Objects++
+		ri.BytesTransferred += size
+	case dmarker:
+		ri.DeleteMarkersFailed++
+	default:
+		ri.ObjectsFailed++
+		ri.BytesFailed += size
 	}
 }
 
@@ -1002,35 +1298,7 @@ func (ri *batchJobInfo) expireFailures() bool {
 	return ri.ObjectsFailed > 0 || ri.DeleteMarkersFailed > 0
 }
 
-// trackExpireAll counts the objects and delete markers that an expiry of all
-// versions of info removed and, when it failed, those the walk saw that it
-// did not remove, at least one. Only batch-expire uses it, for a rule that
-// expires all versions of an object.
-func (ri *batchJobInfo) trackExpireAll(info expireObjInfo, objects, markers int64, failed bool) {
-	if ri == nil {
-		return
-	}
-
-	ri.mu.Lock()
-	defer ri.mu.Unlock()
-
-	ri.Objects += objects
-	ri.DeleteMarkers += markers
-	if !failed {
-		ri.Bucket = info.Bucket
-		ri.Object = info.Name
-		return
-	}
-	failedObjects := max(int64(info.NumVersions)-info.DeleteMarkerCount-objects, 0)
-	failedMarkers := max(info.DeleteMarkerCount-markers, 0)
-	if failedObjects+failedMarkers == 0 {
-		failedObjects = 1
-	}
-	ri.ObjectsFailed += failedObjects
-	ri.DeleteMarkersFailed += failedMarkers
-}
-
-func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo, success bool, attempt int) {
+func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo, success bool) {
 	if ri == nil {
 		return
 	}
@@ -1042,7 +1310,7 @@ func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo,
 		ri.Bucket = bucket
 		ri.Object = info.Name
 	}
-	ri.countItem(info.Size, info.DeleteMarker, success, attempt)
+	ri.countItem(info.Size, info.DeleteMarker, success)
 }
 
 func (ri *batchJobInfo) trackCurrentBucketBatch(bucket string, batch []ObjectInfo) {
@@ -1056,7 +1324,7 @@ func (ri *batchJobInfo) trackCurrentBucketBatch(bucket string, batch []ObjectInf
 	ri.Bucket = bucket
 	for i := range batch {
 		ri.Object = batch[i].Name
-		ri.countItem(batch[i].Size, batch[i].DeleteMarker, true, 1)
+		ri.countItem(batch[i].Size, batch[i].DeleteMarker, true)
 	}
 }
 
@@ -1072,6 +1340,9 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	}
 	if ri.Complete {
 		return nil
+	}
+	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
+		return err
 	}
 	globalBatchJobsMetrics.save(job.ID, ri)
 	lastObject := ri.Object
@@ -1180,6 +1451,12 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			walkCh = make(chan itemOrErr[ObjectInfo], 100)
 			slowCh = make(chan itemOrErr[ObjectInfo], 100)
 		)
+		ctx, cancelCause := context.WithCancelCause(ctx)
+		// refuse ends the job for its submitter: record why before stopping.
+		refuse := func(err error) {
+			ri.refuse(err)
+			cancelCause(err)
+		}
 
 		if r.Source.Snowball.Disable != nil && !*r.Source.Snowball.Disable && r.Source.Type.isMinio() && r.Target.Type.isMinio() {
 			go func() {
@@ -1201,7 +1478,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				batch := make([]ObjectInfo, 0, *r.Source.Snowball.Batch)
 				writeFn := func(batch []ObjectInfo) {
 					if len(batch) > 0 {
-						if err := r.writeAsArchive(ctx, api, cl, batch, r.Target.Prefix); err != nil {
+						if err := r.writeAsArchive(ctx, api, cl, batch, r.Target.Prefix, job.Submitter); err != nil {
+							if isBatchJobAuthzError(err) {
+								refuse(err)
+								return
+							}
 							batchLogOnceIf(ctx, err, job.ID+"writeAsArchive")
 							for _, b := range batch {
 								slowCh <- itemOrErr[ObjectInfo]{Item: b}
@@ -1250,7 +1531,6 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		if walkQuorum == "" {
 			walkQuorum = "strict"
 		}
-		ctx, cancelCause := context.WithCancelCause(ctx)
 		// one of source/target is s3, skip delete marker and all versions under the same object name.
 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
 
@@ -1281,6 +1561,10 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 		skipReplicate := false
 		for res := range slowCh {
+			if context.Cause(ctx) != nil {
+				// Refused or canceled: schedule nothing more.
+				continue
+			}
 			if res.Err != nil {
 				ri.Failed = true
 				batchLogOnceIf(ctx, res.Err, job.ID+"res.Err")
@@ -1300,7 +1584,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricReplication, job.ID, attempts)
 				success := true
-				if err := r.ReplicateToTarget(ctx, api, c, result, retry); err != nil {
+				if err := r.ReplicateToTarget(ctx, api, c, result, retry, job.Submitter); err != nil {
+					if isBatchJobAuthzError(err) {
+						refuse(err)
+						return
+					}
 					if minio.ToErrorResponse(err).Code == "PreconditionFailed" {
 						// pre-condition failed means we already have the object copied over.
 						return
@@ -1315,7 +1603,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				} else {
 					stopFn(result, nil)
 				}
-				ri.trackCurrentBucketObject(r.Source.Bucket, result, success, attempts)
+				ri.trackCurrentBucketObject(r.Source.Bucket, result, success)
 				globalBatchJobsMetrics.save(job.ID, ri)
 				// persist in-memory state to disk after every 10secs.
 				batchLogOnceIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job), job.ID+"updateAfter2")
@@ -1326,13 +1614,22 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			}()
 		}
 		wk.Wait()
+		if ri.refused() {
+			cancelCause(nil)
+			globalBatchJobsMetrics.save(job.ID, ri)
+			batchLogOnceIf(ctx, ri.updateAfter(GlobalContext, api, 0, job), job.ID+"updateAfter3")
+			if err := r.Notify(GlobalContext, ri); err != nil {
+				batchLogOnceIf(ctx, fmt.Errorf("unable to notify %v", err), job.ID+"notify")
+			}
+			return nil
+		}
 		// Do not need to retry if we can't list objects on source.
 		if context.Cause(ctx) != nil {
 			return context.Cause(ctx)
 		}
 		ri.RetryAttempts = attempts
-		ri.Complete = ri.ObjectsFailed == 0
-		ri.Failed = ri.ObjectsFailed > 0
+		ri.Complete = ri.ObjectsFailed == 0 && ri.DeleteMarkersFailed == 0
+		ri.Failed = !ri.Complete
 
 		globalBatchJobsMetrics.save(job.ID, ri)
 		// persist in-memory state to disk.
@@ -1345,9 +1642,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		cancelCause(nil)
 		if ri.Failed {
 			ri.ObjectsFailed = 0
+			ri.DeleteMarkersFailed = 0
 			ri.Bucket = ""
 			ri.Object = ""
 			ri.Objects = 0
+			ri.DeleteMarkers = 0
 			ri.BytesFailed = 0
 			ri.BytesTransferred = 0
 			retry = true // indicate we are retrying..
@@ -1549,8 +1848,12 @@ func (j BatchJobRequest) Validate(ctx context.Context, o ObjectLayer) error {
 	return errInvalidArgument
 }
 
-func (j BatchJobRequest) delete(ctx context.Context, api ObjectLayer) {
-	deleteConfig(ctx, api, getJobPath(j))
+func (j BatchJobRequest) delete(ctx context.Context, api ObjectLayer) error {
+	err := deleteConfig(ctx, api, getJobPath(j))
+	if errors.Is(err, errConfigNotFound) {
+		return nil
+	}
+	return err
 }
 
 func (j BatchJobRequest) getJobReportPath() (string, error) {
@@ -1709,7 +2012,7 @@ func (a adminAPIHandlers) BatchJobStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	buf, err := json.Marshal(madmin.BatchJobStatus{LastMetric: ri.metric()})
+	buf, err := json.Marshal(batchJobStatus{LastMetric: ri.statusMetric()})
 	if err != nil {
 		batchLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1747,8 +2050,13 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Remove sensitive fields.
-	req.RedactSensitive()
-	buf, err := yaml.Marshal(req)
+	out, err := req.redacted()
+	if err != nil {
+		batchLogIf(ctx, err)
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	buf, err := yaml.Marshal(out)
 	if err != nil {
 		batchLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1804,6 +2112,27 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 		if job.Replicate.Source.Snowball.SkipErrs == nil {
 			job.Replicate.Source.Snowball.SkipErrs = ptr(true)
 		}
+	}
+
+	if job.jobSections() != 1 {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrInvalidRequest, errBatchJobSections), r.URL)
+		return
+	}
+
+	// The job acts as the credential that submits it, and only as far as
+	// that credential may act on the job's buckets.
+	submitter, err := newBatchJobSubmitter(creds)
+	if err == nil {
+		job.Submitter = submitter
+		err = submitter.authorize(ctx, job.startAuthzRequests()...)
+	}
+	if err != nil {
+		apiErr := toAPIError(ctx, err)
+		if isBatchJobAuthzError(err) {
+			apiErr = errorCodes.ToAPIErrWithErr(ErrAccessDenied, err)
+		}
+		writeErrorResponseJSON(ctx, w, apiErr, r.URL)
+		return
 	}
 
 	//  Validate the incoming job request
@@ -1942,6 +2271,14 @@ func (j *BatchJobPool) cleanupReports(randomWait func() time.Duration) {
 					continue
 				}
 				if (ri.Complete || ri.Failed) && time.Since(ri.LastUpdate) > oldJobsExpiration {
+					// Remove the job before its report, so that a finished
+					// job is never resumed without its outcome.
+					if ri.JobID != "" {
+						if err := (BatchJobRequest{ID: ri.JobID}).delete(ctx, j.objLayer); err != nil {
+							batchLogIf(ctx, err)
+							continue
+						}
+					}
 					deleteConfig(ctx, j.objLayer, result.Item.Name)
 				}
 			}
@@ -2082,7 +2419,7 @@ func (j *BatchJobPool) queueJob(req *BatchJobRequest) error {
 		})
 	case j.jobCh <- req:
 	default:
-		return fmt.Errorf("batch job queue is currently full please try again later %#v", req)
+		return fmt.Errorf("batch job queue is currently full please try again later (job %s)", req.ID)
 	}
 	return nil
 }

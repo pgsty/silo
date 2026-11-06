@@ -1676,6 +1676,15 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 	}
+	if opts.RefuseLockedOverwrite {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if err := checkVersionLockedForOverwrite(ctx, bucket, object, fi.VersionID, getObjectInfo, opts.Transition); err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+	}
 
 	// Rename the successfully written temporary object to final location.
 	onlineDisks, versions, oldDataDir, err := renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum)
@@ -2195,6 +2204,13 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 
 	if opts.EvalRetentionBypassFn != nil {
 		if err := opts.EvalRetentionBypassFn(goi, gerr); err != nil {
+			return ObjectInfo{}, err
+		}
+	}
+
+	// A delete marker that names a stored version replaces it.
+	if opts.RefuseLockedOverwrite && opts.DeleteMarker && opts.VersionID != "" {
+		if err := refuseLockedMarkerOverwrite(ctx, bucket, object, opts.VersionID, goi, gerr); err != nil {
 			return ObjectInfo{}, err
 		}
 	}

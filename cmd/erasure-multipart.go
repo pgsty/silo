@@ -1687,6 +1687,15 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		defer lk.Unlock(lkctx)
 	}
 
+	if opts.RefuseLockedOverwrite {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if err := checkVersionLockedForOverwrite(ctx, bucket, object, fi.VersionID, getObjectInfo, opts.Transition); err != nil {
+			return oi, toObjectErr(err, bucket, object)
+		}
+	}
 	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement {
 		getObjectInfo := er.getObjectInfo
 		if opts.replicaObjectInfo != nil {
