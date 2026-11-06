@@ -1743,7 +1743,13 @@ func (store *IAMStoreSys) MergePolicies(policyName string) (string, policy.Polic
 		p, found := cache.iamPolicyDocsMap[name]
 		if !found {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := store.loadPolicyDoc(ctx, name, loaded)
+			err := func() error {
+				// Retain writeMu to serialize cache revisions, but let cached
+				// authorization readers proceed while storage is unavailable.
+				store.IAMStorageAPI.unlock()
+				defer store.IAMStorageAPI.lock()
+				return store.loadPolicyDoc(ctx, name, loaded)
+			}()
 			cancel()
 			if errors.Is(err, errNoSuchPolicy) {
 				continue

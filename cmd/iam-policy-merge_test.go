@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
@@ -167,5 +169,69 @@ func TestIAMPolicyMergeInfoFailure(t *testing.T) {
 				t.Fatalf("incomplete effective policy returned as success: %d %s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+type iamPolicyMergeBlockedStore struct {
+	IAMStorageAPI
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *iamPolicyMergeBlockedStore) loadPolicyDoc(ctx context.Context, name string, out map[string]PolicyDoc) error {
+	if name == "merge-slow" {
+		close(s.started)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.IAMStorageAPI.loadPolicyDoc(ctx, name, out)
+}
+
+func TestIAMPolicyMergeSlowLoadKeepsCachedAuthorizationAvailable(t *testing.T) {
+	ctx, sys, _ := prepareIAMRevisionFixture(t)
+	const statement = `{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::merge-bucket/*"]}`
+	batchAuthzPolicy(ctx, t, sys, "merge-cached", statement)
+	batchAuthzPolicy(ctx, t, sys, "merge-slow", statement)
+	cached := iamAdminUser(ctx, t, sys, "merge-cached-user", "merge-cached")
+	slow := iamAdminUser(ctx, t, sys, "merge-slow-user", "merge-slow")
+	store := sys.store
+	original := store.IAMStorageAPI
+	blocked := &iamPolicyMergeBlockedStore{IAMStorageAPI: original, started: make(chan struct{}), release: make(chan struct{})}
+	cache := store.lock()
+	delete(cache.iamPolicyDocsMap, "merge-slow")
+	store.unlock()
+	store.IAMStorageAPI = blocked
+	var wg sync.WaitGroup
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(blocked.release) }) }
+	t.Cleanup(func() { unblock(); wg.Wait(); store.IAMStorageAPI = original })
+	args := policy.Args{AccountName: slow.AccessKey, Action: policy.GetObjectAction, BucketName: "merge-bucket", ObjectName: "object"}
+	slowDone := make(chan bool, 1)
+	wg.Go(func() { slowDone <- sys.IsAllowed(args) })
+	select {
+	case <-blocked.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("missing policy load did not start")
+	}
+	cachedDone := make(chan bool, 1)
+	wg.Go(func() {
+		cachedArgs := args
+		cachedArgs.AccountName = cached.AccessKey
+		cachedDone <- sys.IsAllowed(cachedArgs)
+	})
+	select {
+	case allowed := <-cachedDone:
+		if !allowed {
+			t.Fatal("unrelated cached policy was rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a slow policy load blocked unrelated cached authorization")
+	}
+	unblock()
+	if !<-slowDone {
+		t.Fatal("slow policy did not load after recovery")
 	}
 }
