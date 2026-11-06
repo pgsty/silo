@@ -762,7 +762,13 @@ func recheckReadExpiry(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo
 // of the object, and a delete marker alone in that pool can hide versions in
 // another one. Such a version is moved like any other, and the scanner
 // applies the rule in the pool that holds the object then.
-func (z *erasureServerPools) migrationExpiryApplies(ctx context.Context, oi ObjectInfo, evt lifecycle.Event) bool {
+//
+// The walk reads the history of a key once, into h, for the prechecks of all
+// its versions: this decides only whether a version moves or is left to the
+// expiry, which reads the history again under the object lock before it
+// deletes anything. A read error is kept, so every due version of that key
+// moves.
+func (z *erasureServerPools) migrationExpiryApplies(ctx context.Context, oi ObjectInfo, evt lifecycle.Event, h *migrationHistory) bool {
 	// The options the expiry deletes with, see
 	// applyExpiryOnNonTransitionedObjects and expireTransitionedObject.
 	opts := ObjectOptions{
@@ -780,6 +786,27 @@ func (z *erasureServerPools) migrationExpiryApplies(ctx context.Context, oi Obje
 	if !z.expiryNeedsAllPools(opts) {
 		return true
 	}
-	_, err := z.checkExpiryAllPools(ctx, oi.Bucket, encodeDirObject(oi.Name), opts)
-	return err == nil
+	object := encodeDirObject(oi.Name)
+	if h == nil {
+		h = &migrationHistory{}
+	}
+	if !h.loaded {
+		h.all.versions, h.all.events, h.all.err = z.lifecycleEventsAllPools(ctx, oi.Bucket, object)
+		h.loaded = true
+		if f := migrationHistoryLoaded; f != nil {
+			f(oi.Name)
+		}
+	}
+	return h.all.expiryApplies(oi.Bucket, object, opts) == nil
+}
+
+// migrationHistoryLoaded, when a test sets it, is told each time a migration
+// walk reads the history of a key.
+var migrationHistoryLoaded func(object string)
+
+// migrationHistory is the history of one key in all pools, read once by a
+// decommission or rebalance walk for the prechecks of its versions.
+type migrationHistory struct {
+	loaded bool
+	all    lifecycleAllPools
 }

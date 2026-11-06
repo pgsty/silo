@@ -590,7 +590,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 	for setIdx, set := range pool.sets {
 		// filterLifecycle returns an ILM deletion that migration must handle
 		// before retiring the source copy, or NoneAction.
-		filterLifecycle := func(bucket, object string, fi FileInfo) lifecycle.Action {
+		filterLifecycle := func(bucket, object string, fi FileInfo, history *migrationHistory) lifecycle.Action {
 			if lc == nil {
 				return lifecycle.NoneAction
 			}
@@ -605,7 +605,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				// a noncurrent version and has to be moved like any other. The
 				// scanner applies the expiry once it lives in another pool.
 				return lifecycle.NoneAction
-			case evt.Action.Delete() && !z.migrationExpiryApplies(ctx, objInfo, evt):
+			case evt.Action.Delete() && !z.migrationExpiryApplies(ctx, objInfo, evt, history):
 				// Another pool holds versions with which the rule does not
 				// apply. The version moves like any other.
 				return lifecycle.NoneAction
@@ -638,6 +638,8 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 			var rebalanced int
 			var expired []migrationExpiredVersion
+			// The key's history in all pools, read once for its versions.
+			var history migrationHistory
 			for _, version := range fivs.Versions {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 
@@ -648,7 +650,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				}
 
 				// Apply lifecycle rules on the objects that are expired.
-				if action := filterLifecycle(bucket, version.Name, version); action.Delete() {
+				if action := filterLifecycle(bucket, version.Name, version, &history); action.Delete() {
 					// Count the version, or the source copies of the moved
 					// ones stay behind as duplicates. Its own source copy
 					// goes with them when ILM deletes it alone; any other
