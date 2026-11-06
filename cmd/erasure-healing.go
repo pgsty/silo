@@ -343,6 +343,11 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, partsMetadata, errs, er.defaultParityCount)
 	if err != nil {
+		if dryRun {
+			// A metadata quorum failure must not delete dangling data in dry-run.
+			return er.defaultHealResult(FileInfo{}, storageDisks, storageEndpoints,
+				errs, bucket, object, versionID), err
+		}
 		m, derr := er.deleteIfDangling(ctx, bucket, object, partsMetadata, errs, nil, ObjectOptions{
 			VersionID: versionID,
 		})
