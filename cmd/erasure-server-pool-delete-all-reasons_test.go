@@ -170,6 +170,11 @@ func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 	if delta[ilmIncompleteHistoryUnavailable] != 1 {
 		t.Errorf("counted %v, want one %s", delta, ilmIncompleteHistoryUnavailable)
 	}
+	// The purge names the cause, and callers see a write quorum error.
+	_, err = z.DeleteObject(ctx, p.bucket, key, ObjectOptions{DeleteAllVersions: true, Expiration: ExpirationOptions{Expire: true}})
+	if !errors.Is(err, errDeleteAllHistoryUnavailable) || toAPIErrorCode(ctx, err) != ErrSlowDownWrite {
+		t.Errorf("purge on a corrupt drive: %v, want %v as SlowDownWrite", err, errDeleteAllHistoryUnavailable)
+	}
 	if got := p.get(key); got != "v2" {
 		t.Fatalf("the refused purge left %s readable", got)
 	}
