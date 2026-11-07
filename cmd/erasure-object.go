@@ -1662,7 +1662,11 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		defer lk.Unlock(lkctx)
 	}
 
-	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement &&
+	if opts.restoreCheck != nil {
+		if err := opts.restoreCheck(ctx); err != nil {
+			return ObjectInfo{}, err
+		}
+	} else if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement &&
 		(fi.VersionID == "" || fi.VersionID == nullVersionID) {
 		getObjectInfo := er.getObjectInfo
 		if opts.replicaObjectInfo != nil {
@@ -2630,71 +2634,155 @@ func (er erasureObjects) RestoreTransitionedObject(ctx context.Context, bucket, 
 	return er.restoreTransitionedObject(ctx, bucket, object, opts)
 }
 
-// update restore status header in the metadata
-func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, object string, objInfo ObjectInfo, opts ObjectOptions) error {
-	oi := objInfo.Clone()
-	oi.metadataOnly = true // Perform only metadata updates.
+// updateRestoreMetadata removes the ongoing restore status from the version
+// a failed restore was for, so that the restore can be requested again. The
+// version is read again under the object lock, which the caller may hold, and
+// only its restore status is removed: a version that is gone or unreadable,
+// or whose restore is not ongoing any more, is left as it is.
+func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, object string, opts ObjectOptions) (err error) {
+	defer func() {
+		if err != nil {
+			storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %w", bucket, object, opts.VersionID, err))
+		}
+	}()
 
-	// allow retry in the case of failure to restore
-	delete(oi.UserDefined, xhttp.AmzRestore)
+	if !opts.NoLock {
+		lk := er.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
 
-	if _, err := er.CopyObject(ctx, bucket, object, bucket, object, oi, ObjectOptions{
-		VersionID: oi.VersionID,
-	}, ObjectOptions{
-		VersionID: oi.VersionID,
-	}); err != nil {
-		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
-		return err
+	storageDisks := er.getDisks()
+	var metaArr []FileInfo
+	var errs []error
+	if opts.VersionID != "" {
+		metaArr, errs = readAllFileInfo(ctx, storageDisks, "", bucket, object, opts.VersionID, true, false)
+	} else {
+		metaArr, errs = readAllXL(ctx, storageDisks, bucket, object, true, false)
+	}
+	readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
+	if err != nil {
+		return toObjectErr(err, bucket, object)
+	}
+	onlineDisks, modTime, etag := listOnlineDisks(storageDisks, metaArr, errs, readQuorum)
+	fi, err := pickValidFileInfo(ctx, metaArr, modTime, etag, readQuorum)
+	if err != nil {
+		return toObjectErr(err, bucket, object)
+	}
+	if fi.Deleted {
+		return toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+	if status, err := parseRestoreObjStatus(fi.Metadata[xhttp.AmzRestore]); err != nil || !status.Ongoing() {
+		return nil // no ongoing restore to remove
+	}
+
+	filterOnlineDisksInplace(fi, metaArr, onlineDisks)
+	for index := range metaArr {
+		if onlineDisks[index] == nil {
+			continue
+		}
+		if !metaArr[index].InlineData() {
+			// As in CopyObject: do not inline data that was not.
+			metaArr[index].Data = nil
+		}
+		delete(metaArr[index].Metadata, xhttp.AmzRestore)
+	}
+	if _, err = writeUniqueFileInfo(ctx, onlineDisks, "", bucket, object, metaArr, writeQuorum); err != nil {
+		return toObjectErr(err, bucket, object)
 	}
 	return nil
+}
+
+// errRestoreSuperseded is the error of a restore whose version changed while
+// the restored data was read from the tier.
+var errRestoreSuperseded = errors.New("the version changed while it was restored")
+
+// restoreCommitCheck returns the check that the restored copy of a version
+// runs under the object lock right before it commits. With a single pool no
+// lock is held while the restored data is read from the tier, so the version
+// may have been uploaded over, deleted or changed meanwhile: the restored copy
+// commits only over the version as the restore read it, still in the tier,
+// with the same modification time and metadata, its ongoing restore status
+// among them.
+func (er erasureObjects) restoreCommitCheck(bucket, object string, opts ObjectOptions, read FileInfo) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		fi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts, false)
+		if err != nil {
+			return toObjectErr(err, bucket, object)
+		}
+		if fi.VersionID != read.VersionID || !fi.ModTime.Equal(read.ModTime) || !fi.IsRemote() || !maps.Equal(fi.Metadata, read.Metadata) {
+			return errRestoreSuperseded
+		}
+		return nil
+	}
 }
 
 // restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
 // as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
 func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
-	setRestoreHeaderFn := func(oi ObjectInfo, rerr error) error {
+	setRestoreHeaderFn := func(rerr error) error {
 		if rerr == nil {
 			return nil // nothing to do; restore object was successful
 		}
-		er.updateRestoreMetadata(ctx, bucket, object, oi, opts)
+		er.updateRestoreMetadata(ctx, bucket, object, opts)
 		return rerr
 	}
-	var oi ObjectInfo
 	// get the file info on disk for transitioned object
 	actualfi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts, false)
 	if err != nil {
-		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+		return setRestoreHeaderFn(toObjectErr(err, bucket, object))
 	}
 
-	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
-	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
+	oi := actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
+	// The restored copy replaces the version and takes its metadata as the
+	// drives hold it: an ObjectInfo carries it without the tags and Expires.
+	moi := oi
+	moi.UserDefined = cloneMSS(actualfi.Metadata)
+	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, moi)
+	// With more than one pool the pools layer holds the object lock for the
+	// whole restore; the restored copy is written under that lock. With a
+	// single pool the set takes the lock only to commit the restored copy,
+	// which commits only over the version as it was read.
+	ropts.NoLock = opts.NoLock
+	ropts.restoreCheck = er.restoreCommitCheck(bucket, object, opts, actualfi)
 	if len(oi.Parts) == 1 {
 		var rs *HTTPRangeSpec
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
 		if err != nil {
-			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+			return setRestoreHeaderFn(toObjectErr(err, bucket, object))
 		}
 		defer gr.Close()
 		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", gr.ObjInfo.Size)
 		if err != nil {
-			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+			return setRestoreHeaderFn(toObjectErr(err, bucket, object))
 		}
 		pReader := NewPutObjReader(hashReader)
 		_, err = er.PutObject(ctx, bucket, object, pReader, ropts)
-		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
+		return setRestoreHeaderFn(toObjectErr(err, bucket, object))
 	}
 
 	res, err := er.NewMultipartUpload(ctx, bucket, object, ropts)
 	if err != nil {
-		return setRestoreHeaderFn(oi, err)
+		return setRestoreHeaderFn(err)
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			// A restore that fails leaves no upload behind.
+			er.AbortMultipartUpload(context.Background(), bucket, object, res.UploadID, ObjectOptions{NoAuditLog: true})
+		}
+	}()
 
 	var uploadedParts []CompletePart
 	var rs *HTTPRangeSpec
 	// get reader from the warm backend - note that even in the case of encrypted objects, this stream is still encrypted.
 	gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
 	if err != nil {
-		return setRestoreHeaderFn(oi, err)
+		return setRestoreHeaderFn(err)
 	}
 	defer gr.Close()
 
@@ -2702,14 +2790,14 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	for _, partInfo := range oi.Parts {
 		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.Size)
 		if err != nil {
-			return setRestoreHeaderFn(oi, err)
+			return setRestoreHeaderFn(err)
 		}
 		pInfo, err := er.PutObjectPart(ctx, bucket, object, res.UploadID, partInfo.Number, NewPutObjReader(hr), ObjectOptions{})
 		if err != nil {
-			return setRestoreHeaderFn(oi, err)
+			return setRestoreHeaderFn(err)
 		}
 		if pInfo.Size != partInfo.Size {
-			return setRestoreHeaderFn(oi, InvalidObjectState{Bucket: bucket, Object: object})
+			return setRestoreHeaderFn(InvalidObjectState{Bucket: bucket, Object: object})
 		}
 		uploadedParts = append(uploadedParts, CompletePart{
 			PartNumber: pInfo.PartNumber,
@@ -2717,9 +2805,12 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		})
 	}
 	_, err = er.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{
-		MTime: oi.ModTime,
+		MTime:        oi.ModTime,
+		NoLock:       opts.NoLock,
+		restoreCheck: ropts.restoreCheck,
 	})
-	return setRestoreHeaderFn(oi, err)
+	completed = err == nil
+	return setRestoreHeaderFn(err)
 }
 
 // DecomTieredObject - moves tiered object to another pool during decommissioning.

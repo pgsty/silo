@@ -1687,7 +1687,11 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		defer lk.Unlock(lkctx)
 	}
 
-	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement {
+	if opts.restoreCheck != nil {
+		if err := opts.restoreCheck(ctx); err != nil {
+			return oi, err
+		}
+	} else if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement {
 		getObjectInfo := er.getObjectInfo
 		if opts.replicaObjectInfo != nil {
 			getObjectInfo = opts.replicaObjectInfo
