@@ -4012,24 +4012,30 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	}
 	// set or upgrade restore expiry
 	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
-	metadata := cloneMSS(objInfo.UserDefined)
 
 	// update self with restore metadata
 	if rreq.Type != SelectRestoreRequest {
-		objInfo.metadataOnly = true // Perform only metadata updates.
-		metadata[xhttp.AmzRestoreExpiryDays] = strconv.Itoa(rreq.Days)
-		metadata[xhttp.AmzRestoreRequestDate] = time.Now().UTC().Format(http.TimeFormat)
+		restoreStatus := ongoingRestoreObj().String()
 		if alreadyRestored {
-			metadata[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
-		} else {
-			metadata[xhttp.AmzRestore] = ongoingRestoreObj().String()
+			restoreStatus = completedRestoreObj(restoreExpiry).String()
 		}
-		objInfo.UserDefined = metadata
-		if _, err := objectAPI.CopyObject(GlobalContext, bucket, object, bucket, object, objInfo, ObjectOptions{
-			VersionID: objInfo.VersionID,
-		}, ObjectOptions{
-			VersionID: objInfo.VersionID,
-			MTime:     objInfo.ModTime,
+		requestDate := time.Now().UTC().Format(http.TimeFormat)
+		// Only the restore status changes: it is added to the metadata of
+		// the version as the drives hold it, under the object lock. An
+		// ObjectInfo carries the metadata without the tags and Expires.
+		if _, err := objectAPI.PutObjectMetadata(GlobalContext, bucket, object, ObjectOptions{
+			VersionID:        objInfo.VersionID,
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
+			EvalMetadataFn: func(oi *ObjectInfo, _ error) (ReplicateDecision, error) {
+				if !oi.ModTime.Equal(objInfo.ModTime) || oi.TransitionedObject.Status != lifecycle.TransitionComplete {
+					return ReplicateDecision{}, InvalidObjectState{Bucket: bucket, Object: object} // not the version read above
+				}
+				oi.UserDefined[xhttp.AmzRestoreExpiryDays] = strconv.Itoa(rreq.Days)
+				oi.UserDefined[xhttp.AmzRestoreRequestDate] = requestDate
+				oi.UserDefined[xhttp.AmzRestore] = restoreStatus
+				return ReplicateDecision{}, nil
+			},
 		}); err != nil {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidObjectState), r.URL)
 			return

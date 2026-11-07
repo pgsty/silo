@@ -2738,7 +2738,11 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	}
 
 	oi := actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
-	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
+	// The restored copy replaces the version and takes its metadata as the
+	// drives hold it: an ObjectInfo carries it without the tags and Expires.
+	moi := oi
+	moi.UserDefined = cloneMSS(actualfi.Metadata)
+	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, moi)
 	// With more than one pool the pools layer holds the object lock for the
 	// whole restore; the restored copy is written under that lock. With a
 	// single pool the set takes the lock only to commit the restored copy,
