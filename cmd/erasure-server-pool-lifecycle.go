@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
@@ -76,10 +77,11 @@ func (er erasureObjects) objectVersions(ctx context.Context, bucket, object stri
 	majority := len(disks)/2 + 1
 
 	var (
-		metas   [][]xlMetaV2ShallowVersion
-		metaVs  []uint8
-		metaV   uint8
-		unknown int
+		metas       [][]xlMetaV2ShallowVersion
+		metaVs      []uint8
+		metaV       uint8
+		unknown     int
+		undecodable bool
 	)
 	for i, rf := range rawFileInfos {
 		if errs[i] != nil {
@@ -91,6 +93,7 @@ func (er erasureObjects) objectVersions(ctx context.Context, bucket, object stri
 		var xl xlMetaV2
 		if err := xl.LoadOrConvert(rf.Buf); err != nil {
 			unknown++
+			undecodable = true
 			continue
 		}
 		metas = append(metas, xl.versions)
@@ -99,7 +102,11 @@ func (er erasureObjects) objectVersions(ctx context.Context, bucket, object stri
 	}
 	// Without an unknown drive the history is complete, also on one drive.
 	if unknown > 0 && unknown >= len(disks)/2 {
-		return nil, toObjectErr(errErasureReadQuorum, bucket, object)
+		err := toObjectErr(errErasureReadQuorum, bucket, object)
+		if undecodable {
+			return nil, undecodableHistory{ids: shallowVersionIDs(metas), err: err}
+		}
+		return nil, err
 	}
 
 	quorumMetas, quorumErrs := make([]FileInfo, len(disks)), make([]error, len(disks))
@@ -123,6 +130,46 @@ func (er erasureObjects) objectVersions(ctx context.Context, bucket, object stri
 		}
 	}
 	return versions, nil
+}
+
+// undecodableHistory is the refusal of objectVersions when too many drives
+// could not be read and the metadata of some of them did not decode. It
+// wraps the read quorum error and carries the IDs of the versions that the
+// drives that decoded hold, nullVersionID for the null version. A drive
+// whose metadata does not decode does not come back by itself: a heal
+// rewrites it from a quorum. A purge queues one of each version before it
+// refuses the key, as deleteAllDrives does for a drive it checks.
+type undecodableHistory struct {
+	ids []string
+	err error
+}
+
+func (e undecodableHistory) Error() string {
+	return e.err.Error() + ": the metadata of a drive did not decode"
+}
+
+func (e undecodableHistory) Unwrap() error { return e.err }
+
+// shallowVersionIDs returns the IDs of the versions in metas that are not
+// free versions, each once, nullVersionID for the null version.
+func shallowVersionIDs(metas [][]xlMetaV2ShallowVersion) []string {
+	var ids []string
+	seen := make(map[[16]byte]bool)
+	for _, versions := range metas {
+		for _, ver := range versions {
+			id := ver.header.VersionID
+			if ver.header.FreeVersion() || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if id == [16]byte{} {
+				ids = append(ids, nullVersionID)
+			} else {
+				ids = append(ids, uuid.UUID(id).String())
+			}
+		}
+	}
+	return ids
 }
 
 // revisionKey identifies a revision of a version: its header and a strong
@@ -675,7 +722,7 @@ func (all lifecycleAllPools) protection(versionID string) objectLockState {
 //     or a delete marker without noncurrent versions.
 func (all lifecycleAllPools) expiryApplies(bucket, object string, opts ObjectOptions) error {
 	if all.err != nil {
-		if _, ok := all.err.(InsufficientReadQuorum); ok {
+		if isErrReadQuorum(all.err) {
 			return InsufficientWriteQuorum{}
 		}
 		return all.err

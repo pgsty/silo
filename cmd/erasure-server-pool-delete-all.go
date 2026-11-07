@@ -250,6 +250,21 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 	start := time.Now()
 	name := decodeDirObject(object)
 	fail := func(err error) (ObjectInfo, error) {
+		// A history refused for metadata that did not decode: queue a heal
+		// of each version the drives show, as deleteAllDrives does for a
+		// drive it checks, so that a later attempt finds the key whole. The
+		// purge remains refused.
+		var undecodable undecodableHistory
+		if errors.As(err, &undecodable) {
+			for _, id := range undecodable.ids {
+				globalMRFState.addPartialOp(PartialOperation{
+					Bucket:    bucket,
+					Object:    object,
+					VersionID: id,
+					Queued:    time.Now(),
+				})
+			}
+		}
 		if isErrReadQuorum(err) {
 			err = InsufficientWriteQuorum{}
 		}
@@ -268,6 +283,11 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 		all.versions, all.events, all.err = z.lifecycleEventsAllPools(ctx, bucket, object)
 		if all.err != nil || len(all.versions) > 0 {
 			if err := all.expiryApplies(bucket, object, ObjectOptions{DeletePrefix: true}); err != nil {
+				if all.err != nil {
+					// The history refused, not the rule: fail with it, which
+					// callers see as the same write quorum error.
+					err = all.err
+				}
 				return fail(err)
 			}
 		}

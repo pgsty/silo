@@ -247,6 +247,103 @@ func TestPurgeAllVersionsRefusesCorruptDrive(t *testing.T) {
 	}
 }
 
+// Half of the drives of an eight-drive set hold metadata that does not
+// decode. The key still reads and heals from the other half, but the drives
+// cannot tell its history, so the purge refuses the key before it checks the
+// drives. It still queues a heal of every version the decodable drives hold,
+// the null version by its explicit ID, so that the next purge finds the key
+// whole; the drives refuse nothing once healed.
+func TestPurgeAllVersionsHealsUndecodableHistory(t *testing.T) {
+	z := purgeSinglePool(t, 8)
+	p := newPurgeTest(t, z, "purge-undecodable", MakeBucketOptions{VersioningEnabled: true}, purgeRules)
+	ctx := t.Context()
+	const key = "ea/undecodable"
+	p.put(0, key, "null", daysAgo(7), ObjectOptions{})
+	p.version(0, key, "v1", 6)
+	p.version(0, key, "v2", 5)
+	ops := []expiryOp{p.deleteAllTask(0, key, lifecycle.DeleteAllVersionsAction)}
+
+	disks := z.serverPools[0].getHashedSet(key).getDisks()
+	metaPath := pathJoin(key, xlStorageFormatFile)
+	good, err := disks[0].ReadAll(ctx, p.bucket, metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := slices.Clone(good)
+	meta, _, err := isIndexedMetaV2(corrupt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta[len(meta)-1] ^= 1
+	bad := disks[len(disks)/2:]
+	for _, disk := range bad {
+		if err := disk.WriteAll(ctx, p.bucket, metaPath, corrupt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := p.get(key); got != "v2" {
+		t.Fatalf("fixture: with half of the drives undecodable the key reads %s, want v2", got)
+	}
+
+	var healMu sync.Mutex
+	queued := make(map[string]bool)
+	hook := func(op PartialOperation) {
+		if op.Bucket == p.bucket && op.Object == key {
+			healMu.Lock()
+			queued[op.VersionID] = true
+			healMu.Unlock()
+		}
+	}
+	previousHook := mrfPartialOpHook.Swap(&hook)
+	t.Cleanup(func() { mrfPartialOpHook.Store(previousHook) })
+	delta := incompleteDelta(func() { p.run(ops) })
+	if delta[ilmIncompleteHistoryUnavailable] != 1 {
+		t.Errorf("counted %v, want one %s", delta, ilmIncompleteHistoryUnavailable)
+	}
+	_, err = z.DeleteObject(ctx, p.bucket, key, ObjectOptions{DeleteAllVersions: true, Expiration: ExpirationOptions{Expire: true}})
+	if !isErrWriteQuorum(err) {
+		t.Errorf("purge on an undecodable history: %v, want a write quorum error", err)
+	}
+	if got := p.get(key); got != "v2" {
+		t.Fatalf("the refused purge left %s readable", got)
+	}
+	mrfPartialOpHook.Store(previousHook)
+
+	versions, err := getFileInfoVersions(good, p.bucket, key, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healMu.Lock()
+	for _, fi := range versions.Versions {
+		if !queued[deleteAllVersionID(fi.VersionID)] {
+			t.Errorf("no MRF heal for %q: %v", fi.VersionID, queued)
+		}
+	}
+	if queued[""] {
+		t.Error("MRF used latest instead of explicit null version")
+	}
+	healMu.Unlock()
+
+	for _, fi := range versions.Versions {
+		id := deleteAllVersionID(fi.VersionID)
+		if _, err := z.HealObject(ctx, p.bucket, key, id, madmin.HealOpts{}); err != nil {
+			t.Fatalf("heal %s: %v", id, err)
+		}
+		for i, disk := range bad {
+			if _, err := disk.ReadVersion(ctx, "", p.bucket, key, id, ReadOptions{}); err != nil {
+				t.Fatalf("version %s on healed drive %d: %v", id, i, err)
+			}
+		}
+	}
+	if got := p.get(key); got != "v2" {
+		t.Fatalf("heal changed latest data: %s", got)
+	}
+	p.run([]expiryOp{p.deleteAllTask(0, key, lifecycle.DeleteAllVersionsAction)})
+	if got := p.held(0, key); got != nil {
+		t.Errorf("the purge after the heal left %v", got)
+	}
+}
+
 // The scanner of a pool that holds a tiered version of a key whose latest
 // version is hot does not queue the expiry of all versions, which the purge
 // would refuse, and counts that it skipped it. It accounts every version of
