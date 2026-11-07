@@ -31,14 +31,23 @@ separately even when the fork preserves the original commit object and SHA.
 
 ## Reporting a Vulnerability
 
+The security contact for Silo is [ron@pgsty.com](mailto:ron@pgsty.com).
+This address also receives automated security reports for this repository.
+
 For vulnerabilities in this fork:
 
 1. Follow the fork-specific expectations in [VULNERABILITY_REPORT.md](VULNERABILITY_REPORT.md).
 2. Prefer this repository's [private GitHub security advisory](https://github.com/pgsty/silo/security/advisories/new) workflow.
-3. If private reporting is unavailable, contact the maintainers through the
-   repository without publishing exploit details until a private channel is
-   established.
+3. If you cannot use GitHub private reporting, email [ron@pgsty.com](mailto:ron@pgsty.com)
+   directly. Do not publish vulnerability details or exploit code in public
+   issues or pull requests.
 4. If you confirm the issue also affects upstream `minio/minio`, report it upstream separately.
+
+## Scanner Configuration
+
+The [OSS Scanner build environment](.oss-scanner/Dockerfile) and
+[scan scope and offline checks](.oss-scanner/threat_model.md) are maintained
+with the source. Update them when dependencies or security boundaries change.
 
 ## Disclosure Process
 
