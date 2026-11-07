@@ -98,15 +98,18 @@ func TestPoolsLifecycleReadHTTP(t *testing.T) {
 				local        lifecycle.Action
 				fault        error
 				wantScan     bool
+				// skipped is the reason the recheck counts and traces when
+				// it serves the read instead of the local expiry.
+				skipped string
 			}{
-				{name: "old-version-new-latest", prefix: "exp-", latestAge: 0.01, local: lifecycle.DeleteAction, wantScan: true},
-				{name: "old-version-expired-latest", prefix: "exp-", latestAge: 3, local: lifecycle.DeleteAction, wantScan: true},
-				{name: "old-version-delete-all-latest", prefix: "eav-", latestAge: 3, local: lifecycle.DeleteAllVersionsAction, wantScan: true},
+				{name: "old-version-new-latest", prefix: "exp-", latestAge: 0.01, local: lifecycle.DeleteAction, wantScan: true, skipped: ilmIncompleteNotApplicable},
+				{name: "old-version-expired-latest", prefix: "exp-", latestAge: 3, local: lifecycle.DeleteAction, wantScan: true, skipped: ilmIncompleteNotApplicable},
+				{name: "old-version-delete-all-latest", prefix: "eav-", latestAge: 3, local: lifecycle.DeleteAllVersionsAction, wantScan: true, skipped: ilmIncompleteNotApplicable},
 				{name: "expired-current", prefix: "exp-", latestAge: 3, readLatest: true, local: lifecycle.DeleteAction, action: lifecycle.DeleteAction, wantScan: true},
 				{name: "expired-current-implicit", prefix: "exp-", latestAge: 3, readLatest: true, implicit: true, local: lifecycle.DeleteAction, action: lifecycle.DeleteAction, wantScan: true},
 				{name: "expired-noncurrent", prefix: "both-", latestAge: 3, local: lifecycle.DeleteAction, action: lifecycle.DeleteVersionAction, wantScan: true},
-				{name: "extra-read-quorum-error", prefix: "exp-", latestAge: 3, local: lifecycle.DeleteAction, fault: errDiskNotFound, wantScan: true},
-				{name: "read-version-missing-from-recheck", prefix: "exp-", latestAge: 3, local: lifecycle.DeleteAction, fault: errFileNotFound, wantScan: true},
+				{name: "extra-read-quorum-error", prefix: "exp-", latestAge: 3, local: lifecycle.DeleteAction, fault: errDiskNotFound, wantScan: true, skipped: ilmIncompleteHistoryUnavailable},
+				{name: "read-version-missing-from-recheck", prefix: "exp-", latestAge: 3, local: lifecycle.DeleteAction, fault: errFileNotFound, wantScan: true, skipped: ilmIncompleteNotApplicable},
 				{name: "local-none-global-expired", prefix: "ncv-", latestAge: 3, local: lifecycle.NoneAction},
 			} {
 				for _, null := range []bool{false, true} {
@@ -148,6 +151,7 @@ func TestPoolsLifecycleReadHTTP(t *testing.T) {
 								t.Fatal("fixture must be globally expired but locally NoneAction")
 							}
 							scans := lifecycleReadDisks(t, s, key, oldPool, tc.fault)
+							observer := observePurges(t)
 							for _, method := range []string{http.MethodGet, http.MethodHead} {
 								t.Run(method, func(t *testing.T) {
 									scans.Store(0)
@@ -155,7 +159,27 @@ func TestPoolsLifecycleReadHTTP(t *testing.T) {
 									if tc.implicit {
 										requestID = ""
 									}
-									rec := consistencyRequest(t, router, method, s.bucket, key, requestID)
+									observer.drain()
+									var rec *httptest.ResponseRecorder
+									delta := incompleteDelta(func() { rec = consistencyRequest(t, router, method, s.bucket, key, requestID) })
+									// A read the recheck serves instead of the local
+									// expiry is counted and traced as skipped, by why.
+									_, traces := observer.drain()
+									var skipped []map[string]string
+									for _, tr := range traces {
+										if tr["result"] == "skipped" {
+											skipped = append(skipped, tr)
+										}
+									}
+									switch {
+									case tc.skipped == "" && (len(delta) != 0 || len(skipped) != 0):
+										t.Errorf("counted %v and traced %v, want nothing skipped", delta, skipped)
+									case tc.skipped != "" && (len(delta) != 1 || delta[tc.skipped] != 1):
+										t.Errorf("counted %v, want one %s", delta, tc.skipped)
+									case tc.skipped != "" && (len(skipped) != 1 || skipped[0]["reason"] != tc.skipped ||
+										s.key(key, skipped[0]["version-id"]) != s.key(key, vid)):
+										t.Errorf("traced %v, want one skipped expiry of %s for %s", skipped, vid, tc.skipped)
+									}
 									want := http.StatusOK
 									if tc.action.Delete() {
 										want = http.StatusNotFound
