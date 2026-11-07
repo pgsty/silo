@@ -2520,15 +2520,21 @@ func (j *BatchJobPool) canceler(jobID string, cancel bool) error {
 	if !cancel {
 		return nil
 	} // Worker completion uses its generation token.
-	if j.jobOwners == nil {
-		j.jobOwners = make(map[string]*batchJobOwner)
-	}
 	if owner := j.jobOwners[jobID]; owner != nil {
 		if owner.cancel != nil {
 			owner.cancel()
 		}
 		j.jobOwners[jobID] = &batchJobOwner{state: "canceled"}
-	} else {
+		return nil
+	}
+	// Only startup discovery admits a manifest this node does not own yet.
+	// A cancellation before that admission leaves a record that fences it;
+	// once discovery has finished, nothing admits the ID again (submissions
+	// use new IDs), so an unknown ID leaves no record to accumulate.
+	if !j.discoveryDone {
+		if j.jobOwners == nil {
+			j.jobOwners = make(map[string]*batchJobOwner)
+		}
 		j.jobOwners[jobID] = &batchJobOwner{state: "canceled"}
 	}
 	return nil

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -189,6 +190,38 @@ func TestBatchPoolOwnershipAndCancellation(t *testing.T) {
 		t.Fatalf("shutdown admission: %v", err)
 	}
 	pool.retryDue(time.Now().Add(time.Hour)) // channel remains open; no send/close race.
+}
+
+// A cancellation of a job this node does not own leaves a record only while
+// startup discovery may still admit its manifest. Once discovery has
+// finished, canceling unknown IDs must not grow the ownership table.
+func TestBatchCancelUnknownJobAfterDiscovery(t *testing.T) {
+	pool := &BatchJobPool{ctx: t.Context(), jobCh: make(chan *BatchJobRequest, 1)}
+	// Before discovery finished, the record fences the manifest it may admit.
+	mustIAM(t, pool.canceler("expire-before-discovery", true))
+	if err := pool.queueJob(&BatchJobRequest{ID: "expire-before-discovery"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("admission of a job canceled during discovery: %v", err)
+	}
+	pool.finishDiscovery()
+	for i := range 1000 {
+		mustIAM(t, pool.canceler(fmt.Sprintf("expire-unknown-%d", i), true))
+	}
+	pool.jmu.Lock()
+	owners := len(pool.jobOwners)
+	pool.jmu.Unlock()
+	if owners != 1 {
+		t.Fatalf("%d owner records after canceling unknown jobs, want only the record from discovery", owners)
+	}
+	// An owned job is still canceled and fenced.
+	job := &BatchJobRequest{ID: "expire-owned"}
+	mustIAM(t, pool.queueJob(job))
+	mustIAM(t, pool.canceler(job.ID, true))
+	if job.ctx.Err() == nil {
+		t.Fatal("cancellation did not stop the owned job")
+	}
+	if err := pool.queueJob(&BatchJobRequest{ID: job.ID}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stale admission of a canceled job: %v", err)
+	}
 }
 
 type batchPolicyOutage struct {
