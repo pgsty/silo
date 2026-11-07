@@ -580,14 +580,16 @@ type batchPolicySnapshot struct {
 	reads int // storage reads in progress; the read lock is released while any
 }
 
-// batchSnapshot takes the snapshot; release it with release.
+// batchSnapshot takes the snapshot; release it with release. rlock and
+// runlock are the cache's read lock (IAMStorageAPI), not IAMStoreSys.lock,
+// which also takes writeMu.
 func (store *IAMStoreSys) batchSnapshot(ctx context.Context) *batchPolicySnapshot {
 	store.writeMu.Lock()
-	return &batchPolicySnapshot{IAMStoreSys: store, ctx: ctx, cache: store.IAMStorageAPI.rlock()}
+	return &batchPolicySnapshot{IAMStoreSys: store, ctx: ctx, cache: store.rlock()}
 }
 
 func (s *batchPolicySnapshot) release() {
-	s.IAMStorageAPI.runlock()
+	s.runlock()
 	s.writeMu.Unlock()
 }
 
@@ -598,7 +600,7 @@ func (s *batchPolicySnapshot) release() {
 func (s *batchPolicySnapshot) read(fn func(ctx context.Context) error) error {
 	s.mu.Lock()
 	if s.reads == 0 {
-		s.IAMStorageAPI.runlock()
+		s.runlock()
 	}
 	s.reads++
 	s.mu.Unlock()
@@ -607,7 +609,7 @@ func (s *batchPolicySnapshot) read(fn func(ctx context.Context) error) error {
 		defer s.mu.Unlock()
 		s.reads--
 		if s.reads == 0 {
-			s.IAMStorageAPI.rlock()
+			s.rlock()
 		}
 	}()
 	ctx, cancel := context.WithTimeout(s.ctx, batchIAMLoadTimeout)
