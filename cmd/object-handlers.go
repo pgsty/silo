@@ -631,12 +631,15 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 
 	objInfo, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
-		s3Error = authorizeRequest(ctx, r, policy.ListBucketAction)
-		if s3Error == ErrNone {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-			return
+		// As with S3, a caller without s3:ListBucket on the bucket gets
+		// AccessDenied in place of NoSuchKey. A server error, such as lost
+		// read quorum, tells nothing about the object and reaches the caller,
+		// who may read the object, as it is.
+		apiErr := toAPIError(ctx, err)
+		if apiErr.HTTPStatusCode < http.StatusInternalServerError && authorizeBucketRequest(ctx, r, policy.ListBucketAction) != ErrNone {
+			apiErr = errorCodes.ToAPIErr(ErrAccessDenied)
 		}
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		writeErrorResponse(ctx, w, apiErr, r.URL)
 		return
 	}
 
