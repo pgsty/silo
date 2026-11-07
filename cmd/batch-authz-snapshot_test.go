@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/minio/minio/internal/auth"
 	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/puzpuzpuz/xsync/v3"
 )
@@ -155,5 +156,50 @@ func TestBatchAuthorizeSlowLoadKeepsCachedAuthorizationAvailable(t *testing.T) {
 				t.Fatal("a lazy load outlived the job's context")
 			}
 		})
+	}
+}
+
+// A policy that a mapping still names after it was deleted takes no part in
+// the decision, for a batch job as for a request: the remaining mapped
+// policies decide. An STS parent user's mapping can name a deleted policy,
+// because deleting a policy checks only user and group mappings for use.
+func TestBatchAuthorizeSkipsDeletedMappedPolicy(t *testing.T) {
+	f := newBatchAuthzFixture(t)
+	batchAuthzPolicy(f.ctx, t, f.sys, "mapped-full", batchAuthzFullAccess)
+	batchAuthzPolicy(f.ctx, t, f.sys, "mapped-deleted", `{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::batch-authz/*"]}`)
+	parent := iamAdminUser(f.ctx, t, f.sys, "mapped-parent", "")
+	_, err := f.sys.PolicyDBSet(f.ctx, parent.AccessKey, "mapped-full,mapped-deleted", stsUser, false)
+	mustIAM(t, err)
+	cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{parentClaim: parent.AccessKey, "exp": UTCNow().Add(time.Hour).Unix()}, globalActiveCred.SecretKey)
+	mustIAM(t, err)
+	cred.ParentUser = parent.AccessKey
+	_, err = f.sys.SetTempUser(f.ctx, cred.AccessKey, cred, "")
+	mustIAM(t, err)
+	sub, err := newBatchJobSubmitter(cred)
+	mustIAM(t, err)
+	req := batchAuthzRequest{action: policy.GetObjectAction, bucket: f.bucket, object: "key", versionID: mustGetUUID()}
+	if err := sub.authorize(f.ctx, req); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	p, err := sub.principal(f.ctx)
+	mustIAM(t, err)
+	args := policy.Args{AccountName: cred.AccessKey, Action: req.action, BucketName: req.bucket, ObjectName: req.object, Claims: p.claims, ConditionValues: p.conditionValues(req)}
+
+	mustIAM(t, f.sys.DeletePolicy(f.ctx, "mapped-deleted", true))
+	if !f.sys.IsAllowed(args) {
+		t.Fatal("the request path denied the remaining mapped policy")
+	}
+	if err := sub.authorize(f.ctx, req); err != nil {
+		t.Fatalf("batch authorization diverged from the request after a mapped policy was deleted: %v", err)
+	}
+
+	// With every mapped policy deleted, both deny; the job is refused, not
+	// paused, as nothing is unavailable.
+	mustIAM(t, f.sys.DeletePolicy(f.ctx, "mapped-full", true))
+	if f.sys.IsAllowed(args) {
+		t.Fatal("the request path allowed without any mapped policy")
+	}
+	if err := sub.authorize(f.ctx, req); !isBatchJobAuthzError(err) {
+		t.Fatalf("batch authorization without any mapped policy: %v", err)
 	}
 }

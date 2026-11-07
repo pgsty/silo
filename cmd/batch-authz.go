@@ -688,12 +688,19 @@ func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, wit
 			doc, ok := cache.iamPolicyDocsMap[name]
 			if !ok {
 				loaded := make(map[string]PolicyDoc)
-				if err := snap.loadPolicyDoc(name, loaded); err != nil {
+				err := snap.loadPolicyDoc(name, loaded)
+				if errors.Is(err, errNoSuchPolicy) {
+					// Confirmed absent, as when a mapping still names a
+					// deleted policy: it takes no part in the decision, as
+					// in MergePolicies. Any other failure could hide a Deny.
+					continue
+				}
+				if err != nil {
 					return nil, err
 				}
 				doc, ok = loaded[name]
 				if !ok {
-					return nil, errNoSuchPolicy
+					return nil, fmt.Errorf("load IAM policy %q returned no document", name)
 				}
 			}
 			selected = append(selected, doc.Policy)
