@@ -96,6 +96,12 @@ jobs:
       - name: Run multi-pool delete consistency tests under race detector
         run: go test -race ./cmd -run '^Test(Pools(Delete|BulkDelete|RetiringCopyPreservesSharedTierObject)|BulkDeleteQuorumEvidence)' -count=1 -timeout=5m
 
+      # Build tags: kqueue selects the kqueue backend of rjeczalik/notify on
+      # BSD and macOS and changes nothing on Linux. dev came with upstream's
+      # 2024-06 Makefile change for development builds; no file in this
+      # repository or its dependencies carries a dev build constraint, so it
+      # selects nothing and is kept only so that the documented command
+      # lines (make test, make install-race) stay valid.
       - name: Run lifecycle expiry and native restore tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
@@ -127,6 +133,9 @@ jobs:
         env:
           MINIO_API_REQUESTS_MAX: "10000"
         run: go test -race -tags kqueue,dev ./cmd ./internal/grid ./internal/ioutil -run '^Test(StorageTimeout|StorageRollback|StoragePrerelease|MaintenancePartialFailedOverwriteAvailability|SingleRequest|WithDeadline)' -count=1 -timeout=5m
+
+      - name: Run logger target lifecycle tests under race detector
+        run: go test -race ./cmd -run '^TestDynamicWebhookOutlivesConfigContext' -count=1 -timeout=5m
 
       - name: Compile deferred consistency diagnostics
         run: go test -tags kqueue,dev,consistency_strict ./cmd -run '^$'

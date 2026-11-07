@@ -73,6 +73,11 @@ lint-fix: getdeps ## runs golangci-lint suite of linters with automatic fixes
 	@$(GOLANGCI) run --build-tags kqueue --timeout=10m --config ./.golangci.yml --fix
 
 check: test
+# -tags kqueue,dev: kqueue selects the kqueue backend of rjeczalik/notify on
+# BSD and macOS (no-op on Linux); dev came with upstream's 2024-06 change for
+# development builds and no file in this repository or its dependencies
+# carries a dev build constraint, so it selects nothing. Kept for the
+# documented command lines; .github/workflows/go.yml carries the same note.
 test: verifiers build ## builds Silo, runs linters, tests
 	@echo "Running unit tests"
 	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -v -tags kqueue,dev ./...
