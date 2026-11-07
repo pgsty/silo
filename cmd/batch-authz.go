@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -22,6 +23,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/pgsty/silo-pkg/v3/policy/condition"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 // A batch job acts on objects long after the request that submitted it has
@@ -467,12 +469,12 @@ func (p batchJobPrincipal) authorizeArgs(args policy.Args, req *batchAuthzReques
 		ctx = GlobalContext
 	}
 	plugin := newGlobalAuthZPluginFn()
-	var cache *iamCache
+	var snap *batchPolicySnapshot
 	if plugin == nil && !args.IsOwner {
-		cache = globalIAMSys.store.lock()
-		defer globalIAMSys.store.unlock()
+		snap = globalIAMSys.store.batchSnapshot(ctx)
+		defer snap.release()
 	}
-	policies, err := globalIAMSys.batchLocalPolicies(ctx, p, args, plugin == nil, cache)
+	policies, err := globalIAMSys.batchLocalPolicies(p, args, plugin == nil, snap)
 	if err != nil {
 		if errors.Is(err, errNoSuchPolicy) || errors.Is(err, errAuthentication) || errors.Is(err, errNoSuchUser) || errors.Is(err, errNoSuchGroup) {
 			return denied
@@ -555,24 +557,99 @@ func (p batchJobPrincipal) sessionPolicyDecision(args policy.Args) (bool, bool) 
 	return false, false
 }
 
+// batchIAMLoadTimeout bounds one storage read of a lazy IAM load during
+// batch authorization, as MergePolicies bounds a policy document load.
+const batchIAMLoadTimeout = 5 * time.Second
+
+// batchPolicySnapshot reads the mappings and policy documents of a submitter
+// at one cache revision while cached authentication and authorization
+// proceed.
+//
+// It holds the store's writer mutex, so no writer changes the cache between
+// its reads, and the cache read lock, which it releases around each storage
+// read: a lazy mapping load or a policy document load. Request
+// authentication then neither waits for storage nor queues behind a writer
+// waiting for the cache lock, which taking the write lock back after each
+// read would cause. It writes nothing to the cache but the lazily loaded
+// mappings, which the request path stores under the read lock as well.
+type batchPolicySnapshot struct {
+	*IAMStoreSys
+	ctx   context.Context
+	cache *iamCache
+	mu    sync.Mutex
+	reads int // storage reads in progress; the read lock is released while any
+}
+
+// batchSnapshot takes the snapshot; release it with release.
+func (store *IAMStoreSys) batchSnapshot(ctx context.Context) *batchPolicySnapshot {
+	store.writeMu.Lock()
+	return &batchPolicySnapshot{IAMStoreSys: store, ctx: ctx, cache: store.IAMStorageAPI.rlock()}
+}
+
+func (s *batchPolicySnapshot) release() {
+	s.IAMStorageAPI.runlock()
+	s.writeMu.Unlock()
+}
+
+// read runs one storage read without the cache lock, bounded by the job's
+// context and batchIAMLoadTimeout. Concurrent reads (the group fallback of
+// policyDBGetGroups) release the lock before the first and take it back
+// after the last.
+func (s *batchPolicySnapshot) read(fn func(ctx context.Context) error) error {
+	s.mu.Lock()
+	if s.reads == 0 {
+		s.IAMStorageAPI.runlock()
+	}
+	s.reads++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.reads--
+		if s.reads == 0 {
+			s.IAMStorageAPI.rlock()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(s.ctx, batchIAMLoadTimeout)
+	defer cancel()
+	return fn(ctx)
+}
+
+func (s *batchPolicySnapshot) loadMappedPolicy(_ context.Context, name string, userType IAMUserType, isGroup bool, m *xsync.MapOf[string, MappedPolicy]) error {
+	return s.read(func(ctx context.Context) error {
+		return s.IAMStoreSys.loadMappedPolicy(ctx, name, userType, isGroup, m)
+	})
+}
+
+// loadGroup would write the cache under the read lock. The snapshot resolves
+// the policies of users, which never loads a group.
+func (s *batchPolicySnapshot) loadGroup(context.Context, string, map[string]GroupInfo) error {
+	return errors.New("batch authorization does not load groups")
+}
+
+func (s *batchPolicySnapshot) loadPolicyDoc(name string, out map[string]PolicyDoc) error {
+	return s.read(func(ctx context.Context) error { return s.IAMStoreSys.loadPolicyDoc(ctx, name, out) })
+}
+
 // batchLocalPolicies returns every local policy that can take part in the
 // decision on args: the mapped policies that IsAllowed would merge when
 // withMapped is set (no authorization plugin), and the session policy.
-func (sys *IAMSys) batchLocalPolicies(ctx context.Context, p batchJobPrincipal, args policy.Args, withMapped bool, cache *iamCache) ([]policy.Policy, error) {
+func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, withMapped bool, snap *batchPolicySnapshot) ([]policy.Policy, error) {
 	var out []policy.Policy
 	if withMapped && args.IsOwner {
 		// IsAllowed does not evaluate any policy for the owner.
 		return nil, nil
 	}
 	if withMapped {
-		// The caller holds the IAM writer lock through evaluation. Lazy mapping
-		// loads and selected documents therefore belong to one cache revision.
+		// The caller holds snap through evaluation. Lazy mapping loads and
+		// selected documents therefore belong to one cache revision.
+		cache := snap.cache
 		mappedPolicies := func(name string) ([]string, error) {
-			names, _, err := cache.policyDBGet(sys.store, name, false, false)
+			names, _, err := cache.policyDBGet(snap, name, false, false)
 			if err != nil {
 				return nil, err
 			}
-			groups, err := cache.policyDBGetGroups(sys.store, len(names) > 0, args.Groups...)
+			groups, err := cache.policyDBGetGroups(snap, len(names) > 0, args.Groups...)
 			return append(names, groups...), err
 		}
 		var names []string
@@ -611,10 +688,7 @@ func (sys *IAMSys) batchLocalPolicies(ctx context.Context, p batchJobPrincipal, 
 			doc, ok := cache.iamPolicyDocsMap[name]
 			if !ok {
 				loaded := make(map[string]PolicyDoc)
-				loadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				err := sys.store.loadPolicyDoc(loadCtx, name, loaded)
-				cancel()
-				if err != nil {
+				if err := snap.loadPolicyDoc(name, loaded); err != nil {
 					return nil, err
 				}
 				doc, ok = loaded[name]

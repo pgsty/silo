@@ -372,7 +372,18 @@ func (c *iamCache) removeGroupFromMembershipsMap(group string) {
 	}
 }
 
-func (c *iamCache) policyDBGetGroups(store *IAMStoreSys, userPolicyPresent bool, groups ...string) ([]string, error) {
+// iamMappingLoader is what policyDBGet and policyDBGetGroups need of the
+// store: the identity backend in use and the loads of a mapping or a group
+// the cache does not hold. *IAMStoreSys loads under the lock its caller
+// holds; a caller that must not hold the cache lock across a storage read
+// wraps it (see batchPolicySnapshot).
+type iamMappingLoader interface {
+	getUsersSysType() UsersSysType
+	loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error
+	loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m *xsync.MapOf[string, MappedPolicy]) error
+}
+
+func (c *iamCache) policyDBGetGroups(store iamMappingLoader, userPolicyPresent bool, groups ...string) ([]string, error) {
 	var policies []string
 	for _, group := range groups {
 		if store.getUsersSysType() == MinIOUsersSysType {
@@ -444,7 +455,7 @@ func (c *iamCache) policyDBGetGroups(store *IAMStoreSys, userPolicyPresent bool,
 // information in IAM (i.e sys.iam*Map) - this info is stored only in the STS
 // generated credentials. Thus we skip looking up group memberships, user map,
 // and group map and check the appropriate policy maps directly.
-func (c *iamCache) policyDBGet(store *IAMStoreSys, name string, isGroup bool, policyPresent bool) ([]string, time.Time, error) {
+func (c *iamCache) policyDBGet(store iamMappingLoader, name string, isGroup bool, policyPresent bool) ([]string, time.Time, error) {
 	if isGroup {
 		if store.getUsersSysType() == MinIOUsersSysType {
 			g, ok := c.iamGroupsMap[name]
