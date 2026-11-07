@@ -474,10 +474,10 @@ func (r *BatchJobExpire) expireVersions(ctx context.Context, api ObjectLayer, vc
 // expireAllVersions purges every version of a key whose rule retains none,
 // with the purge of exactly that key (erasureServerPools.deleteAllVersions),
 // while the version the walk matched is still its latest. Under its lock,
-// before it deletes anything, the purge refuses the key when Object Lock
-// protects a version and has every write it would delete, each copy and
-// each revision a drive holds, authorized for the submitter, with the
-// version ID and tags it has then.
+// before it deletes anything, the purge refuses the key when a version is
+// transitioned or Object Lock protects one, and has every write it would
+// delete, each copy and each revision a drive holds, authorized for the
+// submitter, with the version ID and tags it has then.
 //
 // What the purge removed is counted at once; a refused key is counted in res
 // as refused, and the versions a failed purge left in res as failures. A
@@ -520,9 +520,9 @@ func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer,
 		case errors.Is(err, errDeleteAllChanged):
 			// Changed since the walk matched it: not expired.
 			return nil
-		case isErrObjectLocked(err):
+		case isErrObjectLocked(err), errors.Is(err, errDeleteAllTiered):
 			// Refused as a whole: nothing removed, not retried and not a
-			// failure.
+			// failure. A later run of the job checks the key again.
 			res.keysRefused++
 			return nil
 		case errors.Is(err, errDeleteAllBudget) && purge.Removed > 0:
@@ -533,9 +533,6 @@ func (r *BatchJobExpire) expireAllVersions(ctx context.Context, api ObjectLayer,
 			return err
 		}
 		batchLogIf(ctx, fmt.Errorf("Failed to expire %s/%s due to %v (attempts=%d)", exp.Bucket, exp.Name, err, attempts))
-		if errors.Is(err, errDeleteAllTiered) {
-			break // refused; a later run of the job checks again
-		}
 	}
 	res.expireAllFailed(exp, objects, markers)
 	return nil

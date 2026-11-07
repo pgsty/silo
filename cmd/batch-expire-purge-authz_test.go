@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/config/storageclass"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/pgsty/silo-pkg/v3/policy"
@@ -187,6 +188,41 @@ func TestBatchExpirePurgeRefusesLockedAfterWalk(t *testing.T) {
 					ri.Complete, ri.Failed, ri.KeysRefused, ri.ObjectsFailed, ri.Objects)
 			}
 		})
+	}
+}
+
+// transition marks version versionID of key as transitioned to a remote
+// tier, as a lifecycle transition leaves it.
+func (f *batchAuthzFixture) transition(t *testing.T, key, versionID string) {
+	t.Helper()
+	set := f.obj.(*erasureServerPools).serverPools[0]
+	infos, errs := readAllFileInfo(f.ctx, set.getHashedSet(key).getDisks(), "", f.bucket, key, versionID, false, false)
+	mustIAM(t, errs[0])
+	fi := infos[0]
+	fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName = lifecycle.TransitionComplete, "WARM", "remote/"+key+"/"+versionID
+	mustIAM(t, set.DecomTieredObject(f.ctx, f.bucket, key, fi, ObjectOptions{}))
+}
+
+// A key with a transitioned version is refused as a whole, as a key with a
+// locked version is: the job completes with the key counted as refused, not
+// failed, and the key keeps every version.
+func TestBatchExpirePurgeRefusesTieredKey(t *testing.T) {
+	f := newBatchAuthzFixture(t)
+	batchAuthzPolicy(f.ctx, t, f.sys, "batch-full", batchAuthzFullAccess)
+	cred := iamAdminUser(f.ctx, t, f.sys, "batch-user", "batch-full")
+	const key = "purge/tiered"
+	older := f.putVersions(t, key)
+	f.transition(t, key, older)
+	want := batchPurgeVersionIDs(t, f, key)
+	ri := f.runChanged(t, cred, "purge/", func() {})
+	for _, id := range want {
+		if !f.versionExists(t, key, id) {
+			t.Errorf("version %s of a key with a transitioned version was purged", id)
+		}
+	}
+	if !ri.Complete || ri.Failed || ri.KeysRefused != 1 || ri.ObjectsFailed != 0 || ri.Objects != 0 {
+		t.Errorf("job complete=%v failed=%v refused=%d failed objects=%d objects=%d, want complete with 1 refused key",
+			ri.Complete, ri.Failed, ri.KeysRefused, ri.ObjectsFailed, ri.Objects)
 	}
 }
 

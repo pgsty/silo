@@ -816,8 +816,8 @@ func TestPurgeAllVersionsRefusesTieredKeys(t *testing.T) {
 	if got := p.remotes(); got != remotes {
 		t.Errorf("tier holds %d remote objects, want %d", got, remotes)
 	}
-	if ri.Objects != 0 || ri.ObjectsFailed == 0 {
-		t.Errorf("refused batch purges counted objects=%d failed=%d", ri.Objects, ri.ObjectsFailed)
+	if ri.Objects != 0 || ri.ObjectsFailed != 0 || ri.KeysRefused != 2 {
+		t.Errorf("refused batch purges counted objects=%d failed=%d refused=%d, want 2 refused keys", ri.Objects, ri.ObjectsFailed, ri.KeysRefused)
 	}
 }
 
