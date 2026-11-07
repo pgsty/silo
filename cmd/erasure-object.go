@@ -1662,7 +1662,11 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		defer lk.Unlock(lkctx)
 	}
 
-	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement &&
+	if opts.restoreCheck != nil {
+		if err := opts.restoreCheck(ctx); err != nil {
+			return ObjectInfo{}, err
+		}
+	} else if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement &&
 		(fi.VersionID == "" || fi.VersionID == nullVersionID) {
 		getObjectInfo := er.getObjectInfo
 		if opts.replicaObjectInfo != nil {
@@ -2693,6 +2697,30 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 	return nil
 }
 
+// errRestoreSuperseded is the error of a restore whose version changed while
+// the restored data was read from the tier.
+var errRestoreSuperseded = errors.New("the version changed while it was restored")
+
+// restoreCommitCheck returns the check that the restored copy of a version
+// runs under the object lock right before it commits. With a single pool no
+// lock is held while the restored data is read from the tier, so the version
+// may have been uploaded over, deleted or changed meanwhile: the restored copy
+// commits only over the version as the restore read it, still in the tier,
+// with the same modification time and metadata, its ongoing restore status
+// among them.
+func (er erasureObjects) restoreCommitCheck(bucket, object string, opts ObjectOptions, read FileInfo) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		fi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts, false)
+		if err != nil {
+			return toObjectErr(err, bucket, object)
+		}
+		if fi.VersionID != read.VersionID || !fi.ModTime.Equal(read.ModTime) || !fi.IsRemote() || !maps.Equal(fi.Metadata, read.Metadata) {
+			return errRestoreSuperseded
+		}
+		return nil
+	}
+}
+
 // restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
 // as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
 func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
@@ -2712,8 +2740,11 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	oi := actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
 	// With more than one pool the pools layer holds the object lock for the
-	// whole restore; the restored copy is written under that lock.
+	// whole restore; the restored copy is written under that lock. With a
+	// single pool the set takes the lock only to commit the restored copy,
+	// which commits only over the version as it was read.
 	ropts.NoLock = opts.NoLock
+	ropts.restoreCheck = er.restoreCommitCheck(bucket, object, opts, actualfi)
 	if len(oi.Parts) == 1 {
 		var rs *HTTPRangeSpec
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
@@ -2734,6 +2765,13 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 	if err != nil {
 		return setRestoreHeaderFn(err)
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			// A restore that fails leaves no upload behind.
+			er.AbortMultipartUpload(context.Background(), bucket, object, res.UploadID, ObjectOptions{NoAuditLog: true})
+		}
+	}()
 
 	var uploadedParts []CompletePart
 	var rs *HTTPRangeSpec
@@ -2763,9 +2801,11 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		})
 	}
 	_, err = er.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{
-		MTime:  oi.ModTime,
-		NoLock: opts.NoLock,
+		MTime:        oi.ModTime,
+		NoLock:       opts.NoLock,
+		restoreCheck: ropts.restoreCheck,
 	})
+	completed = err == nil
 	return setRestoreHeaderFn(err)
 }
 

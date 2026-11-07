@@ -106,6 +106,13 @@ type ObjectOptions struct {
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn
 
+	// restoreCheck is set by the restore of a transitioned version. The set
+	// runs it under the object lock right before the restored copy commits,
+	// to check that the version is still the one the restore read. The
+	// restored copy rewrites that version with its own data, so the checks
+	// of a write over an existing version do not apply to it.
+	restoreCheck func(ctx context.Context) error
+
 	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
 	// Use the maximum parity (N/2), used when saving server configuration files
