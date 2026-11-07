@@ -723,6 +723,73 @@ func TestPurgeAllVersionsRefusesStaleDecision(t *testing.T) {
 	}
 }
 
+// The purge reads the placement of the versions it approved and may only
+// confirm them. A write that reaches the key between the approval and that
+// read, as one that bypasses the object lock would, changes what the purge
+// is about to delete: a version it did not approve, or another write of an
+// approved one. The purge refuses the key with a write quorum error, which
+// counts as an unavailable history, and deletes nothing; the next purge,
+// which approves what it finds, removes the key.
+func TestPurgeAllVersionsRefusesChangedApproval(t *testing.T) {
+	for _, kind := range []string{"new-version", "latest-rewritten"} {
+		t.Run(kind, func(t *testing.T) {
+			z := purgeSinglePool(t, 16)
+			p := newPurgeTest(t, z, "purge-approval", MakeBucketOptions{VersioningEnabled: true}, purgeRules)
+			ctx := t.Context()
+			const key = "ea/approval"
+			p.version(0, key, "v1", 5)
+			latest := p.version(0, key, "v2", 4)
+			ops := p.scanQueue(0, key)
+
+			// Each purge finds the history changed since its approval.
+			var writes int
+			deleteAllBeforePlacement = func(bucket, object string) {
+				if bucket != p.bucket || object != key {
+					return
+				}
+				writes++
+				label := fmt.Sprintf("v%d", 2+writes)
+				opts := ObjectOptions{Versioned: true, NoLock: true}
+				mtime := daysAgo(3)
+				if kind == "latest-rewritten" {
+					label = fmt.Sprintf("v2-rewrite-%d", writes)
+					opts.VersionID, mtime = latest.VersionID, latest.ModTime
+				}
+				p.put(0, key, label, mtime, opts)
+			}
+			t.Cleanup(func() { deleteAllBeforePlacement = nil })
+
+			_, err := z.DeleteObject(ctx, p.bucket, key, ObjectOptions{DeleteAllVersions: true, Expiration: ExpirationOptions{Expire: true}})
+			if !isErrWriteQuorum(err) {
+				t.Fatalf("purge of a changed history: %v, want a write quorum error", err)
+			}
+			delta := incompleteDelta(func() { p.run(ops) })
+			if delta[ilmIncompleteHistoryUnavailable] != 1 {
+				t.Errorf("counted %v, want one %s", delta, ilmIncompleteHistoryUnavailable)
+			}
+			if writes != 2 {
+				t.Fatalf("the history changed %d times, want 2", writes)
+			}
+			want, read := []string{"hot", "hot", "hot", "hot"}, "v4"
+			if kind == "latest-rewritten" {
+				want, read = []string{"hot", "hot"}, "v2-rewrite-2"
+			}
+			if got := p.held(0, key); !slices.Equal(got, want) {
+				t.Fatalf("the refused purges left %v, want %v", got, want)
+			}
+			if got := p.get(key); got != read {
+				t.Errorf("the key reads %s, want %s", got, read)
+			}
+
+			deleteAllBeforePlacement = nil
+			p.expire(0, key)
+			if got := p.held(0, key); got != nil {
+				t.Errorf("the purge of the unchanged history left %v", got)
+			}
+		})
+	}
+}
+
 // Control: on two pools the stale decision was already refused.
 func TestPurgeAllVersionsStaleDecisionTwoPoolsControl(t *testing.T) {
 	z, _ := consistencyPools(t)

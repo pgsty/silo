@@ -376,3 +376,198 @@ func TestRebalanceLeavesRestoredCopyPastDeadline(t *testing.T) {
 	left := f.tieredVersion(0, key, remote, oi)
 	f.expireRestoredCopy(0, key, remote, left)
 }
+
+// tierReadFaultDisk fails the raw metadata read of one key with err, as a
+// drive that is not reachable or faulty does.
+type tierReadFaultDisk struct {
+	StorageAPI
+	bucket, object string
+	err            error
+}
+
+func (d tierReadFaultDisk) ReadXL(ctx context.Context, volume, path string, readData bool) (RawFileInfo, error) {
+	if volume == d.bucket && path == d.object {
+		return RawFileInfo{}, d.err
+	}
+	return d.StorageAPI.ReadXL(ctx, volume, path, readData)
+}
+
+// freeRecord returns the free version of key in pool and the remote tuple
+// it names.
+func (f *freeVersionTest) freeRecord(pool int, key string) (FileInfo, tierRemoteTuple) {
+	f.t.Helper()
+	fivs, err := getFileInfoVersions(f.xlMeta(pool, key), f.bucket, key, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if len(fivs.FreeVersions) != 1 {
+		f.t.Fatalf("pool %d holds %d free versions of %s, want 1", pool, len(fivs.FreeVersions), key)
+	}
+	fv := fivs.FreeVersions[0]
+	return fv, tierRemoteTuple{Tier: fv.TransitionTier, Object: fv.TransitionedObjName, VersionID: fv.TransitionVersionID}
+}
+
+// A drive that cannot be read, in any pool, may hold a live reference to the
+// remote object: its ownership is unknown. The cleanup of the expiry worker
+// and of a decommission is refused with a read quorum error, the free record
+// and the remote object stay, and both go once the drive reads again.
+func TestTierOwnershipReadFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error // nil: the drive is offline
+	}{
+		{"offline", nil},
+		{"disk-not-found", errDiskNotFound},
+		{"faulty-disk", errFaultyDisk},
+		{"unformatted-disk", errUnformattedDisk},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFreeVersionTest(t, "")
+			ctx := t.Context()
+			const key = "obj-02" // only a free version, in pool 0
+			remote := f.remote(key, "v1")
+			fv, tuple := f.freeRecord(0, key)
+			if tuple.Object != remote {
+				t.Fatalf("free record names %+v", tuple)
+			}
+			// The drive is in the pool that holds nothing of the key.
+			set := f.z.serverPools[1].getHashedSet(key)
+			getDisks := set.getDisks
+			faulty := slices.Clone(getDisks())
+			if tc.err == nil {
+				faulty[3] = nil
+			} else {
+				faulty[3] = tierReadFaultDisk{StorageAPI: faulty[3], bucket: f.bucket, object: key, err: tc.err}
+			}
+			set.getDisks = func() []StorageAPI { return faulty }
+			restore := func() { set.getDisks = getDisks }
+			defer restore()
+
+			err := f.z.deleteTierTuple(ctx, f.bucket, key, tuple)
+			var rq InsufficientReadQuorum
+			if !errors.Is(err, errTierOwnershipUnavailable) || !errors.As(err, &rq) {
+				t.Fatalf("cleanup with an unreadable drive: %v", err)
+			}
+			if err := f.z.removeFreeVersions(ctx, f.bucket, key, 0, []FileInfo{fv}); !errors.Is(err, errTierOwnershipUnavailable) {
+				t.Fatalf("decommission cleanup with an unreadable drive: %v", err)
+			}
+			if len(f.tier.removed) != 0 {
+				t.Fatalf("remote object removed with a drive unread: %v", f.tier.removed)
+			}
+			if got := f.stored(0, key); !slices.Equal(got, []string{"free"}) {
+				t.Fatalf("pool 0 holds %v, want the free record", got)
+			}
+
+			restore()
+			if err := f.z.deleteTierTuple(ctx, f.bucket, key, tuple); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(f.tier.removed, []string{remote}) {
+				t.Fatalf("remote objects removed once the drive reads: %v", f.tier.removed)
+			}
+			if got := f.stored(0, key); len(got) != 0 {
+				t.Fatalf("pool 0 still holds %v", got)
+			}
+		})
+	}
+}
+
+// freeRecordDelete returns the FileInfo with which the tier cleanup deletes
+// the free record id of the remote tuple.
+func freeRecordDelete(id string, tuple tierRemoteTuple) FileInfo {
+	fi := FileInfo{VersionID: id, TransitionTier: tuple.Tier, TransitionedObjName: tuple.Object, TransitionVersionID: tuple.VersionID}
+	fi.SetTierFreeVersion()
+	return fi
+}
+
+// A free record is deleted only with the remote tuple it names. The storage
+// layer checks the record under the version ID: a cleanup that names another
+// tier, remote object or remote version, as a stale task or a record rewritten
+// on one drive would, finds no such version and leaves the record.
+func TestFreeRecordDeleteNeedsMatchingTuple(t *testing.T) {
+	const id = "00000000-0000-0000-0000-0000000000f1"
+	tuple := tierRemoteTuple{Tier: "WARM", Object: "remote/obj/v1", VersionID: "rv1"}
+	record := func() *xlMetaV2 {
+		t.Helper()
+		var xl xlMetaV2
+		fi := FileInfo{
+			Volume: "bucket", Name: "obj", VersionID: mustGetUUID(), ModTime: UTCNow(), DataDir: mustGetUUID(),
+			Erasure: ErasureInfo{Algorithm: ReedSolomon.String(), DataBlocks: 4, ParityBlocks: 2, BlockSize: 10000, Index: 1, Distribution: []int{1, 2, 3, 4, 5, 6, 7, 8}},
+		}
+		if err := xl.AddVersion(fi); err != nil {
+			t.Fatal(err)
+		}
+		fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName, fi.TransitionVersionID = lifecycle.TransitionComplete, tuple.Tier, tuple.Object, tuple.VersionID
+		if _, err := xl.DeleteVersion(fi); err != nil {
+			t.Fatal(err)
+		}
+		fi.TransitionStatus = ""
+		fi.SetTierFreeVersionID(id)
+		if _, err := xl.DeleteVersion(fi); err != nil {
+			t.Fatal(err)
+		}
+		free, err := xl.listFreeVersions("bucket", "obj")
+		if err != nil || len(free) != 1 || free[0].VersionID != id || free[0].TransitionedObjName != tuple.Object {
+			t.Fatalf("fixture: free versions %+v, %v", free, err)
+		}
+		return &xl
+	}
+	others := map[string]func(*tierRemoteTuple){
+		"tier":    func(tp *tierRemoteTuple) { tp.Tier = "COLD" },
+		"object":  func(tp *tierRemoteTuple) { tp.Object = "remote/obj/v2" },
+		"version": func(tp *tierRemoteTuple) { tp.VersionID = "rv2" },
+	}
+	for name, change := range others {
+		t.Run(name, func(t *testing.T) {
+			xl := record()
+			other := tuple
+			change(&other)
+			if _, err := xl.DeleteVersion(freeRecordDelete(id, other)); !errors.Is(err, errFileVersionNotFound) {
+				t.Fatalf("delete with another %s: %v, want %v", name, err, errFileVersionNotFound)
+			}
+			if free, err := xl.listFreeVersions("bucket", "obj"); err != nil || len(free) != 1 {
+				t.Fatalf("free versions after a refused delete: %+v, %v", free, err)
+			}
+		})
+	}
+	t.Run("matching", func(t *testing.T) {
+		xl := record()
+		if _, err := xl.DeleteVersion(freeRecordDelete(id, tuple)); err != nil {
+			t.Fatal(err)
+		}
+		if free, err := xl.listFreeVersions("bucket", "obj"); err != nil || len(free) != 0 {
+			t.Fatalf("free versions after the delete: %+v, %v", free, err)
+		}
+	})
+	t.Run("storage", func(t *testing.T) {
+		ctx := t.Context()
+		disk, _, err := newXLStorageTestSetup(t)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := disk.MakeVol(ctx, "bucket"); err != nil {
+			t.Fatal(err)
+		}
+		buf, err := record().AppendTo(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := disk.WriteAll(ctx, "bucket", pathJoin("obj", xlStorageFormatFile), buf); err != nil {
+			t.Fatal(err)
+		}
+		other := tuple
+		other.Object = "remote/obj/v2"
+		if err := disk.DeleteVersion(ctx, "bucket", "obj", freeRecordDelete(id, other), false, DeleteOptions{}); !errors.Is(err, errFileVersionNotFound) {
+			t.Fatalf("delete with another remote object: %v, want %v", err, errFileVersionNotFound)
+		}
+		if fi, err := disk.ReadVersion(ctx, "", "bucket", "obj", id, ReadOptions{InclFreeVersions: true}); err != nil || !fi.TierFreeVersion() || fi.TransitionedObjName != tuple.Object {
+			t.Fatalf("free record after a refused delete: %+v, %v", fi, err)
+		}
+		if err := disk.DeleteVersion(ctx, "bucket", "obj", freeRecordDelete(id, tuple), false, DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := disk.ReadAll(ctx, "bucket", pathJoin("obj", xlStorageFormatFile)); !errors.Is(err, errFileNotFound) {
+			t.Fatalf("metadata after the last record is deleted: %v", err)
+		}
+	})
+}

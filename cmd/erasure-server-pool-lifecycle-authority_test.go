@@ -382,6 +382,99 @@ func TestPoolsLifecycleRevisionIdentity(t *testing.T) {
 	})
 }
 
+// authorityMarker encodes a delete marker of version id at modTime.
+func authorityMarker(t *testing.T, id [16]byte, modTime int64) xlMetaV2ShallowVersion {
+	t.Helper()
+	v := xlMetaV2Version{Type: DeleteType, DeleteMarker: &xlMetaV2DeleteMarker{VersionID: id, ModTime: modTime, MetaSys: map[string][]byte{}}}
+	meta, err := v.MarshalMsg(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return xlMetaV2ShallowVersion{header: v.header(), meta: meta}
+}
+
+// A revision counts only on more than half of the drives, whatever read
+// quorum its metadata has. A delete marker that a DELETE left on exactly
+// half of the drives, which is the read quorum of a marker, is not part of
+// the history: the drives cannot tell whether the version it hides is the
+// latest one, and no expiry is decided on them. One more drive decides.
+func TestPoolsLifecycleHalfDriveMarker(t *testing.T) {
+	markerID, objectID := [16]byte{2}, [16]byte{1}
+	history := func(drives int) [][]xlMetaV2ShallowVersion {
+		metas := make([][]xlMetaV2ShallowVersion, 16)
+		for i := range metas {
+			if i < drives {
+				metas[i] = append(metas[i], authorityMarker(t, markerID, 2))
+			}
+			metas[i] = append(metas[i], authorityRevision(t, objectID, 1, i+1, ""))
+		}
+		return metas
+	}
+	metaVs := slices.Repeat([]uint8{xlMetaVersion}, 16)
+	readQuorum := func(ver xlMetaV2ShallowVersion, _ uint8) int {
+		if ver.header.Type == DeleteType {
+			return 8
+		}
+		return 12
+	}
+	t.Run("half", func(t *testing.T) {
+		if merged, err := authoritativeHistory(t.Context(), history(8), metaVs, xlMetaVersion, 9, readQuorum); !errors.Is(err, errErasureReadQuorum) {
+			t.Fatalf("marker on 8 of 16 drives: %d versions, err=%v", len(merged), err)
+		}
+	})
+	t.Run("majority", func(t *testing.T) {
+		merged, err := authoritativeHistory(t.Context(), history(9), metaVs, xlMetaVersion, 9, readQuorum)
+		if err != nil || len(merged) != 2 || merged[0].header.VersionID != markerID || merged[1].header.VersionID != objectID {
+			t.Fatalf("marker on 9 of 16 drives: %d versions, err=%v", len(merged), err)
+		}
+	})
+
+	// On the drives: an expired version under a marker that reached half of
+	// them. The expiry of the version, which the marker hides on those
+	// drives, and of the key are refused, and every drive keeps what it has.
+	t.Run("drives", func(t *testing.T) {
+		authorityParity(t)
+		s := newSplitILM(t, versioning.Enabled, splitILMRules)
+		ctx := t.Context()
+		const key = "exp-half-marker"
+		s.write(key, splitAt("v1", 5, 0))
+		s.write(key, splitMarker("dm", 0.01, 0))
+		id, marker := s.ids[key+" v1"], s.ids[key+" dm"]
+		removeAuthorityCopies(t, s, 0, key, marker, authorityDrives(8, 16))
+
+		if _, _, err := s.z.lifecycleEventsAllPools(ctx, s.bucket, key); !isErrReadQuorum(err) {
+			t.Errorf("history with a marker on half of the drives: %v", err)
+		}
+		if err := authorityExpireVersion(t, s, key, id); !isErrWriteQuorum(err) {
+			t.Errorf("expiry of the version under the marker: %v", err)
+		}
+		if _, err := s.z.DeleteObject(ctx, s.bucket, key, authorityDeleteAll); !isErrWriteQuorum(err) {
+			t.Errorf("expiry of all versions: %v", err)
+		}
+		authorityPresent(t, s, 0, key, id)
+		for i, disk := range s.z.serverPools[0].getHashedSet(key).getDisks() {
+			_, err := disk.ReadVersion(ctx, "", s.bucket, key, marker, ReadOptions{})
+			if i < 8 && err != nil {
+				t.Fatalf("drive %d lost the marker: %v", i, err)
+			}
+			if i >= 8 && !errors.Is(err, errFileVersionNotFound) {
+				t.Fatalf("drive %d: marker %v", i, err)
+			}
+		}
+
+		// Control: the marker on one more drive decides, and the version
+		// under it is noncurrent, which the rule of exp- does not expire.
+		const whole = "exp-majority-marker"
+		s.write(whole, splitAt("v1", 5, 0))
+		s.write(whole, splitMarker("dm", 0.01, 0))
+		removeAuthorityCopies(t, s, 0, whole, s.ids[whole+" dm"], authorityDrives(9, 16))
+		versions, events, err := s.z.lifecycleEventsAllPools(ctx, s.bucket, whole)
+		if err != nil || len(versions) != 2 || !versions[0].DeleteMarker || events[1].Action != lifecycle.NoneAction {
+			t.Fatalf("history with a marker on 9 drives: %d versions, events %v, err=%v", len(versions), events, err)
+		}
+	})
+}
+
 // authorityMovedHold serves a drive whose metadata of version id carries the
 // legal hold in the system map instead of the user map, under the header it
 // had: the evaluator no longer reads the hold there.

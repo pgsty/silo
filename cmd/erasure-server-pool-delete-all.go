@@ -91,6 +91,12 @@ var deleteAllBudget = struct {
 // quorum is repeated on the drives that failed it.
 const deleteAllRetries = 2
 
+// deleteAllBeforePlacement, when a test sets it, runs after a purge approved
+// the versions of a key and before it reads their placement, with the bucket
+// and the encoded key: a write that reaches the key then, as one that
+// bypasses the object lock would, must refuse the purge.
+var deleteAllBeforePlacement func(bucket, object string)
+
 // deleteAllMatch identifies the latest version that a batch expiry matched.
 type deleteAllMatch struct {
 	VersionID string
@@ -295,6 +301,9 @@ func (z *erasureServerPools) deleteAllVersions(ctx context.Context, bucket, obje
 	}
 	// The placement of the approved versions. This read may only confirm
 	// them: whatever differs from the approval refuses the key.
+	if f := deleteAllBeforePlacement; f != nil {
+		f(bucket, object)
+	}
 	history, err := z.deleteAllHistory(ctx, bucket, object)
 	if err != nil {
 		return fail(err)
