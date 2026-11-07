@@ -2642,6 +2642,7 @@ func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, obje
 		VersionID: oi.VersionID,
 	}, ObjectOptions{
 		VersionID: oi.VersionID,
+		NoLock:    opts.NoLock, // the caller of the restore may hold the object lock
 	}); err != nil {
 		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
 		return err
@@ -2668,6 +2669,9 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 
 	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
+	// With more than one pool the pools layer holds the object lock for the
+	// whole restore; the restored copy is written under that lock.
+	ropts.NoLock = opts.NoLock
 	if len(oi.Parts) == 1 {
 		var rs *HTTPRangeSpec
 		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
@@ -2717,7 +2721,8 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		})
 	}
 	_, err = er.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{
-		MTime: oi.ModTime,
+		MTime:  oi.ModTime,
+		NoLock: opts.NoLock,
 	})
 	return setRestoreHeaderFn(oi, err)
 }
