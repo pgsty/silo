@@ -55,7 +55,34 @@ const (
 	restoreCapabilityTimeout = 5 * time.Second
 )
 
-var errNativeRestoreUnavailable = errors.New("native restore is unavailable during a rolling upgrade: not every server of the cluster supports it yet")
+// errNativeRestoreUnavailable is the refusal of a native restore. The gate
+// returns an error that wraps it and names the reason, so that an operator
+// looks for a server that is not connected, not for an older binary.
+var errNativeRestoreUnavailable = errors.New("native restore is unavailable")
+
+var (
+	// errNativeRestoreUnsupported: a server of the cluster does not report
+	// this protocol, as an older server does not, or reconnected while it
+	// was asked, so its answer does not count.
+	errNativeRestoreUnsupported = fmt.Errorf("%w during a rolling upgrade: not every server of the cluster supports it yet", errNativeRestoreUnavailable)
+	// errNativeRestorePeerUnreachable: a server of the cluster is not
+	// connected. nativeRestoreUnreachableError names it.
+	errNativeRestorePeerUnreachable = fmt.Errorf("%w: a server of the cluster is not reachable", errNativeRestoreUnavailable)
+)
+
+// nativeRestoreUnreachableError is errNativeRestorePeerUnreachable naming
+// the server.
+type nativeRestoreUnreachableError struct{ server string }
+
+func (e nativeRestoreUnreachableError) Error() string {
+	server := "a server of the cluster"
+	if e.server != "" {
+		server = "server " + e.server
+	}
+	return fmt.Sprintf("native restore is unavailable: %s is not reachable, so it cannot be shown to have stopped an older restore", server)
+}
+
+func (nativeRestoreUnreachableError) Unwrap() error { return errNativeRestorePeerUnreachable }
 
 // restoreCapabilityHandler answers the question on this server.
 func restoreCapabilityHandler(*grid.MSS) (*grid.MSS, *grid.RemoteErr) {
@@ -64,6 +91,8 @@ func restoreCapabilityHandler(*grid.MSS) (*grid.MSS, *grid.RemoteErr) {
 
 // restoreCapabilityPeer is another server of the cluster.
 type restoreCapabilityPeer interface {
+	// restoreServer names the server, for messages; empty when unknown.
+	restoreServer() string
 	// restoreConnection identifies the current connection to the server; it
 	// changes when the server reconnects, as a restarted one does. ok is
 	// false when the server is not connected.
@@ -72,6 +101,13 @@ type restoreCapabilityPeer interface {
 }
 
 type restorePeerClient struct{ *peerRESTClient }
+
+func (c restorePeerClient) restoreServer() string {
+	if c.peerRESTClient == nil || c.host == nil {
+		return ""
+	}
+	return c.host.String()
+}
 
 func (c restorePeerClient) restoreConnection() (string, bool) {
 	if c.peerRESTClient == nil || c.gridConn == nil {
@@ -126,8 +162,9 @@ func notificationRestorePeers() []restoreCapabilityPeer {
 	return peers
 }
 
-// nativeRestoreAvailable returns errNativeRestoreUnavailable unless every
-// other server of the cluster supports native restore.
+// nativeRestoreAvailable returns an error that wraps
+// errNativeRestoreUnavailable, and says why, unless every other server of
+// the cluster supports native restore.
 func nativeRestoreAvailable(ctx context.Context) error {
 	return globalRestoreCapability.check(ctx)
 }
@@ -137,34 +174,35 @@ func (g *restoreCapabilityGate) check(ctx context.Context) error {
 	// One deadline covers the wait for another check and the questions.
 	ctx, cancel := context.WithTimeout(ctx, restoreCapabilityTimeout)
 	defer cancel()
+	ended := func() error { return fmt.Errorf("%w: %w", errNativeRestoreUnavailable, ctx.Err()) }
 	select {
 	case g.turn <- struct{}{}:
 	case <-ctx.Done():
-		return errNativeRestoreUnavailable
+		return ended()
 	}
 	defer func() { <-g.turn }()
 
 	// Read the connections only now: one may have changed while this check
-	// waited for another.
+	// waited for another. A server that is not connected is named.
 	peers := g.peers()
-	connections := func() ([]string, bool) {
+	connections := func() ([]string, error) {
 		keys := make([]string, len(peers))
 		for i, p := range peers {
 			key, ok := p.restoreConnection()
 			if !ok {
-				return nil, false
+				return nil, nativeRestoreUnreachableError{server: p.restoreServer()}
 			}
 			keys[i] = key
 		}
-		return keys, true
+		return keys, nil
 	}
-	keys, ok := connections()
-	if !ok {
+	keys, err := connections()
+	if err != nil {
 		g.checked, g.keys = time.Time{}, nil
-		return errNativeRestoreUnavailable
+		return err
 	}
 	if ctx.Err() != nil {
-		return errNativeRestoreUnavailable
+		return ended()
 	}
 	if !g.checked.IsZero() && time.Since(g.checked) < restoreCapabilityTTL && slices.Equal(keys, g.keys) {
 		return nil
@@ -183,9 +221,14 @@ func (g *restoreCapabilityGate) check(ctx context.Context) error {
 	wg.Wait()
 	// An answer counts only for the connection it was asked on: a server
 	// that reconnected meanwhile may be another binary.
-	after, ok := connections()
-	if !ok || !slices.Equal(keys, after) || slices.Contains(answers, false) || ctx.Err() != nil {
-		return errNativeRestoreUnavailable
+	after, err := connections()
+	switch {
+	case err != nil:
+		return err
+	case ctx.Err() != nil:
+		return ended()
+	case !slices.Equal(keys, after), slices.Contains(answers, false):
+		return errNativeRestoreUnsupported
 	}
 	g.checked, g.keys = time.Now(), keys
 	return nil

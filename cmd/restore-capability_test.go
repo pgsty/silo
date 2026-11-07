@@ -74,20 +74,25 @@ func TestNativeRestoreCapabilityGrid(t *testing.T) {
 	}
 }
 
-// restoreCapabilityFake is a server whose connection and answer a test sets.
+// restoreCapabilityFake is a server whose connection and answer a test sets:
+// capable answers the question, protocol, when set, with another protocol.
 type restoreCapabilityFake struct {
+	server    string
 	capable   atomic.Bool
 	connected atomic.Bool
 	conn      atomic.Int64
 	asked     atomic.Int64
+	protocol  atomic.Pointer[string]
 }
 
 func newRestoreCapabilityFake() *restoreCapabilityFake {
-	p := &restoreCapabilityFake{}
+	p := &restoreCapabilityFake{server: "server-2:9000"}
 	p.capable.Store(true)
 	p.connected.Store(true)
 	return p
 }
+
+func (p *restoreCapabilityFake) restoreServer() string { return p.server }
 
 func (p *restoreCapabilityFake) restoreConnection() (string, bool) {
 	return strings.Repeat("c", int(p.conn.Load())), p.connected.Load()
@@ -97,6 +102,9 @@ func (p *restoreCapabilityFake) restoreCapability(context.Context) (string, erro
 	p.asked.Add(1)
 	if !p.capable.Load() {
 		return "", errors.New("Invalid Handler for type: RestoreCapability")
+	}
+	if protocol := p.protocol.Load(); protocol != nil {
+		return *protocol, nil
 	}
 	return nativeRestoreCapability, nil
 }
@@ -183,6 +191,55 @@ func TestNativeRestoreRollingUpgradeGate(t *testing.T) {
 	info, err := r.z.GetObjectInfo(t.Context(), r.bucket, r.object, r.opts(oi.VersionID))
 	if err != nil || info.RestoreOngoing || !info.IsRemote() || info.UserDefined[xhttp.AmzRestore] != "" {
 		t.Errorf("version after a refused queued restore: %q, %v", info.UserDefined[xhttp.AmzRestore], err)
+	}
+}
+
+// A refused POST restore says why. A server that is not connected is named,
+// as not reachable: that is not a rolling upgrade, and the operator looks for
+// the server. A server that speaks another protocol is one. Neither refusal
+// writes anything.
+func TestNativeRestoreRefusalReasons(t *testing.T) {
+	r := newRestoreSafetyTest(t, 1, versioning.Enabled)
+	initConfigSubsystem(t.Context(), r.z)
+	oi, _ := restoreIsolationSeed(t, r, 0, false, true)
+	p := newRestoreCapabilityFake()
+	previous := globalRestoreCapability
+	globalRestoreCapability = &restoreCapabilityGate{peers: func() []restoreCapabilityPeer { return []restoreCapabilityPeer{p} }}
+	t.Cleanup(func() { globalRestoreCapability = previous })
+	before := r.fileInfo(oi.VersionID)
+	layer := newRestoreIsolationLayer(r)
+
+	p.connected.Store(false)
+	rec := restoreIsolationPOST(t, r, layer, oi.VersionID)
+	if body := rec.Body.String(); rec.Code != http.StatusServiceUnavailable || !strings.Contains(body, "not reachable") ||
+		!strings.Contains(body, p.server) || strings.Contains(body, "rolling upgrade") {
+		t.Errorf("POST with a server not connected: %d %s", rec.Code, body)
+	}
+	if err := nativeRestoreAvailable(t.Context()); !errors.Is(err, errNativeRestorePeerUnreachable) ||
+		!errors.Is(err, errNativeRestoreUnavailable) || errors.Is(err, errNativeRestoreUnsupported) {
+		t.Errorf("gate with a server not connected: %v", err)
+	}
+
+	p.connected.Store(true)
+	older := "1"
+	p.protocol.Store(&older)
+	rec = restoreIsolationPOST(t, r, layer, oi.VersionID)
+	if body := rec.Body.String(); rec.Code != http.StatusServiceUnavailable || !strings.Contains(body, "rolling upgrade") ||
+		strings.Contains(body, "not reachable") {
+		t.Errorf("POST with a server of protocol %s: %d %s", older, rec.Code, body)
+	}
+	if err := nativeRestoreAvailable(t.Context()); !errors.Is(err, errNativeRestoreUnsupported) ||
+		!errors.Is(err, errNativeRestoreUnavailable) || errors.Is(err, errNativeRestorePeerUnreachable) {
+		t.Errorf("gate with a server of protocol %s: %v", older, err)
+	}
+
+	if after := r.fileInfo(oi.VersionID); !reflect.DeepEqual(before.Metadata, after.Metadata) {
+		t.Error("a refused POST changed the version")
+	}
+	select {
+	case err := <-layer.done:
+		t.Fatalf("a refused POST started a restore: %v", err)
+	default:
 	}
 }
 
