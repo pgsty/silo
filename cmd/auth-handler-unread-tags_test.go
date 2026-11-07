@@ -20,6 +20,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -29,9 +30,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/auth"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/pgsty/silo-pkg/v3/policy"
+	"github.com/pgsty/silo-pkg/v3/policy/condition"
 )
 
 // objectReadFault takes the first n drives of the set that holds object
@@ -243,4 +246,60 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 	}
 	check("read quorum lost", anonymous, "anonymous", get, http.StatusServiceUnavailable)
 	check("read quorum lost", anonymous, "anonymous", head, http.StatusServiceUnavailable)
+}
+
+func TestExistingObjectTagsFor(t *testing.T) {
+	values := map[string][]string{"username": {"alice"}, "sub": {"u1"}}
+	for _, tc := range []struct {
+		effect     policy.Effect
+		conditions string
+		want       string // the tags to set, encoded as in x-amz-tagging
+		ok         bool   // false: no tags for this statement
+	}{
+		{policy.Allow, `{"StringEquals": {"s3:ExistingObjectTag/k": "v"}}`, "k=v", true},
+		{policy.Allow, `{"StringEqualsIgnoreCase": {"s3:ExistingObjectTag/k": "V"}, "IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}`, "k=V", true},
+		{policy.Allow, `{"ForAnyValue:StringEquals": {"s3:ExistingObjectTag/k": ["b", "a"]}}`, "k=a", true},
+		{policy.Allow, `{"StringLike": {"s3:ExistingObjectTag/k": "a?c*"}}`, "k=a_c", true},
+		{policy.Allow, `{"StringEquals": {"s3:ExistingObjectTag/b": "2", "s3:ExistingObjectTag/a": "1"}}`, "a=1&b=2", true},
+		// Passed without the tag.
+		{policy.Allow, `{"StringNotEquals": {"s3:ExistingObjectTag/k": "v"}}`, "", true},
+		{policy.Allow, `{"Null": {"s3:ExistingObjectTag/k": "true"}}`, "", true},
+		// Null "false" asks for the tag, with any value.
+		{policy.Allow, `{"Null": {"s3:ExistingObjectTag/k": "false"}}`, "k=", true},
+		{policy.Allow, `{"Null": {"s3:ExistingObjectTag/k": "false"}, "StringNotEquals": {"s3:ExistingObjectTag/k": ["", "w"]}}`, "k=_", true},
+		{policy.Allow, `{"Null": {"s3:ExistingObjectTag/k": "false"}, "StringNotLike": {"s3:ExistingObjectTag/k": "*w"}}`, "k=", true},
+		{policy.Allow, `{"ForAllValues:StringNotEquals": {"s3:ExistingObjectTag/k": "w"}}`, "k=", true},
+		{policy.Allow, `{"Null": {"s3:ExistingObjectTag/k": "true"}, "StringEquals": {"s3:ExistingObjectTag/k": "v"}}`, "", false},
+		// Policy variables take the values of the request.
+		{policy.Allow, `{"StringEquals": {"s3:ExistingObjectTag/owner": "${aws:username}"}}`, "owner=alice", true},
+		{policy.Allow, `{"StringLike": {"s3:ExistingObjectTag/owner": "${jwt:sub}-*"}}`, "owner=u1-", true},
+		{policy.Allow, `{"StringEquals": {"s3:ExistingObjectTag/owner": "${ldap:user}"}}`, "", false},
+		// A Deny is kept from matching.
+		{policy.Deny, `{"StringNotEquals": {"s3:ExistingObjectTag/k": "v"}}`, "k=v", true},
+		{policy.Deny, `{"Null": {"s3:ExistingObjectTag/k": "true"}}`, "k=", true},
+		{policy.Deny, `{"StringEquals": {"s3:ExistingObjectTag/k": "v"}}`, "", true},
+		{policy.Deny, `{"StringEquals": {"s3:prefix": "v"}}`, "", false},
+		// No tag tests.
+		{policy.Allow, `{"StringEquals": {"s3:prefix": "v"}}`, "", false},
+		{policy.Allow, "", "", false},
+	} {
+		var conditions condition.Functions // nil: a statement without a Condition
+		if tc.conditions != "" {
+			if err := json.Unmarshal([]byte(tc.conditions), &conditions); err != nil {
+				t.Fatalf("%s: %v", tc.conditions, err)
+			}
+		}
+		tagMap, ok := existingObjectTagsFor(tc.effect, conditions, values)
+		got := ""
+		if len(tagMap) > 0 {
+			encoded, err := tags.MapToObjectTags(tagMap)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.conditions, err)
+			}
+			got = encoded.String()
+		}
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("%s %s: got %q %v, want %q %v", tc.effect, tc.conditions, got, ok, tc.want, tc.ok)
+		}
+	}
 }
