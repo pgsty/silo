@@ -21,10 +21,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,6 +34,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 func TestSysErrors(t *testing.T) {
@@ -524,5 +527,155 @@ func TestXLStorageRenameDataRetriesWhileCleanupWalksUp(t *testing.T) {
 				t.Fatalf("committed size %d, want %d", got.Size, fi.Size)
 			}
 		})
+	}
+}
+
+// A failed RenameData that runs late, after its caller gave up, removes its
+// empty object directory and the empty parents. When it does so right after
+// another write of the same key created the object directory, that write
+// must create the directory again and succeed, whichever way it writes its
+// metadata file: a fresh xl.meta opened in place (a delete marker on an
+// absent key), a first version of a key without xl.meta, or a large xl.meta
+// written directly. A cleanup that walks up the whole path, one directory
+// per step, is survived as well. UpdateMetadata renames over an existing
+// xl.meta, so its directory is never empty and the cleanup cannot remove it.
+func TestXLStorageMetadataWriteSurvivesLateCleanup(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip("directory creation is not traced on Windows")
+	}
+	const object = "a/b/object"
+	writers := []struct {
+		name  string
+		write func(ctx context.Context, s *xlStorage, fi FileInfo) (FileInfo, error)
+	}{
+		{"delete_marker", func(ctx context.Context, s *xlStorage, fi FileInfo) (FileInfo, error) {
+			// DeleteVersion with forceDelMarker on a key without xl.meta.
+			fi.Deleted, fi.Fresh = true, true
+			return fi, s.WriteMetadata(ctx, "", "bucket", object, fi)
+		}},
+		{"first_version", func(ctx context.Context, s *xlStorage, fi FileInfo) (FileInfo, error) {
+			// Not fresh: the missing xl.meta is read first.
+			fi.Size, fi.Data = 1, []byte("x")
+			fi.AddObjectPart(1, "", 1, 1, fi.ModTime, nil, nil)
+			fi.SetInlineData()
+			return fi, s.WriteMetadata(ctx, "", "bucket", object, fi)
+		}},
+		{"direct_write", func(ctx context.Context, s *xlStorage, fi FileInfo) (FileInfo, error) {
+			// Larger than the direct I/O alignment: written through
+			// writeAllDirect, with O_DIRECT where supported.
+			fi.Metadata = map[string]string{"x-amz-meta-pad": strings.Repeat("p", 2*xioutil.DirectioAlignSize)}
+			var xlMeta xlMetaV2
+			if err := xlMeta.AddVersion(fi); err != nil {
+				return fi, err
+			}
+			buf, err := xlMeta.AppendTo(nil)
+			if err != nil {
+				return fi, err
+			}
+			return fi, s.WriteAll(ctx, "bucket", pathJoin(object, xlStorageFormatFile), buf)
+		}},
+	}
+	for _, wr := range writers {
+		for _, walkUp := range []bool{false, true} {
+			name := wr.name + "/late_rename_data"
+			if walkUp {
+				name = wr.name + "/walk_up"
+			}
+			t.Run(name, func(t *testing.T) {
+				disk, root, err := newXLStorageTestSetup(t)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer disk.Close()
+				s := disk.storage
+				ctx := t.Context()
+				if err := s.MakeVol(ctx, "bucket"); err != nil {
+					t.Fatal(err)
+				}
+				objDir := filepath.Join(root, "bucket", filepath.FromSlash(object))
+				bDir := filepath.Dir(objDir)
+				aDir := filepath.Dir(bDir)
+				fi := newFileInfo(object, 2, 2)
+				fi.DataDir, fi.VersionID = mustGetUUID(), mustGetUUID()
+				fi.Erasure.Index = 1
+				fi.ModTime = time.Now().UTC()
+
+				// The walk removes object/, then b/, then a/, each right after
+				// the write's next directory creation reached it, whether it
+				// created the directory or found it in place.
+				walk := []string{objDir, bDir, aDir}
+				var mu sync.Mutex
+				steps := 0
+				var hookErrs []error
+				var fired atomic.Bool
+				traceOSCalls(t, func(tr madmin.TraceInfo) {
+					if tr.FuncName != "os.Mkdir" {
+						return
+					}
+					if walkUp {
+						mu.Lock()
+						defer mu.Unlock()
+						if steps == len(walk) || filepath.Clean(tr.Path) != walk[steps] {
+							return
+						}
+						if err := os.Remove(walk[steps]); err != nil {
+							hookErrs = append(hookErrs, err)
+						}
+						steps++
+						return
+					}
+					if tr.Error != "" || filepath.Clean(tr.Path) != objDir || !fired.CompareAndSwap(false, true) {
+						return
+					}
+					// The write has just created the object directory. A late
+					// RenameData of the same key, whose staged data is gone,
+					// fails now and removes the directory and its empty parents.
+					late := newFileInfo(object, 2, 2)
+					late.DataDir, late.VersionID = mustGetUUID(), mustGetUUID()
+					late.Erasure.Index = 1
+					late.ModTime = time.Now().UTC()
+					late.Size = 1
+					late.AddObjectPart(1, "", 1, 1, late.ModTime, nil, nil)
+					_, err := s.RenameData(context.Background(), minioMetaTmpBucket, mustGetUUID(), late, "bucket", object, RenameOptions{})
+					var errs []error
+					if !errors.Is(err, errFileNotFound) {
+						errs = append(errs, fmt.Errorf("late RenameData returned %v, want %v", err, errFileNotFound))
+					}
+					if _, serr := os.Stat(objDir); !os.IsNotExist(serr) {
+						errs = append(errs, fmt.Errorf("late RenameData left %s (%v)", objDir, serr))
+					}
+					mu.Lock()
+					hookErrs = append(hookErrs, errs...)
+					steps++
+					mu.Unlock()
+				})
+
+				fi, err = wr.write(ctx, s, fi)
+				mu.Lock()
+				done, errs := steps, hookErrs
+				mu.Unlock()
+				for _, herr := range errs {
+					t.Error(herr)
+				}
+				if err != nil {
+					t.Fatalf("%s failed after a concurrent cleanup: %v", wr.name, err)
+				}
+				want := 1
+				if walkUp {
+					want = len(walk)
+				}
+				if done != want {
+					t.Fatalf("the cleanup made %d of %d steps", done, want)
+				}
+				got, err := s.ReadVersion(ctx, "", "bucket", object, fi.VersionID, ReadOptions{ReadData: true})
+				if err != nil {
+					t.Fatalf("written version lost: %v", err)
+				}
+				if got.VersionID != fi.VersionID || got.Deleted != fi.Deleted || !bytes.Equal(got.Data, fi.Data) {
+					t.Fatalf("read back version %s deleted=%v data=%q, want %s deleted=%v data=%q",
+						got.VersionID, got.Deleted, got.Data, fi.VersionID, fi.Deleted, fi.Data)
+				}
+			})
+		}
 	}
 }

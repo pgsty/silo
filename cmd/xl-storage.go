@@ -2001,13 +2001,8 @@ func (s *xlStorage) openFile(filePath string, mode int, skipParent string) (f *o
 	if skipParent == "" {
 		skipParent = s.drivePath
 	}
-	// Create top level directories if they don't exist.
-	// with mode 0777 mkdir honors system umask.
-	if err = mkdirAll(pathutil.Dir(filePath), 0o777, skipParent); err != nil {
-		return nil, osErrToFileErr(err)
-	}
-
-	w, err := OpenFile(filePath, mode, 0o666)
+	// Create top level directories if they don't exist, then open the file.
+	w, err := openFileAll(filePath, mode, false, skipParent)
 	if err != nil {
 		// File path cannot be verified since one of the parents is a file.
 		switch {
@@ -2158,21 +2153,10 @@ func (s *xlStorage) writeAllDirect(ctx context.Context, filePath string, fileSiz
 		skipParent = s.drivePath
 	}
 
-	// Create top level directories if they don't exist.
-	// with mode 0777 mkdir honors system umask.
-	parentFilePath := pathutil.Dir(filePath)
-	if err = mkdirAll(parentFilePath, 0o777, skipParent); err != nil {
-		return osErrToFileErr(err)
-	}
-
 	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect && fileSize > 0
 
-	var w *os.File
-	if odirectEnabled {
-		w, err = OpenFileDirectIO(filePath, flags, 0o666)
-	} else {
-		w, err = OpenFile(filePath, flags, 0o666)
-	}
+	// Create top level directories if they don't exist, then open the file.
+	w, err := openFileAll(filePath, flags, odirectEnabled, skipParent)
 	if err != nil {
 		return osErrToFileErr(err)
 	}
@@ -2583,40 +2567,6 @@ func skipAccessChecks(volume string) (ok bool) {
 	return strings.HasPrefix(volume, minioMetaBucket)
 }
 
-// renameDataAll is renameAll for the two renames of RenameData. A failed
-// RenameData, typically one that runs after its caller gave up, removes its
-// object directory and the parents that are empty, so it can remove the
-// directories that renameAll is creating for this rename. The directory
-// creation or the rename then reports "not found" although the source is
-// still in place: retry, which creates the directories again. A cleanup
-// removes each directory of the path at most once and each failed attempt
-// needs at least one such removal, so one retry per path level is enough
-// against any single cleanup. The decision uses the error of the attempt
-// itself, since another write can recreate the directories in between.
-func renameDataAll(srcPath, dstPath, skipParent string) error {
-	if srcPath == "" || dstPath == "" {
-		return errInvalidArgument
-	}
-	if err := checkPathLength(srcPath); err != nil {
-		return err
-	}
-	if err := checkPathLength(dstPath); err != nil {
-		return err
-	}
-	retries := strings.Count(strings.TrimPrefix(pathutil.Clean(dstPath), pathutil.Clean(skipParent)), SlashSeparator)
-	for {
-		err := reliableRename(srcPath, dstPath, skipParent)
-		if err == nil || retries == 0 || !osIsNotExist(err) {
-			return renameAllErr(err, srcPath, dstPath)
-		}
-		if _, serr := Lstat(pathutil.Clean(srcPath)); serr != nil {
-			// The source is gone: a late call, which the caller cleans up.
-			return renameAllErr(err, srcPath, dstPath)
-		}
-		retries--
-	}
-}
-
 // RenameData - rename source path to destination path atomically, metadata and data directory.
 func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (res RenameDataResp, err error) {
 	defer func() {
@@ -2923,7 +2873,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		if contextCanceled(ctx) {
 			return res, ctx.Err()
 		}
-		if err = renameDataAll(srcDataPath, dstDataPath, skipParent); err != nil {
+		if err = renameAll(srcDataPath, dstDataPath, skipParent); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
 				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
@@ -2962,7 +2912,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	// Commit meta-file
-	if err = renameDataAll(srcFilePath, dstFilePath, skipParent); err != nil {
+	if err = renameAll(srcFilePath, dstFilePath, skipParent); err != nil {
 		if legacyPreserved {
 			// Any failed rename calls un-roll previous transaction.
 			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)

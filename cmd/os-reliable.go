@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 )
 
 // Wrapper functions to os.RemoveAll, which calls reliableRemoveAll
@@ -82,20 +83,63 @@ func mkdirAll(dirPath string, mode os.FileMode, baseDir string) (err error) {
 		return err
 	}
 
-	if err = reliableMkdirAll(dirPath, mode, baseDir); err != nil {
+	return mkdirAllErr(reliableMkdirAll(dirPath, mode, baseDir))
+}
+
+// mkdirAllErr converts an error of reliableMkdirAll into the error that
+// mkdirAll returns.
+func mkdirAllErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case isSysErrNotDir(err):
 		// File path cannot be verified since one of the parents is a file.
-		if isSysErrNotDir(err) {
-			return errFileAccessDenied
-		} else if isSysErrPathNotFound(err) {
-			// This is a special case should be handled only for
-			// windows, because windows API does not return "not a
-			// directory" error message. Handle this specifically here.
-			return errFileAccessDenied
-		}
+		return errFileAccessDenied
+	case isSysErrPathNotFound(err):
+		// This is a special case should be handled only for
+		// windows, because windows API does not return "not a
+		// directory" error message. Handle this specifically here.
+		return errFileAccessDenied
+	default:
 		return osErrToFileErr(err)
 	}
+}
 
-	return nil
+// openFileAll is mkdirAll for the parent of filePath followed by the open
+// of filePath with flags, with direct I/O when direct is set. A cleanup of a
+// failed write of the same key can remove the directories in between, see
+// retriesAgainstCleanup; then it creates them again. An error of the
+// directory creation is the error of mkdirAll, an error of the open is the
+// error of the OS call.
+func openFileAll(filePath string, flags int, direct bool, baseDir string) (*os.File, error) {
+	parentDir := path.Dir(filePath)
+	if err := checkPathLength(parentDir); err != nil {
+		return nil, err
+	}
+	retries := retriesAgainstCleanup(filePath, baseDir)
+	for {
+		// Create top level directories if they don't exist.
+		// with mode 0777 mkdir honors system umask.
+		if err := reliableMkdirAll(parentDir, 0o777, baseDir); err != nil {
+			if retries > 0 && osIsNotExist(err) {
+				retries--
+				continue
+			}
+			return nil, mkdirAllErr(err)
+		}
+		var f *os.File
+		var err error
+		if direct {
+			f, err = OpenFileDirectIO(filePath, flags, 0o666)
+		} else {
+			f, err = OpenFile(filePath, flags, 0o666)
+		}
+		if err != nil && retries > 0 && osIsNotExist(err) && flags&os.O_CREATE != 0 {
+			retries--
+			continue
+		}
+		return f, err
+	}
 }
 
 // Reliably retries os.MkdirAll if for some reason os.MkdirAll returns
@@ -175,24 +219,41 @@ func renameAllErr(err error, srcFilePath, dstFilePath string) error {
 	}
 }
 
-// Reliably retries os.RenameAll if for some reason os.RenameAll returns
-// syscall.ENOENT (parent does not exist).
-func reliableRename(srcFilePath, dstFilePath, baseDir string) (err error) {
-	if err = reliableMkdirAll(path.Dir(dstFilePath), 0o777, baseDir); err != nil {
-		return err
-	}
+// retriesAgainstCleanup returns how often a write to filePath is retried
+// when a directory of its path disappears between the directory creation
+// and the use of the directory: once per path level below baseDir.
+//
+// A failed RenameData, typically one that runs after its caller gave up,
+// removes its object directory and the parents that are empty, so it can
+// remove the directories that another write of the same key has just
+// created. The directory creation or the write then reports "not found"
+// although nothing is wrong with the write: retry, which creates the
+// directories again. A cleanup removes each directory of the path at most
+// once and each failed attempt needs at least one such removal, so one retry
+// per path level is enough against any single cleanup.
+func retriesAgainstCleanup(filePath, baseDir string) int {
+	return strings.Count(strings.TrimPrefix(path.Clean(filePath), path.Clean(baseDir)), SlashSeparator)
+}
 
-	i := 0
+// Reliably retries os.Rename if for some reason the directory creation or
+// os.Rename returns syscall.ENOENT (parent does not exist) while the source
+// is still in place, see retriesAgainstCleanup. The decision uses the error
+// of the attempt itself, since another write can recreate the directories
+// in between.
+func reliableRename(srcFilePath, dstFilePath, baseDir string) (err error) {
+	retries := retriesAgainstCleanup(dstFilePath, baseDir)
 	for {
-		// After a successful parent directory create attempt a renameAll.
-		if err = Rename(srcFilePath, dstFilePath); err != nil {
-			// Retry only for the first retryable error.
-			if osIsNotExist(err) && i == 0 {
-				i++
-				continue
-			}
+		if err = reliableMkdirAll(path.Dir(dstFilePath), 0o777, baseDir); err == nil {
+			// After a successful parent directory create attempt a rename.
+			err = Rename(srcFilePath, dstFilePath)
 		}
-		break
+		if err == nil || retries == 0 || !osIsNotExist(err) {
+			return err
+		}
+		if _, serr := Lstat(path.Clean(srcFilePath)); serr != nil {
+			// The source is gone: a late call, which the caller cleans up.
+			return err
+		}
+		retries--
 	}
-	return err
 }
