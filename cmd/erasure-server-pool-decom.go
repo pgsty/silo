@@ -813,10 +813,14 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 
 			evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
 			switch {
-			case evt.Action.DeleteRestored(): // if restored copy has expired, delete it synchronously
-				if !applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom) {
-					return evt.Action
-				}
+			case evt.Action.DeleteRestored():
+				// A restored copy past its deadline is removed now, before the
+				// version moves, as the scanner would. When that removal is
+				// refused, the version moves like any other, with its tier
+				// metadata and its deadline, and the scanner of the pool that
+				// holds it then removes the copy. A version the walk neither
+				// moves nor expires leaves the key behind, and fails it.
+				applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
 				return lifecycle.NoneAction
 			case evt.Action == lifecycle.DeleteAction && versioned:
 				// Expiring the latest version of a versioned bucket only puts

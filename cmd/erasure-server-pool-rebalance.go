@@ -600,6 +600,12 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 			evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
 			switch {
+			case evt.Action.DeleteRestored():
+				// A restored copy expires by its own deadline, in the pool
+				// that holds the version; a rebalance does not remove it.
+				// Such a version reads as remote and the walk leaves it, as
+				// the decommission walk moves it: neither counts it as deleted.
+				return lifecycle.NoneAction
 			case evt.Action == lifecycle.DeleteAction && versioned:
 				// Expiring the latest version of a versioned bucket only puts
 				// a delete marker on top of it. The version itself survives as
