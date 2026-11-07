@@ -976,6 +976,25 @@ func postRestoreOpts(ctx context.Context, r *http.Request, bucket, object string
 	}, nil
 }
 
+// restoreLockTimeout is how long POST ?restore waits for the restore lock of
+// a version before it answers that a restore is in progress.
+const restoreLockTimeout = 2 * time.Second
+
+// lockRestore takes the restore lock of a version of an object, which a
+// restore holds from POST ?restore until it is done, on whichever server of
+// the cluster it runs. A restore status that is ongoing while nobody holds
+// the lock was left by a restore that does not run any more, such as one
+// whose server went down. It is a separate lock from the object lock: reads
+// and writes of the object are not held up by it.
+func lockRestore(objAPI ObjectLayer, bucket, object, versionID string) (unlock func(), err error) {
+	lk := objAPI.NewNSLock(minioMetaBucket, pathJoin("restore", bucket, object, versionID))
+	lkctx, err := lk.GetLock(GlobalContext, newDynamicTimeout(restoreLockTimeout, restoreLockTimeout))
+	if err != nil {
+		return nil, err
+	}
+	return func() { lk.Unlock(lkctx) }, nil
+}
+
 // set ObjectOptions for PUT call to restore temporary copy of transitioned data
 func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo ObjectInfo) (putOpts ObjectOptions) {
 	meta := make(map[string]string)

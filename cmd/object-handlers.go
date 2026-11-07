@@ -3976,13 +3976,35 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		writeErrorResponse(ctx, w, apiErr, r.URL)
 		return
 	}
-	statusCode := http.StatusOK
-	alreadyRestored := false
-	if err == nil {
-		if objInfo.RestoreOngoing && rreq.Type != SelectRestoreRequest {
+	// A restore of the version is in progress while it holds the restore
+	// lock of the version; a restore status left ongoing by a restore that
+	// does not run any more does not stop a new one.
+	var unlockRestore func()
+	if rreq.Type != SelectRestoreRequest {
+		unlockRestore, err = lockRestore(objectAPI, bucket, object, objInfo.VersionID)
+		if err != nil {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrObjectRestoreAlreadyInProgress), r.URL)
 			return
 		}
+		defer func() {
+			if unlockRestore != nil {
+				unlockRestore()
+			}
+		}()
+		// Read the version again: a restore may have completed meanwhile.
+		opts.VersionID = objInfo.VersionID
+		if objInfo, err = getObjectInfo(ctx, bucket, object, opts); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		if objInfo.TransitionedObject.Status != lifecycle.TransitionComplete {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidObjectState), r.URL)
+			return
+		}
+	}
+	statusCode := http.StatusOK
+	alreadyRestored := false
+	if err == nil {
 		if !objInfo.RestoreOngoing && !objInfo.RestoreExpires.IsZero() {
 			statusCode = http.StatusAccepted
 			alreadyRestored = true
@@ -4032,8 +4054,13 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 		UserAgent:  r.UserAgent(),
 		Host:       handlers.GetSourceIP(r),
 	})
-	// now process the restore in background
+	// now process the restore in background, which releases the restore lock
+	unlock := unlockRestore
+	unlockRestore = nil
 	go func() {
+		if unlock != nil {
+			defer unlock()
+		}
 		rctx := GlobalContext
 		if !rreq.SelectParameters.IsEmpty() {
 			actualSize, err := objInfo.GetActualSize()
