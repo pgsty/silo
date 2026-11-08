@@ -37,9 +37,10 @@ import (
 //     expired, revoked or edited since submission fails the job; a reused
 //     access key does not match the binding.
 //   - Each action is evaluated with the submitter's policies and session
-//     policy but without a request. A policy statement that would need
+//     policy but without a request. A Deny that may apply and would need
 //     request context the job does not have (source address, transport,
-//     headers and so on) refuses the action instead of being skipped.
+//     headers and so on) refuses the action instead of being skipped; an
+//     Allow that would need it grants nothing to the job.
 //
 // A job without a binding was queued by an earlier release. It is never
 // authorized, whoever submitted it, and has to be submitted again.
@@ -474,22 +475,36 @@ func (p batchJobPrincipal) authorizeArgs(args policy.Args, req *batchAuthzReques
 		snap = globalIAMSys.store.batchSnapshot(ctx)
 		defer snap.release()
 	}
-	policies, err := globalIAMSys.batchLocalPolicies(p, args, plugin == nil, snap)
+	mapped, session, err := globalIAMSys.batchLocalPolicies(p, args, plugin == nil, snap)
 	if err != nil {
 		if errors.Is(err, errNoSuchPolicy) || errors.Is(err, errAuthentication) || errors.Is(err, errNoSuchUser) || errors.Is(err, errNoSuchGroup) {
 			return denied
 		}
 		return batchUnavailable("IAM policy lookup", err)
 	}
+	// sessionNarrowed: the session policy lost an Allow below, so the
+	// narrowed policy decides in its place.
+	sessionNarrowed := false
 	if req != nil {
 		supplied := req.suppliedConditionKeys()
-		for _, pol := range policies {
-			for _, st := range pol.Statements {
-				if batchStatementNeedsRequest(st, args, supplied) {
-					return batchJobAuthzError{reason: denied.reason + ": a policy statement depends on request context that a batch job does not have"}
-				}
-			}
+		var refuse bool
+		if mapped, _, refuse = batchContextFree(mapped, args, supplied); !refuse {
+			session, sessionNarrowed, refuse = batchContextFree(session, args, supplied)
 		}
+		if refuse {
+			return batchJobAuthzError{reason: denied.reason + ": a policy statement depends on request context that a batch job does not have"}
+		}
+	}
+	sessionDenies := func() bool {
+		has, allowed := p.sessionPolicyDecision(args)
+		if has && allowed && sessionNarrowed {
+			// As sessionPolicyDecision evaluates it, without its dropped
+			// Allows. This can only turn an allow into a deny.
+			spArgs := args
+			spArgs.IsOwner, spArgs.DenyOnly = false, false
+			allowed = session.IsAllowed(spArgs)
+		}
+		return has && !allowed
 	}
 	if plugin != nil {
 		ok, err := plugin.IsAllowedContext(ctx, args)
@@ -500,7 +515,7 @@ func (p batchJobPrincipal) authorizeArgs(args policy.Args, req *batchAuthzReques
 			return denied
 		}
 		// The plugin does not see a session policy; it only limits further.
-		if has, allowed := p.sessionPolicyDecision(args); has && !allowed {
+		if sessionDenies() {
 			return denied
 		}
 		return nil
@@ -516,7 +531,7 @@ func (p batchJobPrincipal) authorizeArgs(args policy.Args, req *batchAuthzReques
 			return denied
 		}
 	}
-	if has, allowed := p.sessionPolicyDecision(args); has && !allowed {
+	if sessionDenies() {
 		return denied
 	}
 	ownerDerived := (p.temp || p.service) && p.parentUser == globalActiveCred.AccessKey
@@ -524,11 +539,48 @@ func (p batchJobPrincipal) authorizeArgs(args policy.Args, req *batchAuthzReques
 		if p.service {
 			args.AccountName = p.parentUser
 		}
-		if len(policies) == 0 || !policies[0].IsAllowed(args) {
+		if mapped == nil || !mapped.IsAllowed(args) {
 			return denied
 		}
 	}
 	return nil
+}
+
+// batchContextFree returns pol without the Allow statements that may apply
+// to args but need request context the job does not supply (see
+// batchStatementNeedsRequest), and whether it dropped any. Such an Allow
+// grants nothing to the job. It is dropped rather than evaluated, because
+// evaluated without the context it could grant what a request would not:
+// IfExists and Null conditions hold for an absent key. Dropping an Allow can
+// only narrow the decision. Dropping a Deny that needs the context could
+// allow what a request with that context would not, so refuse reports one,
+// and the job refuses the action.
+func batchContextFree(pol *policy.Policy, args policy.Args, supplied map[string]bool) (out *policy.Policy, dropped, refuse bool) {
+	if pol == nil {
+		return nil, false, false
+	}
+	var kept []policy.Statement
+	for i, st := range pol.Statements {
+		if !batchStatementNeedsRequest(st, args, supplied) {
+			if dropped {
+				kept = append(kept, st)
+			}
+			continue
+		}
+		if st.Effect != policy.Allow {
+			return pol, false, true
+		}
+		if !dropped {
+			kept = append(make([]policy.Statement, 0, len(pol.Statements)-1), pol.Statements[:i]...)
+			dropped = true
+		}
+	}
+	if !dropped {
+		return pol, false, false
+	}
+	// A new policy: pol's statement index refers to pol's own statements, and
+	// pol may be a cached policy document.
+	return &policy.Policy{ID: pol.ID, Version: pol.Version, Statements: kept}, true, false
 }
 
 func batchDeniedReason(req batchAuthzRequest) string {
@@ -636,13 +688,13 @@ func (s *batchPolicySnapshot) loadPolicyDoc(name string, out map[string]PolicyDo
 }
 
 // batchLocalPolicies returns every local policy that can take part in the
-// decision on args: the mapped policies that IsAllowed would merge when
-// withMapped is set (no authorization plugin), and the session policy.
-func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, withMapped bool, snap *batchPolicySnapshot) ([]policy.Policy, error) {
-	var out []policy.Policy
+// decision on args: mapped, the mapped policies merged as IsAllowed would
+// merge them, when withMapped is set (no authorization plugin), and session,
+// the session policy. Each is nil when it takes no part.
+func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, withMapped bool, snap *batchPolicySnapshot) (mapped, session *policy.Policy, err error) {
 	if withMapped && args.IsOwner {
 		// IsAllowed does not evaluate any policy for the owner.
-		return nil, nil
+		return nil, nil, nil
 	}
 	if withMapped {
 		// The caller holds snap through evaluation. Lazy mapping loads and
@@ -664,28 +716,28 @@ func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, wit
 			if roleArn := args.GetRoleArn(); roleArn != "" {
 				a, err := arn.Parse(roleArn)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				names = append(names, newMappedPolicy(sys.rolesMap[a]).toSlice()...)
 			} else {
-				mapped, err := mappedPolicies(p.parentUser)
+				parent, err := mappedPolicies(p.parentUser)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
-				names = append(names, mapped...)
+				names = append(names, parent...)
 				// The claimed policies apply only when nothing is mapped.
-				if len(mapped) == 0 {
+				if len(parent) == 0 {
 					if claimed, ok := policy.GetPoliciesFromClaims(args.Claims, iamPolicyClaimNameOpenID()); ok {
 						names = append(names, claimed.ToSlice()...)
 					}
 				}
 			}
 		default:
-			mapped, err := mappedPolicies(p.accessKey)
+			own, err := mappedPolicies(p.accessKey)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			names = append(names, mapped...)
+			names = append(names, own...)
 		}
 		var selected []policy.Policy
 		for _, name := range names {
@@ -700,63 +752,56 @@ func (sys *IAMSys) batchLocalPolicies(p batchJobPrincipal, args policy.Args, wit
 					continue
 				}
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				doc, ok = loaded[name]
 				if !ok {
-					return nil, fmt.Errorf("load IAM policy %q returned no document", name)
+					return nil, nil, fmt.Errorf("load IAM policy %q returned no document", name)
 				}
 			}
 			selected = append(selected, doc.Policy)
 		}
-		out = append(out, policy.MergePolicies(selected...))
+		merged := policy.MergePolicies(selected...)
+		mapped = &merged
 	}
 	if p.temp || p.service {
 		if p.service && p.claims[iamPolicyClaimNameSA()] == inheritedPolicyType {
-			return out, nil
+			return mapped, nil, nil
 		}
 		if sp, ok := p.claims[sessionPolicyNameExtracted]; ok {
 			s, ok := sp.(string)
 			if !ok {
-				return nil, errAuthentication
+				return nil, nil, errAuthentication
 			}
 			parsed, err := policy.ParseConfig(strings.NewReader(s))
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			out = append(out, *parsed)
+			session = parsed
 		}
 	}
-	return out, nil
+	return mapped, session, nil
 }
 
-// batchStatementNeedsRequest reports whether a statement that applies to
-// args depends on a condition key that the job does not supply. Applying
+// batchStatementNeedsRequest reports whether a statement may apply to args
+// and depends on request context that the job does not supply: a condition
+// key, or a policy variable in a resource or a condition value. Applying
 // such a statement without its value could grant (Allow) or drop (Deny)
-// what a request with that context would not, so the job refuses the action.
-// Resources are matched without conditions; a statement is taken to apply
-// whenever it might.
+// what a request with that context would not (see batchContextFree).
+//
+// Resources are matched first and without conditions; a statement is taken
+// to apply whenever it might. A statement whose resources rule args out
+// does not apply, whatever its conditions need. One whose resources hold a
+// variable the job does not supply might match, so it may apply.
 func batchStatementNeedsRequest(st policy.Statement, args policy.Args, supplied map[string]bool) bool {
 	if (!st.Actions.Match(args.Action) && !st.Actions.IsEmpty()) || st.NotActions.Match(args.Action) {
 		return false
 	}
-	// Policy variables in resources or condition values.
-	if data, err := json.Marshal(st); err == nil {
-		s := string(data)
-		for {
-			i := strings.Index(s, "${")
-			if i < 0 {
-				break
-			}
-			s = s[i+2:]
-			j := strings.IndexByte(s, '}')
-			if j < 0 {
-				break
-			}
-			if !batchKeySupplied(supplied, s[:j]) {
+	for _, resources := range []policy.ResourceSet{st.Resources, st.NotResources} {
+		for r := range resources {
+			if batchUnsuppliedVariable(r.Pattern, supplied) {
 				return true
 			}
-			s = s[j+1:]
 		}
 	}
 	if !batchStatementMayApply(st, args) {
@@ -767,7 +812,34 @@ func batchStatementNeedsRequest(st policy.Statement, args policy.Args, supplied 
 			return true
 		}
 	}
+	// Policy variables in condition values.
+	if len(st.Conditions) > 0 {
+		data, err := json.Marshal(st.Conditions)
+		if err != nil || batchUnsuppliedVariable(string(data), supplied) {
+			return true
+		}
+	}
 	return false
+}
+
+// batchUnsuppliedVariable reports whether s holds a policy variable, ${key},
+// whose value the job does not supply.
+func batchUnsuppliedVariable(s string, supplied map[string]bool) bool {
+	for {
+		i := strings.Index(s, "${")
+		if i < 0 {
+			return false
+		}
+		s = s[i+2:]
+		j := strings.IndexByte(s, '}')
+		if j < 0 {
+			return false
+		}
+		if !batchKeySupplied(supplied, s[:j]) {
+			return true
+		}
+		s = s[j+1:]
+	}
 }
 
 // batchStatementMayApply matches the resources of a statement, in both forms
