@@ -572,6 +572,8 @@ const batchIAMLoadTimeout = 5 * time.Second
 // waiting for the cache lock, which taking the write lock back after each
 // read would cause. It writes nothing to the cache but the lazily loaded
 // mappings, which the request path stores under the read lock as well.
+//
+//msgp:ignore batchPolicySnapshot
 type batchPolicySnapshot struct {
 	*IAMStoreSys
 	ctx   context.Context
