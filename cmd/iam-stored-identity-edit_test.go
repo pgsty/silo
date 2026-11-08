@@ -231,3 +231,42 @@ func TestIAMUserStatusOnServiceAccount(t *testing.T) {
 		t.Error("a user secret change of a service account touched the account")
 	}
 }
+
+// A server whose cache still holds the account of the first parent drops
+// it when its edit is refused, whether the edit was bound to that parent or
+// replicated from before the deletion: storage says the cached copy is gone.
+func TestIAMRefusedEditDropsStaleCache(t *testing.T) {
+	t.Run("rebound-parent", func(t *testing.T) {
+		f := newGroupRefreshFixture(t)
+		snapshot := f.service(t, "edit-rebind")
+		other := f.sibling(t)
+		next := iamAdminUser(f.ctx, t, f.sys, "edit-rebind-next", "refresh-parent")
+		mustIAM(t, f.sys.DeleteServiceAccount(f.ctx, snapshot.AccessKey, false))
+		_, _, err := f.sys.NewServiceAccount(f.ctx, next.AccessKey, nil, newServiceAccountOpts{accessKey: snapshot.AccessKey, secretKey: "edit-rebind-secret"})
+		mustIAM(t, err)
+		if cached, ok := other.GetUser(snapshot.AccessKey); !ok || cached.Credentials.ParentUser != snapshot.ParentUser {
+			t.Fatal("control: the stale server must still cache the first account")
+		}
+		_, err = other.UpdateServiceAccount(f.ctx, snapshot.AccessKey, updateServiceAccountOpts{description: "stale", parentUser: snapshot.ParentUser})
+		if !errors.Is(err, errNoSuchServiceAccount) {
+			t.Errorf("got %v, want errNoSuchServiceAccount", err)
+		}
+		if _, ok := other.GetUser(snapshot.AccessKey); ok {
+			t.Error("the stale server still caches the account of the first parent")
+		}
+	})
+	t.Run("replicated-stale", func(t *testing.T) {
+		f := newGroupRefreshFixture(t)
+		snapshot := f.service(t, "edit-repl-stale")
+		other := f.sibling(t)
+		before := UTCNow()
+		mustIAM(t, f.sys.DeleteServiceAccount(f.ctx, snapshot.AccessKey, false))
+		_, err := other.UpdateServiceAccount(withIAMReplicationTime(f.ctx, before), snapshot.AccessKey, updateServiceAccountOpts{description: "late"})
+		if iamReplicationError(err) != nil {
+			t.Errorf("an older replicated edit must be acknowledged, got %v", err)
+		}
+		if _, ok := other.GetUser(snapshot.AccessKey); ok {
+			t.Error("the server that acknowledged a stale edit still caches the deleted account")
+		}
+	})
+}

@@ -2854,12 +2854,12 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 
 	u, _, err := store.editStoredIdentity(ctx, cache, accessKey, svcUser, func(stored *UserIdentity) error {
 		if !stored.Credentials.IsServiceAccount() {
-			return errNoSuchServiceAccount
+			return errIAMIdentityGone
 		}
 		if opts.parentUser != "" && stored.Credentials.ParentUser != opts.parentUser {
 			// Not the account the caller was authorized for: it was
 			// deleted and created again for another parent meanwhile.
-			return errNoSuchServiceAccount
+			return errIAMIdentityGone
 		}
 		cr, err := updatedServiceAccountCredentials(ctx, accessKey, stored.Credentials, opts)
 		if err != nil {
@@ -3168,7 +3168,7 @@ func (store *IAMStoreSys) RefreshUserGroups(ctx context.Context, cred auth.Crede
 		stored.Credentials.Groups = groups
 		return nil
 	})
-	if errors.Is(err, errIAMIdentityGone) {
+	if errors.Is(err, errIAMIdentityGone) || errors.Is(err, errIAMStaleUpdate) {
 		return false, nil
 	}
 	if err != nil {
@@ -3181,12 +3181,15 @@ func (store *IAMStoreSys) RefreshUserGroups(ctx context.Context, cred auth.Crede
 // is stored now, under its revision lock (see iamIdentityEdit), and caches
 // the result. The caller holds the cache lock. When the identity is absent
 // or deleted in storage, or edit returns errIAMIdentityGone because it is
-// no longer the identity the edit addressed, the cached copy is dropped, so
-// a lookup loads what is stored, and errIAMIdentityGone is returned.
+// no longer the identity the edit addressed, errIAMIdentityGone is
+// returned; a replicated edit older than what is stored returns
+// errIAMStaleUpdate. Either way storage holds something else than the
+// cached copy, which is dropped, so a lookup loads what is stored.
 func (store *IAMStoreSys) editStoredIdentity(ctx context.Context, cache *iamCache, accessKey string, userType IAMUserType, edit func(u *UserIdentity) error) (UserIdentity, bool, error) {
 	op := &iamIdentityEdit{accessKey: accessKey, edit: edit}
 	err := store.saveIAMRevision(ctx, getUserIdentityPath(accessKey, userType), op)
-	if errors.Is(err, errIAMIdentityGone) {
+	if errors.Is(err, errIAMIdentityGone) || errors.Is(err, errIAMStaleUpdate) {
+		// Storage holds something else than the cached copy: drop it.
 		store.forgetCachedIdentity(cache, accessKey, userType)
 	}
 	if err != nil {
