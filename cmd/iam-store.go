@@ -2831,10 +2831,12 @@ func (store *IAMStoreSys) AddServiceAccount(ctx context.Context, cred auth.Crede
 	}
 
 	u := newUserIdentity(cred)
-	err = store.saveUserIdentity(ctx, u.Credentials.AccessKey, svcUser, &u)
+	create := &iamIdentityCreate{UserIdentity: u}
+	err = store.saveIAMRevision(ctx, getUserIdentityPath(u.Credentials.AccessKey, svcUser), create)
 	if err != nil {
 		return updatedAt, err
 	}
+	u = create.UserIdentity
 
 	if err := cache.updateUserWithClaims(u.Credentials.AccessKey, u); err != nil {
 		// Persistence already replaced the credential. A failed refresh must
@@ -3223,6 +3225,7 @@ func (store *IAMStoreSys) forgetCachedIdentity(cache *iamCache, accessKey string
 
 // LoadUser - attempts to load user info from storage and updates cache.
 func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error {
+	loadedAt := time.Now()
 	groupLoad := env.Get("_MINIO_IAM_GROUP_REFRESH", config.EnableOff) == config.EnableOn
 
 	newCachePopulate := func() (val any, err error) {
@@ -3316,6 +3319,13 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 
 	cache := store.lock()
 	defer store.unlock()
+
+	// A partial load may have started before a credential edit or deletion and
+	// finished after it. Do not merge that snapshot over the newer cache state;
+	// the next notification or load will supply the missing entry.
+	if cache.updatedAt.After(loadedAt) {
+		return nil
+	}
 
 	// We need to merge the new cache with the existing cache because the
 	// periodic IAM reload is partial. The periodic load here is to account.

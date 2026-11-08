@@ -60,6 +60,15 @@ type iamIdentityEdit struct {
 	unchanged    bool
 }
 
+// An identity create is checked against the record under the same revision
+// lock as the write. Local callers may recreate a deleted access key, but may
+// never replace a live stored service account that their cache did not contain.
+// Replicated creates retain the normal revision ordering below and may replace
+// an older live snapshot when their source revision wins.
+type iamIdentityCreate struct {
+	UserIdentity
+}
+
 var (
 	errIAMIdentityGone      = errors.New("IAM identity is absent or deleted in storage")
 	errIAMIdentityUnchanged = errors.New("IAM identity edit changes nothing")
@@ -271,6 +280,22 @@ func saveIAMRevision(ctx context.Context, store IAMStorageAPI, path string, item
 	previous, err := loadIAMRevision(ctx, store, path)
 	if err != nil {
 		return err
+	}
+	if op, ok := item.(*iamIdentityCreate); ok {
+		if _, replicated := iamReplicationTime(ctx); !replicated {
+			var current UserIdentity
+			err := store.loadIAMConfig(ctx, &current, path)
+			switch {
+			case err == nil && !current.Deleted:
+				return fmt.Errorf("%w: access key already exists in storage", errIAMServiceAccountNotAllowed)
+			case err == nil, errors.Is(err, errConfigNotFound):
+				// A tombstone or an absent record can be recreated. The
+				// existing revision path below retains its revocation boundary.
+			default:
+				return err
+			}
+		}
+		item = &op.UserIdentity
 	}
 	if op, ok := item.(*iamIdentityEdit); ok {
 		var current UserIdentity

@@ -59,6 +59,35 @@ func TestIAMStaleServiceAccountEdit(t *testing.T) {
 	})
 }
 
+// A server that missed the create notification must not replace a live
+// service account merely because its local cache has no entry for the key.
+func TestIAMStaleServiceAccountCreate(t *testing.T) {
+	f := newGroupRefreshFixture(t)
+	other := f.sibling(t)
+	original := f.service(t, "create-stale")
+	if _, ok := other.GetUser(original.AccessKey); ok {
+		t.Fatal("control: the stale server must not have loaded the new account")
+	}
+
+	claims := map[string]any{
+		parentClaim:            f.parent.AccessKey,
+		iamPolicyClaimNameSA(): inheritedPolicyType,
+	}
+	mustIAM(t, setIAMParentRevocationClaim(f.ctx, other, f.parent.AccessKey, claims))
+	replacement, err := auth.CreateNewCredentialsWithMetadata(original.AccessKey, "create-replacement-secret", claims, "create-replacement-secret")
+	mustIAM(t, err)
+	replacement.ParentUser = f.parent.AccessKey
+	replacement.Status = auth.AccountOn
+	if _, err := other.AddServiceAccount(f.ctx, replacement); !errors.Is(err, errIAMServiceAccountNotAllowed) {
+		t.Fatalf("stale create should be rejected, got %v", err)
+	}
+
+	stored, ok := f.stored(t, original.AccessKey)
+	if !ok || stored.Credentials.SecretKey != original.SecretKey || stored.Credentials.ParentUser != original.ParentUser {
+		t.Fatalf("stale create changed the live account: present=%v parent=%q secret=%q", ok, stored.Credentials.ParentUser, stored.Credentials.SecretKey)
+	}
+}
+
 // A session policy edit stores the claims of the token it signs.
 func TestIAMServiceAccountEditStoresNewClaims(t *testing.T) {
 	f := newGroupRefreshFixture(t)
