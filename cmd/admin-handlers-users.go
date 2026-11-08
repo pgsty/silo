@@ -903,6 +903,9 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 		description:   updateReq.NewDescription,
 		expiration:    updateReq.NewExpiration,
 		sessionPolicy: sp,
+		// The edit applies to the stored account only while it still has
+		// the parent the checks above authorized.
+		parentUser: svcAccount.ParentUser,
 	}
 	updatedAt, err := globalIAMSys.UpdateServiceAccount(ctx, accessKey, opts)
 	if err != nil {

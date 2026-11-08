@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
 	etcd "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -46,21 +45,25 @@ type iamGroupRevocation struct {
 // its revision so an older non-expiring credential cannot return.
 type iamExpireIdentity struct{}
 
-// An LDAP group refresh sets the groups of the credential as it is stored
-// now. The refresh computes the groups from a snapshot of a server's cache
-// taken before a slow directory lookup; writing that snapshot back would
-// undo a rotation or an edit made meanwhile on any server, and bring back a
-// deleted credential. The refresh therefore changes only the groups, under
-// the identity's revision lock and on the stored record, and leaves alone a
-// credential that is gone, expired, or now has another parent, whose groups
-// the lookup did not compute.
-type iamGroupRefresh struct {
+// An edit of an identity applies to the identity as it is stored now, under
+// its revision lock, not to a server's cached copy. A copy written back
+// whole would undo a rotation or an edit made meanwhile through this or
+// another server, whose notification this one may have missed, and bring
+// back an identity deleted meanwhile. edit receives the stored record and
+// changes it in place; it returns errIAMIdentityUnchanged to write nothing,
+// or any other error to refuse. An identity that is absent or deleted is
+// refused with errIAMIdentityGone.
+type iamIdentityEdit struct {
 	UserIdentity // the record written, or found unchanged
 	accessKey    string
-	parentUser   string
-	groups       []string
-	unchanged    bool // the stored record already has the groups
+	edit         func(u *UserIdentity) error
+	unchanged    bool
 }
+
+var (
+	errIAMIdentityGone      = errors.New("IAM identity is absent or deleted in storage")
+	errIAMIdentityUnchanged = errors.New("IAM identity edit changes nothing")
+)
 
 // The authoritative revocation is durable even if dependent cleanup fails.
 // Callers must publish it to sibling caches before returning the error.
@@ -269,27 +272,45 @@ func saveIAMRevision(ctx context.Context, store IAMStorageAPI, path string, item
 	if err != nil {
 		return err
 	}
-	if op, ok := item.(*iamGroupRefresh); ok {
+	if op, ok := item.(*iamIdentityEdit); ok {
 		var current UserIdentity
 		err := store.loadIAMConfig(ctx, &current, path)
 		if errors.Is(err, errConfigNotFound) {
-			return errIAMStaleUpdate
+			return errIAMIdentityGone
 		}
 		if err != nil {
 			return err
 		}
+		if current.Deleted {
+			if origin, replicated := iamReplicationTime(ctx); replicated && !origin.After(previous.timestamp()) {
+				// A peer's edit from before this deletion: acknowledged.
+				return errIAMStaleUpdate
+			}
+			return errIAMIdentityGone
+		}
+		// Normalize the record as the identity loaders do: the path names the
+		// access key, the claims are the token's, and a deprecated comment
+		// stands in for an empty description.
 		if current.Credentials.AccessKey == "" {
-			// As the identity loaders do: the path names the access key.
 			current.Credentials.AccessKey = op.accessKey
 		}
-		if current.Deleted || current.Credentials.ParentUser != op.parentUser || current.Credentials.IsExpired() {
-			return errIAMStaleUpdate
+		if current.Credentials.SessionToken != "" {
+			claims, err := extractJWTClaims(current)
+			if err != nil {
+				return err
+			}
+			current.Credentials.Claims = claims.Map()
 		}
-		if set.CreateStringSet(current.Credentials.Groups...).Equals(set.CreateStringSet(op.groups...)) {
-			op.UserIdentity, op.unchanged = current, true
-			return nil
+		if current.Credentials.Description == "" {
+			current.Credentials.Description = current.Credentials.Comment
 		}
-		current.Credentials.Groups = op.groups
+		if err := op.edit(&current); err != nil {
+			if errors.Is(err, errIAMIdentityUnchanged) {
+				op.UserIdentity, op.unchanged = current, true
+				return nil
+			}
+			return err
+		}
 		current.UpdatedAt = time.Time{} // a new revision, as for any local edit
 		op.UserIdentity = current
 		item = &op.UserIdentity

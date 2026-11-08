@@ -1211,6 +1211,9 @@ type updateServiceAccountOpts struct {
 	status            string
 	name, description string
 	expiration        *time.Time
+	// parentUser, when set, is the parent the caller was authorized for; an
+	// account stored under another parent is refused as absent.
+	parentUser string
 }
 
 // UpdateServiceAccount - edit a service account

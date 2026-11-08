@@ -2778,37 +2778,26 @@ func (store *IAMStoreSys) SetUserStatus(ctx context.Context, accessKey string, s
 	cache := store.lock()
 	defer store.unlock()
 
-	ui, ok := cache.iamUsersMap[accessKey]
-	if !ok {
-		return updatedAt, errNoSuchUser
-	}
-	cred := ui.Credentials
-
-	if cred.IsTemp() || cred.IsServiceAccount() {
+	if ui, ok := cache.iamUsersMap[accessKey]; ok && (ui.Credentials.IsTemp() || ui.Credentials.IsServiceAccount()) {
 		return updatedAt, errIAMActionNotAllowed
 	}
-
-	uinfo := newUserIdentity(auth.Credentials{
-		AccessKey: accessKey,
-		SecretKey: cred.SecretKey,
-		Status: func() string {
-			switch string(status) {
-			case string(madmin.AccountEnabled), string(auth.AccountOn):
-				return auth.AccountOn
-			}
-			return auth.AccountOff
-		}(),
+	u, _, err := store.editStoredIdentity(ctx, cache, accessKey, regUser, func(stored *UserIdentity) error {
+		if stored.Credentials.IsTemp() || stored.Credentials.IsServiceAccount() {
+			return errIAMActionNotAllowed
+		}
+		stored.Credentials.Status = auth.AccountOff
+		if status == madmin.AccountEnabled {
+			stored.Credentials.Status = auth.AccountOn
+		}
+		return nil
 	})
-
-	if err := store.saveUserIdentity(ctx, accessKey, regUser, &uinfo); err != nil {
+	if errors.Is(err, errIAMIdentityGone) {
+		return updatedAt, errNoSuchUser
+	}
+	if err != nil {
 		return updatedAt, err
 	}
-
-	if err := cache.updateUserWithClaims(accessKey, uinfo); err != nil {
-		return updatedAt, err
-	}
-
-	return uinfo.UpdatedAt, nil
+	return u.UpdatedAt, nil
 }
 
 // AddServiceAccount - add a new service account
@@ -2863,15 +2852,39 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	cache := store.lock()
 	defer store.unlock()
 
-	ui, ok := cache.iamUsersMap[accessKey]
-	if !ok || !ui.Credentials.IsServiceAccount() {
+	u, _, err := store.editStoredIdentity(ctx, cache, accessKey, svcUser, func(stored *UserIdentity) error {
+		if !stored.Credentials.IsServiceAccount() {
+			return errNoSuchServiceAccount
+		}
+		if opts.parentUser != "" && stored.Credentials.ParentUser != opts.parentUser {
+			// Not the account the caller was authorized for: it was
+			// deleted and created again for another parent meanwhile.
+			return errNoSuchServiceAccount
+		}
+		cr, err := updatedServiceAccountCredentials(ctx, accessKey, stored.Credentials, opts)
+		if err != nil {
+			return err
+		}
+		stored.Credentials = cr
+		return nil
+	})
+	if errors.Is(err, errIAMIdentityGone) {
 		return updatedAt, errNoSuchServiceAccount
 	}
-	cr := ui.Credentials
+	if err != nil {
+		return updatedAt, err
+	}
+	return u.UpdatedAt, nil
+}
+
+// updatedServiceAccountCredentials returns cr, the stored credential of
+// service account accessKey, with the edits of opts and a session token
+// signed again for them.
+func updatedServiceAccountCredentials(ctx context.Context, accessKey string, cr auth.Credentials, opts updateServiceAccountOpts) (auth.Credentials, error) {
 	currentSecretKey := cr.SecretKey
 	if opts.secretKey != "" {
 		if !auth.IsSecretKeyValid(opts.secretKey) {
-			return updatedAt, auth.ErrInvalidSecretKeyLength
+			return cr, auth.ErrInvalidSecretKeyLength
 		}
 		cr.SecretKey = opts.secretKey
 	}
@@ -2887,7 +2900,7 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	if opts.expiration != nil {
 		expirationInUTC := opts.expiration.UTC()
 		if err := validateSvcExpirationInUTC(ctx, expirationInUTC); err != nil {
-			return updatedAt, err
+			return cr, err
 		}
 		cr.Expiration = expirationInUTC
 	}
@@ -2903,12 +2916,12 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	case auth.AccountOn, auth.AccountOff:
 		cr.Status = opts.status
 	default:
-		return updatedAt, errors.New("unknown account status value")
+		return cr, errors.New("unknown account status value")
 	}
 
 	m, err := getClaimsFromTokenWithSecret(cr.SessionToken, currentSecretKey)
 	if err != nil {
-		return updatedAt, fmt.Errorf("unable to get svc acc claims: %v", err)
+		return cr, fmt.Errorf("unable to get svc acc claims: %v", err)
 	}
 
 	// Extracted session policy name string can be removed as its not useful
@@ -2926,17 +2939,17 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 
 	if opts.sessionPolicy != nil { // session policies is being updated
 		if err := opts.sessionPolicy.Validate(); err != nil {
-			return updatedAt, err
+			return cr, err
 		}
 
 		if opts.sessionPolicy.Version != "" && len(opts.sessionPolicy.Statements) > 0 {
 			policyBuf, err := json.Marshal(opts.sessionPolicy)
 			if err != nil {
-				return updatedAt, err
+				return cr, err
 			}
 
 			if len(policyBuf) > maxSVCSessionPolicySize {
-				return updatedAt, errSessionPolicyTooLarge
+				return cr, errSessionPolicyTooLarge
 			}
 
 			// Overwrite session policy claims.
@@ -2947,21 +2960,11 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 
 	cr.SessionToken, err = auth.JWTSignWithAccessKey(accessKey, m.Map(), cr.SecretKey)
 	if err != nil {
-		return updatedAt, err
+		return cr, err
 	}
-
-	u := newUserIdentity(cr)
-	if err := store.saveUserIdentity(ctx, u.Credentials.AccessKey, svcUser, &u); err != nil {
-		return updatedAt, err
-	}
-
-	if err := cache.updateUserWithClaims(u.Credentials.AccessKey, u); err != nil {
-		delete(cache.iamUsersMap, accessKey)
-		cache.updatedAt = UTCNow()
-		return updatedAt, err
-	}
-
-	return u.UpdatedAt, nil
+	// The stored claims are those of the new token; the save extracts them.
+	cr.Claims = nil
+	return cr, nil
 }
 
 // ListTempAccounts - lists only temporary accounts from the cache.
@@ -3105,20 +3108,14 @@ func (store *IAMStoreSys) UpdateUserSecretKey(ctx context.Context, accessKey, se
 	cache := store.lock()
 	defer store.unlock()
 
-	cache.updatedAt = time.Now()
-
-	ui, ok := cache.iamUsersMap[accessKey]
-	if !ok {
+	_, _, err := store.editStoredIdentity(ctx, cache, accessKey, regUser, func(stored *UserIdentity) error {
+		stored.Credentials.SecretKey = secretKey
+		return nil
+	})
+	if errors.Is(err, errIAMIdentityGone) {
 		return errNoSuchUser
 	}
-	cred := ui.Credentials
-	cred.SecretKey = secretKey
-	u := newUserIdentity(cred)
-	if err := store.saveUserIdentity(ctx, accessKey, regUser, &u); err != nil {
-		return err
-	}
-
-	return cache.updateUserWithClaims(accessKey, u)
+	return err
 }
 
 // GetSTSAndServiceAccounts - returns all STS and Service account credentials.
@@ -3146,10 +3143,10 @@ func (store *IAMStoreSys) getSTSAndServiceAccounts(cache *iamCache) []auth.Crede
 
 // RefreshUserGroups sets the groups of the STS or service-account
 // credential that cred was read from to groups, on the record stored now
-// and under its revision lock (see iamGroupRefresh). Nothing else of the
-// record changes. A credential that is gone, expired or now has another
-// parent is left alone in storage and dropped from the cache, which then
-// loads what is stored on its next use. It reports whether it wrote.
+// (see editStoredIdentity). Nothing else of the record changes. A
+// credential that is gone, expired or now has another parent, whose groups
+// the directory lookup did not compute, is left alone in storage and
+// dropped from the cache. It reports whether it wrote.
 func (store *IAMStoreSys) RefreshUserGroups(ctx context.Context, cred auth.Credentials, groups []string) (bool, error) {
 	cache := store.lock()
 	defer store.unlock()
@@ -3161,26 +3158,64 @@ func (store *IAMStoreSys) RefreshUserGroups(ctx context.Context, cred auth.Crede
 		}
 		userType = stsUser
 	}
-	op := &iamGroupRefresh{accessKey: cred.AccessKey, parentUser: cred.ParentUser, groups: groups}
-	err := store.saveIAMRevision(ctx, getUserIdentityPath(cred.AccessKey, userType), op)
-	if errors.Is(err, errIAMStaleUpdate) {
-		// The cache still holds the stale record; storage says otherwise.
-		delete(cache.iamUsersMap, cred.AccessKey)
-		delete(cache.iamSTSAccountsMap, cred.AccessKey)
-		cache.updatedAt = time.Now()
-		if store.group != nil {
-			store.group.Forget(cred.AccessKey)
+	_, unchanged, err := store.editStoredIdentity(ctx, cache, cred.AccessKey, userType, func(stored *UserIdentity) error {
+		if stored.Credentials.ParentUser != cred.ParentUser || stored.Credentials.IsExpired() {
+			return errIAMIdentityGone
 		}
+		if set.CreateStringSet(stored.Credentials.Groups...).Equals(set.CreateStringSet(groups...)) {
+			return errIAMIdentityUnchanged
+		}
+		stored.Credentials.Groups = groups
+		return nil
+	})
+	if errors.Is(err, errIAMIdentityGone) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	// The stored record is authoritative, also when it had the groups.
-	if err := cache.updateUserWithClaims(cred.AccessKey, op.UserIdentity); err != nil {
-		return false, err
+	return !unchanged, nil
+}
+
+// editStoredIdentity applies edit to identity accessKey of userType as it
+// is stored now, under its revision lock (see iamIdentityEdit), and caches
+// the result. The caller holds the cache lock. When the identity is absent
+// or deleted in storage, or edit returns errIAMIdentityGone because it is
+// no longer the identity the edit addressed, the cached copy is dropped, so
+// a lookup loads what is stored, and errIAMIdentityGone is returned.
+func (store *IAMStoreSys) editStoredIdentity(ctx context.Context, cache *iamCache, accessKey string, userType IAMUserType, edit func(u *UserIdentity) error) (UserIdentity, bool, error) {
+	op := &iamIdentityEdit{accessKey: accessKey, edit: edit}
+	err := store.saveIAMRevision(ctx, getUserIdentityPath(accessKey, userType), op)
+	if errors.Is(err, errIAMIdentityGone) {
+		store.forgetCachedIdentity(cache, accessKey, userType)
 	}
-	return !op.unchanged, nil
+	if err != nil {
+		return UserIdentity{}, false, err
+	}
+	if err := cache.updateUserWithClaims(accessKey, op.UserIdentity); err != nil {
+		// Stored but not cached: a lookup loads it.
+		store.forgetCachedIdentity(cache, accessKey, userType)
+		return UserIdentity{}, false, err
+	}
+	return op.UserIdentity, op.unchanged, nil
+}
+
+// forgetCachedIdentity drops identity accessKey of userType from the cache;
+// a lookup then loads it from storage. Users and service accounts share a
+// map, so an entry of the other kind under the same key is kept.
+func (store *IAMStoreSys) forgetCachedIdentity(cache *iamCache, accessKey string, userType IAMUserType) {
+	switch userType {
+	case stsUser:
+		delete(cache.iamSTSAccountsMap, accessKey)
+	default:
+		if ui, ok := cache.iamUsersMap[accessKey]; ok && ui.Credentials.IsServiceAccount() == (userType == svcUser) {
+			delete(cache.iamUsersMap, accessKey)
+		}
+	}
+	cache.updatedAt = time.Now()
+	if store.group != nil {
+		store.group.Forget(accessKey)
+	}
 }
 
 // LoadUser - attempts to load user info from storage and updates cache.
