@@ -170,7 +170,7 @@ type batchJobStatus struct {
 
 type batchJobStatusMetric struct {
 	madmin.JobMetric
-	VersionsSkippedLocked int64  `json:"versionsSkippedLocked,omitempty"`
+	VersionsSkippedLocked *int64 `json:"versionsSkippedLocked,omitempty"`
 	KeysRefused           int64  `json:"keysRefused,omitempty"`
 	FailureReason         string `json:"failureReason,omitempty"`
 	PausedReason          string `json:"pausedReason,omitempty"`
@@ -179,9 +179,10 @@ type batchJobStatusMetric struct {
 func (ri *batchJobInfo) statusMetric() batchJobStatusMetric {
 	ri.mu.RLock()
 	defer ri.mu.RUnlock()
+	versionsSkipped := ri.VersionsSkippedLocked
 	return batchJobStatusMetric{
 		JobMetric:             ri.metric(),
-		VersionsSkippedLocked: ri.VersionsSkippedLocked,
+		VersionsSkippedLocked: &versionsSkipped,
 		KeysRefused:           ri.KeysRefused,
 		FailureReason:         ri.FailureReason,
 		PausedReason:          ri.PausedReason,

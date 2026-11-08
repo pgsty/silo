@@ -462,6 +462,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
 		return err
 	}
+	ri.resetReplicationAttempt()
 	globalBatchJobsMetrics.save(job.ID, ri)
 
 	retryAttempts := job.Replicate.Flags.Retry.Attempts
@@ -576,9 +577,10 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
 		minioSrc := r.Source.Type == BatchJobReplicateResourceMinIO
 		ctx, cancelCause := context.WithCancelCause(ctx)
-		// refuse ends the job for its submitter: record why before stopping.
-		refuse := func(err error) {
-			ri.refuse(err)
+		stop := func(err error) {
+			if isBatchJobAuthzError(err) {
+				ri.refuse(err)
+			}
 			cancelCause(err)
 		}
 		// Each run lists the source from the start and counts every locked
@@ -613,6 +615,15 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		for obj := range objInfoCh {
 			if context.Cause(ctx) != nil {
 				// Refused or canceled: schedule nothing more.
+				continue
+			}
+			if obj.Err != nil {
+				switch minio.ToErrorResponse(obj.Err).StatusCode {
+				case http.StatusUnauthorized, http.StatusForbidden:
+					stop(batchJobAuthzError{reason: "source listing denied: " + obj.Err.Error()})
+				default:
+					stop(batchListingError(obj.Err))
+				}
 				continue
 			}
 			oi := toObjectInfo(r.Source.Bucket, obj.Key, obj)
@@ -663,8 +674,11 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricReplication, job.ID, attempts)
 				success := true
 				if err := r.ReplicateFromSource(ctx, api, core, oi, retry, job.Submitter); err != nil {
-					if isBatchJobAuthzError(err) {
-						refuse(err)
+					if isBatchJobStopped(err) {
+						stop(err)
+						return
+					}
+					if ctx.Err() != nil {
 						return
 					}
 					// A locked destination version is left as it is: the
@@ -706,6 +720,14 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 			}
 			return nil
 		}
+		if cause := context.Cause(ctx); cause != nil {
+			cancelCause(nil)
+			if isBatchJobUnavailable(cause) {
+				ri.resetReplicationAttempt()
+				return ri.savePaused(ctx, api, job, cause)
+			}
+			return cause
+		}
 
 		ri.RetryAttempts = attempts
 		ri.Complete = ri.ObjectsFailed == 0 && ri.DeleteMarkersFailed == 0
@@ -721,14 +743,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 
 		cancelCause(nil)
 		if ri.Failed {
-			ri.ObjectsFailed = 0
-			ri.DeleteMarkersFailed = 0
-			ri.Bucket = ""
-			ri.Object = ""
-			ri.Objects = 0
-			ri.DeleteMarkers = 0
-			ri.BytesFailed = 0
-			ri.BytesTransferred = 0
+			ri.resetReplicationAttempt()
 			retry = true // indicate we are retrying..
 			time.Sleep(delay + time.Duration(rnd.Float64()*float64(delay)))
 			continue
@@ -1337,6 +1352,21 @@ func (ri *batchJobInfo) trackCurrentBucketBatch(bucket string, batch []ObjectInf
 	}
 }
 
+func (ri *batchJobInfo) resetReplicationAttempt() {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	ri.Complete, ri.Failed = false, false
+	ri.ObjectsFailed = 0
+	ri.DeleteMarkersFailed = 0
+	ri.Bucket = ""
+	ri.Object = ""
+	ri.Objects = 0
+	ri.DeleteMarkers = 0
+	ri.BytesFailed = 0
+	ri.BytesTransferred = 0
+	ri.VersionsSkippedLocked = 0
+}
+
 // Start start the batch replication job, resumes if there was a pending job via "job.ID"
 func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job BatchJobRequest) error {
 	ri := &batchJobInfo{
@@ -1353,8 +1383,8 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
 		return err
 	}
+	ri.resetReplicationAttempt()
 	globalBatchJobsMetrics.save(job.ID, ri)
-	lastObject := ri.Object
 
 	retryAttempts := job.Replicate.Flags.Retry.Attempts
 	if retryAttempts <= 0 {
@@ -1461,9 +1491,10 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			slowCh = make(chan itemOrErr[ObjectInfo], 100)
 		)
 		ctx, cancelCause := context.WithCancelCause(ctx)
-		// refuse ends the job for its submitter: record why before stopping.
-		refuse := func(err error) {
-			ri.refuse(err)
+		stop := func(err error) {
+			if isBatchJobAuthzError(err) {
+				ri.refuse(err)
+			}
 			cancelCause(err)
 		}
 
@@ -1488,8 +1519,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				writeFn := func(batch []ObjectInfo) {
 					if len(batch) > 0 {
 						if err := r.writeAsArchive(ctx, api, cl, batch, r.Target.Prefix, job.Submitter); err != nil {
-							if isBatchJobAuthzError(err) {
-								refuse(err)
+							if isBatchJobStopped(err) {
+								stop(err)
+								return
+							}
+							if ctx.Err() != nil {
 								return
 							}
 							batchLogOnceIf(ctx, err, job.ID+"writeAsArchive")
@@ -1505,7 +1539,10 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 					}
 				}
 				for obj := range walkCh {
-					if obj.Item.DeleteMarker || !obj.Item.VersionPurgeStatus.Empty() || obj.Item.Size >= int64(smallerThan) {
+					if context.Cause(ctx) != nil {
+						continue
+					}
+					if obj.Err != nil || obj.Item.DeleteMarker || !obj.Item.VersionPurgeStatus.Empty() || obj.Item.Size >= int64(smallerThan) {
 						slowCh <- obj
 						continue
 					}
@@ -1518,7 +1555,9 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 					writeFn(batch)
 					batch = batch[:0]
 				}
-				writeFn(batch)
+				if context.Cause(ctx) == nil {
+					writeFn(batch)
+				}
 				xioutil.SafeClose(slowCh)
 			}()
 		} else {
@@ -1551,11 +1590,10 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			for _, prefix := range prefixes {
 				prefixWalkCh := make(chan itemOrErr[ObjectInfo], 100)
 				if err := api.Walk(ctx, r.Source.Bucket, prefix, prefixWalkCh, WalkOptions{
-					Marker:   lastObject,
 					Filter:   selectObj,
 					AskDisks: walkQuorum,
 				}); err != nil {
-					cancelCause(err)
+					cancelCause(batchListingError(err))
 					xioutil.SafeClose(walkCh)
 					return
 				}
@@ -1575,7 +1613,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				continue
 			}
 			if res.Err != nil {
-				ri.Failed = true
+				cancelCause(batchListingError(res.Err))
 				batchLogOnceIf(ctx, res.Err, job.ID+"res.Err")
 				continue
 			}
@@ -1594,8 +1632,11 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricReplication, job.ID, attempts)
 				success := true
 				if err := r.ReplicateToTarget(ctx, api, c, result, retry, job.Submitter); err != nil {
-					if isBatchJobAuthzError(err) {
-						refuse(err)
+					if isBatchJobStopped(err) {
+						stop(err)
+						return
+					}
+					if ctx.Err() != nil {
 						return
 					}
 					if minio.ToErrorResponse(err).Code == "PreconditionFailed" {
@@ -1632,9 +1673,13 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			}
 			return nil
 		}
-		// Do not need to retry if we can't list objects on source.
-		if context.Cause(ctx) != nil {
-			return context.Cause(ctx)
+		if cause := context.Cause(ctx); cause != nil {
+			cancelCause(nil)
+			if isBatchJobUnavailable(cause) {
+				ri.resetReplicationAttempt()
+				return ri.savePaused(ctx, api, job, cause)
+			}
+			return cause
 		}
 		ri.RetryAttempts = attempts
 		ri.Complete = ri.ObjectsFailed == 0 && ri.DeleteMarkersFailed == 0
@@ -1650,14 +1695,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 		cancelCause(nil)
 		if ri.Failed {
-			ri.ObjectsFailed = 0
-			ri.DeleteMarkersFailed = 0
-			ri.Bucket = ""
-			ri.Object = ""
-			ri.Objects = 0
-			ri.DeleteMarkers = 0
-			ri.BytesFailed = 0
-			ri.BytesTransferred = 0
+			ri.resetReplicationAttempt()
 			retry = true // indicate we are retrying..
 			time.Sleep(delay + time.Duration(rnd.Float64()*float64(delay)))
 			continue
@@ -2627,20 +2665,20 @@ func (ri *batchJobInfo) metric() madmin.JobMetric {
 	return m
 }
 
-func (m *batchJobMetrics) report(jobID string) (metrics *madmin.BatchJobMetrics) {
-	metrics = &madmin.BatchJobMetrics{CollectedAt: time.Now(), Jobs: make(map[string]madmin.JobMetric)}
+func (m *batchJobMetrics) report(jobID string) (metrics *batchJobMetricsReport) {
+	metrics = &batchJobMetricsReport{CollectedAt: time.Now(), Jobs: make(map[string]batchJobStatusMetric)}
 	m.RLock()
 	defer m.RUnlock()
 
 	if jobID != "" {
 		if job, ok := m.metrics[jobID]; ok {
-			metrics.Jobs[jobID] = job.metric()
+			metrics.Jobs[jobID] = job.statusMetric()
 		}
 		return metrics
 	}
 
 	for id, job := range m.metrics {
-		metrics.Jobs[id] = job.metric()
+		metrics.Jobs[id] = job.statusMetric()
 	}
 	return metrics
 }

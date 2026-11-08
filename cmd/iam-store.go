@@ -3225,15 +3225,17 @@ func (store *IAMStoreSys) forgetCachedIdentity(cache *iamCache, accessKey string
 
 // LoadUser - attempts to load user info from storage and updates cache.
 func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error {
-	loadedAt := time.Now()
 	groupLoad := env.Get("_MINIO_IAM_GROUP_REFRESH", config.EnableOff) == config.EnableOn
 
-	newCachePopulate := func() (val any, err error) {
-		newCache := newIamCache()
+	newCachePopulate := func(ctx context.Context) (newCache *iamCache, err error) {
+		newCache = newIamCache()
 		newCache.revisions = store.revisionIndex()
 
 		// Check for service account first
-		store.loadUser(ctx, accessKey, svcUser, newCache.iamUsersMap)
+		err = store.loadUser(ctx, accessKey, svcUser, newCache.iamUsersMap)
+		if err != nil && !errors.Is(err, errNoSuchUser) && !errors.Is(err, errConfigNotFound) {
+			return nil, err
+		}
 
 		svc, found := newCache.iamUsersMap[accessKey]
 		if found {
@@ -3251,6 +3253,9 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 
 		if !found {
 			err = store.loadUser(ctx, accessKey, regUser, newCache.iamUsersMap)
+			if err != nil && !errors.Is(err, errNoSuchUser) && !errors.Is(err, errConfigNotFound) {
+				return nil, err
+			}
 			if _, found = newCache.iamUsersMap[accessKey]; found {
 				// NOTE: we are not worried about loading errors from policies.
 				store.loadMappedPolicyWithRetry(ctx, accessKey, regUser, false, newCache.iamUserPolicyMap, 3)
@@ -3294,69 +3299,67 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 		return newCache, err
 	}
 
-	var (
-		val any
-		err error
-	)
-	if store.group != nil {
-		val, err, _ = store.group.Do(accessKey, newCachePopulate)
-	} else {
-		val, err = newCachePopulate()
-	}
-
-	// Return error right away if any.
-	if err != nil {
-		if errors.Is(err, errNoSuchUser) || errors.Is(err, errConfigNotFound) {
-			return nil
+	load := func() (any, error) {
+		loadedAt := time.Now()
+		newCache, err := newCachePopulate(ctx)
+		if err != nil {
+			return nil, err
 		}
-		return err
+
+		cache := store.lock()
+		defer store.unlock()
+
+		if cache.updatedAt.After(loadedAt) {
+			err = store.withIAMStorage(ctx, func(ctx context.Context) error {
+				newCache, err = newCachePopulate(ctx)
+				return err
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// We need to merge the new cache with the existing cache because the
+		// periodic IAM reload is partial. The periodic load here is to account.
+		newCache.iamGroupPolicyMap.Range(func(k string, v MappedPolicy) bool {
+			cache.iamGroupPolicyMap.Store(k, v)
+			return true
+		})
+
+		maps.Copy(cache.iamGroupsMap, newCache.iamGroupsMap)
+
+		maps.Copy(cache.iamPolicyDocsMap, newCache.iamPolicyDocsMap)
+
+		maps.Copy(cache.iamUserGroupMemberships, newCache.iamUserGroupMemberships)
+
+		newCache.iamUserPolicyMap.Range(func(k string, v MappedPolicy) bool {
+			cache.iamUserPolicyMap.Store(k, v)
+			return true
+		})
+
+		maps.Copy(cache.iamUsersMap, newCache.iamUsersMap)
+
+		maps.Copy(cache.iamSTSAccountsMap, newCache.iamSTSAccountsMap)
+
+		newCache.iamSTSPolicyMap.Range(func(k string, v MappedPolicy) bool {
+			cache.iamSTSPolicyMap.Store(k, v)
+			return true
+		})
+
+		cache.updatedAt = time.Now()
+		return nil, nil
 	}
 
-	newCache, ok := val.(*iamCache)
-	if !ok {
+	var err error
+	if store.group != nil {
+		_, err, _ = store.group.Do(accessKey, load)
+	} else {
+		_, err = load()
+	}
+	if errors.Is(err, errNoSuchUser) || errors.Is(err, errConfigNotFound) {
 		return nil
 	}
-
-	cache := store.lock()
-	defer store.unlock()
-
-	// A partial load may have started before a credential edit or deletion and
-	// finished after it. Do not merge that snapshot over the newer cache state;
-	// the next notification or load will supply the missing entry.
-	if cache.updatedAt.After(loadedAt) {
-		return nil
-	}
-
-	// We need to merge the new cache with the existing cache because the
-	// periodic IAM reload is partial. The periodic load here is to account.
-	newCache.iamGroupPolicyMap.Range(func(k string, v MappedPolicy) bool {
-		cache.iamGroupPolicyMap.Store(k, v)
-		return true
-	})
-
-	maps.Copy(cache.iamGroupsMap, newCache.iamGroupsMap)
-
-	maps.Copy(cache.iamPolicyDocsMap, newCache.iamPolicyDocsMap)
-
-	maps.Copy(cache.iamUserGroupMemberships, newCache.iamUserGroupMemberships)
-
-	newCache.iamUserPolicyMap.Range(func(k string, v MappedPolicy) bool {
-		cache.iamUserPolicyMap.Store(k, v)
-		return true
-	})
-
-	maps.Copy(cache.iamUsersMap, newCache.iamUsersMap)
-
-	maps.Copy(cache.iamSTSAccountsMap, newCache.iamSTSAccountsMap)
-
-	newCache.iamSTSPolicyMap.Range(func(k string, v MappedPolicy) bool {
-		cache.iamSTSPolicyMap.Store(k, v)
-		return true
-	})
-
-	cache.updatedAt = time.Now()
-
-	return nil
+	return err
 }
 
 var errTokenSigningKeyUnavailable = errors.New("token signing key unavailable")

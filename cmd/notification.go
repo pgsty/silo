@@ -873,9 +873,9 @@ func (sys *NotificationSys) GetOSInfo(ctx context.Context) []madmin.OSInfo {
 	return reply
 }
 
-// GetMetrics - Get metrics from all peers.
-func (sys *NotificationSys) GetMetrics(ctx context.Context, t madmin.MetricType, opts collectMetricsOpts) []madmin.RealtimeMetrics {
-	reply := make([]madmin.RealtimeMetrics, len(sys.peerClients))
+// getMetrics - Get metrics from all peers.
+func (sys *NotificationSys) getMetrics(ctx context.Context, t madmin.MetricType, opts collectMetricsOpts) []realtimeMetrics {
+	reply := make([]realtimeMetrics, len(sys.peerClients))
 
 	g := errgroup.WithNErrs(len(sys.peerClients))
 	for index, client := range sys.peerClients {

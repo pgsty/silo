@@ -62,7 +62,7 @@ var (
 	madminOSInfo           = grid.NewJSONPool[madmin.OSInfo]()
 	madminPartitions       = grid.NewJSONPool[madmin.Partitions]()
 	madminProcInfo         = grid.NewJSONPool[madmin.ProcInfo]()
-	madminRealtimeMetrics  = grid.NewJSONPool[madmin.RealtimeMetrics]()
+	madminRealtimeMetrics  = grid.NewJSONPool[realtimeMetrics]()
 	madminServerProperties = grid.NewJSONPool[madmin.ServerProperties]()
 	madminStorageInfo      = grid.NewJSONPool[madmin.StorageInfo]()
 	madminSysConfig        = grid.NewJSONPool[madmin.SysConfig]()
@@ -84,7 +84,7 @@ var (
 	getLocksRPC                    = grid.NewSingleHandler[*grid.MSS, *localLockMap](grid.HandlerGetLocks, grid.NewMSS, func() *localLockMap { return &localLockMap{} })
 	getMemInfoRPC                  = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.MemInfo]](grid.HandlerGetMemInfo, grid.NewMSS, madminMemInfo.NewJSON)
 	getMetacacheListingRPC         = grid.NewSingleHandler[*listPathOptions, *metacache](grid.HandlerGetMetacacheListing, func() *listPathOptions { return &listPathOptions{} }, func() *metacache { return &metacache{} })
-	getMetricsRPC                  = grid.NewSingleHandler[*grid.URLValues, *grid.JSON[madmin.RealtimeMetrics]](grid.HandlerGetMetrics, grid.NewURLValues, madminRealtimeMetrics.NewJSON)
+	getMetricsRPC                  = grid.NewSingleHandler[*grid.URLValues, *grid.JSON[realtimeMetrics]](grid.HandlerGetMetrics, grid.NewURLValues, madminRealtimeMetrics.NewJSON)
 	getNetInfoRPC                  = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.NetInfo]](grid.HandlerGetNetInfo, grid.NewMSS, madminNetInfo.NewJSON)
 	getOSInfoRPC                   = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.OSInfo]](grid.HandlerGetOSInfo, grid.NewMSS, madminOSInfo.NewJSON)
 	getPartitionsRPC               = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.Partitions]](grid.HandlerGetPartitions, grid.NewMSS, madminPartitions.NewJSON)
@@ -423,7 +423,7 @@ func (s *peerRESTServer) GetMemInfoHandler(_ *grid.MSS) (*grid.JSON[madmin.MemIn
 }
 
 // GetMetricsHandler - returns server metrics.
-func (s *peerRESTServer) GetMetricsHandler(v *grid.URLValues) (*grid.JSON[madmin.RealtimeMetrics], *grid.RemoteErr) {
+func (s *peerRESTServer) GetMetricsHandler(v *grid.URLValues) (*grid.JSON[realtimeMetrics], *grid.RemoteErr) {
 	values := v.Values()
 	var types madmin.MetricType
 	if t, _ := strconv.ParseUint(values.Get(peerRESTMetricsTypes), 10, 64); t != 0 {

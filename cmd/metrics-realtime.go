@@ -38,7 +38,7 @@ type collectMetricsOpts struct {
 	depID string
 }
 
-func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m madmin.RealtimeMetrics) {
+func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m realtimeMetrics) {
 	if types == madmin.MetricsNone {
 		return m
 	}
@@ -144,7 +144,7 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 	// Add types...
 
 	// ByHost is a shallow reference, so careful about sharing.
-	m.ByHost = map[string]madmin.Metrics{byHostName: m.Aggregated}
+	m.ByHost = map[string]realtimeMetricGroups{byHostName: m.Aggregated}
 	m.Hosts = append(m.Hosts, byHostName)
 
 	return m
@@ -221,11 +221,11 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 	return metrics
 }
 
-func collectRemoteMetrics(ctx context.Context, types madmin.MetricType, opts collectMetricsOpts) (m madmin.RealtimeMetrics) {
+func collectRemoteMetrics(ctx context.Context, types madmin.MetricType, opts collectMetricsOpts) (m realtimeMetrics) {
 	if !globalIsDistErasure {
 		return m
 	}
-	all := globalNotificationSys.GetMetrics(ctx, types, opts)
+	all := globalNotificationSys.getMetrics(ctx, types, opts)
 	for _, remote := range all {
 		m.Merge(&remote)
 	}

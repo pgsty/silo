@@ -3804,7 +3804,7 @@ func getBatchJobsMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
 	}
 
 	mg.RegisterRead(func(ctx context.Context) (metrics []MetricV2) {
-		var m madmin.RealtimeMetrics
+		var m realtimeMetrics
 		mLocal := collectLocalMetrics(madmin.MetricsBatchJobs, collectMetricsOpts{})
 		m.Merge(&mLocal)
 
