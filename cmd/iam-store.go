@@ -3144,27 +3144,43 @@ func (store *IAMStoreSys) getSTSAndServiceAccounts(cache *iamCache) []auth.Crede
 	return res
 }
 
-// UpdateUserIdentity - updates a user credential.
-func (store *IAMStoreSys) UpdateUserIdentity(ctx context.Context, cred auth.Credentials) error {
+// RefreshUserGroups sets the groups of the STS or service-account
+// credential that cred was read from to groups, on the record stored now
+// and under its revision lock (see iamGroupRefresh). Nothing else of the
+// record changes. A credential that is gone, expired or now has another
+// parent is left alone in storage and dropped from the cache, which then
+// loads what is stored on its next use. It reports whether it wrote.
+func (store *IAMStoreSys) RefreshUserGroups(ctx context.Context, cred auth.Credentials, groups []string) (bool, error) {
 	cache := store.lock()
 	defer store.unlock()
 
-	cache.updatedAt = time.Now()
-
-	userType := regUser
-	if cred.IsServiceAccount() {
-		userType = svcUser
-	} else if cred.IsTemp() {
+	userType := svcUser
+	if !cred.IsServiceAccount() {
+		if !cred.IsTemp() {
+			return false, errInvalidArgument
+		}
 		userType = stsUser
 	}
-	ui := newUserIdentity(cred)
-	// Overwrite the user identity here. As store should be
-	// atomic, it shouldn't cause any corruption.
-	if err := store.saveUserIdentity(ctx, cred.AccessKey, userType, &ui); err != nil {
-		return err
+	op := &iamGroupRefresh{accessKey: cred.AccessKey, parentUser: cred.ParentUser, groups: groups}
+	err := store.saveIAMRevision(ctx, getUserIdentityPath(cred.AccessKey, userType), op)
+	if errors.Is(err, errIAMStaleUpdate) {
+		// The cache still holds the stale record; storage says otherwise.
+		delete(cache.iamUsersMap, cred.AccessKey)
+		delete(cache.iamSTSAccountsMap, cred.AccessKey)
+		cache.updatedAt = time.Now()
+		if store.group != nil {
+			store.group.Forget(cred.AccessKey)
+		}
+		return false, nil
 	}
-
-	return cache.updateUserWithClaims(cred.AccessKey, ui)
+	if err != nil {
+		return false, err
+	}
+	// The stored record is authoritative, also when it had the groups.
+	if err := cache.updateUserWithClaims(cred.AccessKey, op.UserIdentity); err != nil {
+		return false, err
+	}
+	return !op.unchanged, nil
 }
 
 // LoadUser - attempts to load user info from storage and updates cache.

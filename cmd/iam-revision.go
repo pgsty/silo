@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
 	etcd "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -44,6 +45,22 @@ type iamGroupRevocation struct {
 // immutable STS token can be removed; a reusable service-account key retains
 // its revision so an older non-expiring credential cannot return.
 type iamExpireIdentity struct{}
+
+// An LDAP group refresh sets the groups of the credential as it is stored
+// now. The refresh computes the groups from a snapshot of a server's cache
+// taken before a slow directory lookup; writing that snapshot back would
+// undo a rotation or an edit made meanwhile on any server, and bring back a
+// deleted credential. The refresh therefore changes only the groups, under
+// the identity's revision lock and on the stored record, and leaves alone a
+// credential that is gone, expired, or now has another parent, whose groups
+// the lookup did not compute.
+type iamGroupRefresh struct {
+	UserIdentity // the record written, or found unchanged
+	accessKey    string
+	parentUser   string
+	groups       []string
+	unchanged    bool // the stored record already has the groups
+}
 
 // The authoritative revocation is durable even if dependent cleanup fails.
 // Callers must publish it to sibling caches before returning the error.
@@ -251,6 +268,35 @@ func saveIAMRevision(ctx context.Context, store IAMStorageAPI, path string, item
 	previous, err := loadIAMRevision(ctx, store, path)
 	if err != nil {
 		return err
+	}
+	if op, ok := item.(*iamGroupRefresh); ok {
+		var current UserIdentity
+		err := store.loadIAMConfig(ctx, &current, path)
+		if errors.Is(err, errConfigNotFound) {
+			return errIAMStaleUpdate
+		}
+		if err != nil {
+			return err
+		}
+		if current.Credentials.AccessKey == "" {
+			// As the identity loaders do: the path names the access key.
+			current.Credentials.AccessKey = op.accessKey
+		}
+		if current.Deleted || current.Credentials.ParentUser != op.parentUser || current.Credentials.IsExpired() {
+			return errIAMStaleUpdate
+		}
+		if set.CreateStringSet(current.Credentials.Groups...).Equals(set.CreateStringSet(op.groups...)) {
+			op.UserIdentity, op.unchanged = current, true
+			return nil
+		}
+		current.Credentials.Groups = op.groups
+		current.UpdatedAt = time.Time{} // a new revision, as for any local edit
+		op.UserIdentity = current
+		item = &op.UserIdentity
+		if strings.HasPrefix(path, iamConfigSTSPrefix) {
+			// Keep the record expiring with its token, as SetTempUser stores it.
+			opts = []options{{ttl: max(1, int64(time.Until(current.Credentials.Expiration).Seconds()))}}
+		}
 	}
 	if _, expiring := item.(*iamExpireIdentity); expiring {
 		sts := strings.HasPrefix(path, iamConfigSTSPrefix)

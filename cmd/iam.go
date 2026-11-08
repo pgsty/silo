@@ -1658,8 +1658,10 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 				continue
 			}
 
-			cred.Groups = currGroups
-			if err := sys.store.UpdateUserIdentity(ctx, cred); err != nil {
+			// Only the groups change, on the credential as it is stored now:
+			// cred is a snapshot from before the lookup, and a rotation, an
+			// edit or a deletion since then must stand.
+			if _, err := sys.store.RefreshUserGroups(ctx, cred, currGroups); err != nil {
 				// Log and continue error - perhaps it'll work the next time.
 				iamLogIf(GlobalContext, err)
 			}

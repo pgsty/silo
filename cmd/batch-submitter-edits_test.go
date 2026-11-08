@@ -66,9 +66,11 @@ func TestBatchSubmitterCredentialEdits(t *testing.T) {
 			if !ok {
 				t.Fatal("service account missing")
 			}
-			c := u.Credentials
-			c.Groups = append(c.Groups, "refreshed-group")
-			mustIAM(t, f.sys.store.UpdateUserIdentity(f.ctx, c))
+			wrote, err := f.sys.store.RefreshUserGroups(f.ctx, u.Credentials, append(u.Credentials.Groups, "refreshed-group"))
+			mustIAM(t, err)
+			if !wrote {
+				t.Fatal("control: the refresh did not write")
+			}
 		}, true},
 		{"secret-rotated", false, func(t *testing.T, cred auth.Credentials) {
 			_, err := f.sys.UpdateServiceAccount(f.ctx, cred.AccessKey, updateServiceAccountOpts{secretKey: "edit-rotated-secret-key"})
