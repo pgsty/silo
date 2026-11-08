@@ -196,11 +196,23 @@ func TestBatchExpirePurgeRefusesLockedAfterWalk(t *testing.T) {
 func (f *batchAuthzFixture) transition(t *testing.T, key, versionID string) {
 	t.Helper()
 	set := f.obj.(*erasureServerPools).serverPools[0]
-	infos, errs := readAllFileInfo(f.ctx, set.getHashedSet(key).getDisks(), "", f.bucket, key, versionID, false, false)
+	er := set.getHashedSet(key)
+	// DecomTieredObject takes its parity from the global storage class, which
+	// earlier tests can leave at a parity this set cannot have; it then
+	// writes on no drive and still succeeds. Use the set's own parity; the
+	// whole configuration is restored when the test ends.
+	setTestStandardParity(t, er.defaultParityCount)
+	infos, errs := readAllFileInfo(f.ctx, er.getDisks(), "", f.bucket, key, versionID, false, false)
 	mustIAM(t, errs[0])
 	fi := infos[0]
 	fi.TransitionStatus, fi.TransitionTier, fi.TransitionedObjName = lifecycle.TransitionComplete, "WARM", "remote/"+key+"/"+versionID
 	mustIAM(t, set.DecomTieredObject(f.ctx, f.bucket, key, fi, ObjectOptions{}))
+	infos, errs = readAllFileInfo(f.ctx, er.getDisks(), "", f.bucket, key, versionID, false, false)
+	for i := range infos {
+		if errs[i] != nil || infos[i].TransitionStatus != lifecycle.TransitionComplete {
+			t.Fatalf("drive %d does not hold the transition: %v", i, errs[i])
+		}
+	}
 }
 
 // A key with a transitioned version is refused as a whole, as a key with a
