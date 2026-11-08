@@ -34,8 +34,12 @@ import (
 //     (batchJobSubmitter). Nothing in the submitted definition names it.
 //   - Every start of the job, and every object it touches, resolves the
 //     binding against IAM again. A credential that is gone, disabled,
-//     expired, revoked or edited since submission fails the job; a reused
-//     access key does not match the binding.
+//     expired or revoked fails the job, and so does one whose secret,
+//     session token or parent changed since submission; a reused access key
+//     does not match the binding. Edits that leave the credential itself as
+//     it was (a name, a description, a later expiry of an expiring
+//     credential, the LDAP groups) keep the job: its policies, groups,
+//     status and expiry are read again each time.
 //   - Each action is evaluated with the submitter's policies and session
 //     policy but without a request. A Deny that may apply and would need
 //     request context the job does not have (source address, transport,
@@ -55,8 +59,13 @@ type batchJobSubmitter struct {
 	AccessKey string `msg:"ak"`
 	// ParentUser is the parent of a derived credential.
 	ParentUser string `msg:"pu"`
-	// UpdatedAt and RevokedBefore are the revision of the identity record;
-	// any edit of the identity changes them. They are unset for root.
+	// UpdatedAt is the revision of the identity record at submission. It is
+	// recorded for diagnosis only: an edit that keeps the credential, such as
+	// a description, a later expiry or an LDAP group refresh, changes it and
+	// must not end the job. RevokedBefore is the revocation boundary of the
+	// record, which edits keep and a deletion advances, so a credential
+	// created again under the access key does not match. Both are unset for
+	// root.
 	UpdatedAt     time.Time `msg:"ua"`
 	RevokedBefore time.Time `msg:"rb"`
 	// Binding is a keyed fingerprint of the credential itself, see
@@ -229,8 +238,13 @@ func (s *batchJobSubmitter) principal(ctx context.Context) (batchJobPrincipal, e
 	}
 	cred := u.Credentials
 	typ := batchSubmitterType(cred)
+	// The binding covers the secret, the session token and the parent, so a
+	// rotated or reissued credential does not match it. The rest of the
+	// identity record (UpdatedAt) changes with edits that keep the
+	// credential and is not compared; what those edits decide, status,
+	// expiry, groups and policies, is evaluated below and per action.
 	if typ != s.Type || cred.AccessKey != s.AccessKey || cred.ParentUser != s.ParentUser ||
-		!u.UpdatedAt.Equal(s.UpdatedAt) || !u.RevokedBefore.Equal(s.RevokedBefore) ||
+		!u.RevokedBefore.Equal(s.RevokedBefore) ||
 		!hmac.Equal(s.Binding, batchSubmitterBinding(typ, cred)) {
 		return batchJobPrincipal{}, errBatchJobChanged
 	}
