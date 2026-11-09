@@ -1,6 +1,6 @@
 {
-  "updated": "2026-11-04T11:20:24+00:00",
-  "revision": "152aa8b4513ebc4ed01618a2ce9d0e5027fecf3b",
+  "updated": "2026-11-09T05:40:48+00:00",
+  "revision": "72eaa6f7175081c12741435574e83f4bb370e7d9",
   "repositories": [
     "pgsty/silo",
     "pgsty/silo-console",
@@ -132,7 +132,7 @@
       "handle": "botdeniska",
       "group": "code",
       "featured": true,
-      "what": "Contributed multi-pool migration and deletion safety, tiered expiry and replication checksum repairs, and faster policy evaluation in silo-pkg",
+      "what": "Contributed multi-pool migration, deletion and lifecycle safety, native restore reports and verification, LDAP login and storage cleanup fixes, replication checksum repairs, and faster policy evaluation",
       "firstContribution": "2026-10-17"
     },
     {
@@ -141,6 +141,20 @@
       "featured": true,
       "what": "Fixed long-DN LDAP login while preserving IAM revocation-record errors",
       "firstContribution": "2026-10-19"
+    },
+    {
+      "handle": "cyberbret",
+      "group": "code",
+      "featured": true,
+      "what": "Contributed on-demand folder and bucket usage scans and the optional persistent usage worker",
+      "firstContribution": "2026-10-26"
+    },
+    {
+      "handle": "EduardoAndradeMachado",
+      "group": "code",
+      "featured": true,
+      "what": "Contributed Brazilian Portuguese translations to Console and privately reported a security issue",
+      "firstContribution": "2026-11-06"
     },
     {
       "handle": "magicxor",
@@ -178,6 +192,13 @@
       "firstContribution": "2026-09-14"
     },
     {
+      "handle": "dihmandrake",
+      "group": "proposed",
+      "featured": true,
+      "what": "Reported dry-run healing safety issues and proposed parallel deep verification and Helm configuration options",
+      "firstContribution": "2026-11-02"
+    },
+    {
       "handle": "sulin37392",
       "group": "proposed",
       "featured": false,
@@ -192,11 +213,18 @@
       "firstContribution": "2026-06-24"
     },
     {
-      "handle": "cyberbret",
+      "handle": "liubin07",
       "group": "proposed",
-      "featured": true,
-      "what": "Contributed on-demand folder and bucket usage scans and the optional persistent usage worker",
-      "firstContribution": "2026-10-26"
+      "featured": false,
+      "what": "Proposed an opt-in object naming mode for coexisting object and prefix names",
+      "firstContribution": "2026-10-30"
+    },
+    {
+      "handle": "HaveFun83",
+      "group": "proposed",
+      "featured": false,
+      "what": "Proposed configurable Kubernetes health probes in the Helm chart",
+      "firstContribution": "2026-11-06"
     },
     {
       "handle": "kh0mka",
@@ -259,6 +287,27 @@
       "group": "reports",
       "featured": true,
       "what": "Reported the Object Lock GOVERNANCE retention authorization bypass",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "GhaziTriki",
+      "group": "reports",
+      "featured": true,
+      "what": "Investigated policy-query and Console slowdown and identified overlapping client mirror jobs",
+      "firstContribution": "2026-10-20"
+    },
+    {
+      "handle": "haf",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported audit webhook delivery stopping on peer nodes after configuration reload",
+      "firstContribution": "2026-10-26"
+    },
+    {
+      "handle": "sun1024",
+      "group": "reports",
+      "featured": true,
+      "what": "Privately reported a security issue in SILO",
       "firstContribution": "9999-12-31"
     },
     {
@@ -486,11 +535,18 @@
       "firstContribution": "2026-10-19"
     },
     {
-      "handle": "GhaziTriki",
+      "handle": "siyahkut",
       "group": "reports",
-      "featured": true,
-      "what": "Reported policy-query and Console performance degradation",
-      "firstContribution": "2026-10-20"
+      "featured": false,
+      "what": "Requested Turkish language support",
+      "firstContribution": "2026-11-02"
+    },
+    {
+      "handle": "seumasdunlop",
+      "group": "reports",
+      "featured": false,
+      "what": "Reported the outdated default server image tag in the Helm chart",
+      "firstContribution": "2026-11-09"
     }
   ]
 }
