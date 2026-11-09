@@ -482,6 +482,17 @@ jobs:
             fi
           done
 
+          # Both variants must trust the same roots: the UBI bundle with the
+          # RHSB-2026-012 blocklist applied, not Debian's bundle.
+          tar -xOf "${ctx}/rootfs.tar" etc/ssl/certs/ca-certificates.crt > "${ctx}/ca.pem"
+          openssl crl2pkcs7 -nocrl -certfile "${ctx}/ca.pem" \
+            | openssl pkcs7 -print_certs -noout > "${ctx}/ca-subjects.txt"
+          test "$(grep -c '^subject=' "${ctx}/ca-subjects.txt")" -gt 100
+          if grep -E '^subject=.*(AAA Certificate Services|emSign ECC Root CA - G3)' "${ctx}/ca-subjects.txt"; then
+            echo "distroless CA bundle still trusts a blocklisted root"
+            exit 1
+          fi
+
           # The baked-in healthcheck must drive Docker's health state on its
           # own, the probe binary must be directly exec-able without any
           # shell, and SIGTERM must still reach PID 1 (the server binary is
