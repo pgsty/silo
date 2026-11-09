@@ -119,7 +119,10 @@ func (a *ActiveWorkerStat) update() {
 	if a == nil {
 		return
 	}
-	a.Curr = globalReplicationPool.Get().ActiveWorkers()
+	a.Curr = 0
+	if pool := globalReplicationPool.Get(); pool != nil {
+		a.Curr = pool.ActiveWorkers()
+	}
 	a.hist.Update(int64(a.Curr))
 	a.Avg = float32(a.hist.Mean())
 	a.Max = int(a.hist.Max())

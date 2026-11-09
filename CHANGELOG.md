@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Embed Console 2.7.0 source `26ce922424f1`, including its ten-language UI,
+  rebuilt frontend assets, Swagger array-validation fixes and Redoc routing.
+  Select the published mcli 20261109 source `e1d4cc5abfe0` and silo-pkg
+  v3.16.0 directly in the maintained dependency graph.
+- Adopt go-jose/v4 v4.1.9, cpuid/v2 v2.4.2, YAML v3.0.6 and gjson v1.20.1,
+  plus Console's runtime/server-middleware v0.33.4. Preserve Go 1.27.3, the
+  verified upstream minio-go commit, networking/crypto security floors and
+  terminal-width/NetBSD compatibility selections.
+- Update NATS credentials to jwt/v2 v2.8.3 and nkeys v0.4.17, including
+  rejection of identity-point and small-order public keys. Use nats-server
+  v2.15.2 for notification integration tests.
+- Update Google Cloud auth to v0.24.3 and oauth2adapt to v0.3.1 for REST
+  request validation and AWS FIPS endpoint signing fixes.
+- Bundle verified mcli 20261109 archives in source container builds and use
+  that release by default in the integration-test client installer.
+- Prevent replication worker metrics from panicking when the replication
+  pool is absent, while retaining historical averages and peak counts.
+
 ## RELEASE.2026-10-26T00-00-00Z
 
 Package version: `20261026000000.0.0`; published from source `c3ad836aed0d`.
