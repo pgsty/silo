@@ -8,10 +8,30 @@
 # seeds fresh volumes from the image-layer mountpoint, no entrypoint
 # exists to repair ownership at runtime, and 0777 is what keeps every
 # privilege mode working, --user included.
-FROM busybox:1.37.0 AS prep
+FROM busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec AS prep
 RUN mkdir -p /prep/data && chmod 0777 /prep/data
 
-FROM gcr.io/distroless/static-debian12:latest
+# Debian's bundle in distroless still trusts the roots the classic image
+# blocklists. Build the same bundle as Dockerfile.goreleaser so both variants
+# trust the same roots; it is architecture-neutral, so build it natively.
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/ubi:latest@sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3 AS certs
+# Native root blocklist mitigation: https://access.redhat.com/security/vulnerabilities/RHSB-2026-012
+RUN dnf -y install ca-certificates && \
+    if [ -d /etc/pki/ca-trust/source/blocklist ]; then \
+      blocklist=/etc/pki/ca-trust/source/blocklist; \
+    else \
+      blocklist=/etc/pki/ca-trust/source/blacklist; \
+    fi && \
+    trust extract --overwrite --format=pem-bundle \
+      --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' \
+      "$blocklist/Comodo_AAA_Services_root.pem" && \
+    trust extract --overwrite --format=pem-bundle \
+      --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' \
+      "$blocklist/emSign_ECC_Root_CA_-_G3.pem" && \
+    update-ca-trust && \
+    cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tmp/ca-certificates.crt
+
+FROM gcr.io/distroless/static-debian12:latest@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
 
 LABEL org.opencontainers.image.title="Silo" \
       org.opencontainers.image.description="S3-Interface Libre Object Storage (distroless)" \
@@ -28,6 +48,8 @@ ENV MINIO_ACCESS_KEY_FILE=access_key \
     MINIO_CONFIG_ENV_FILE=config.env \
     HOME=/tmp
 
+# The only file under /etc/ssl/certs, so replacing it is sufficient.
+COPY --from=certs /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --chmod=0755 silo /usr/bin/silo
 # COPY of a directory copies its contents, not the directory entry, so an
 # empty /prep/data would arrive as a default root:0755 /data and non-root
