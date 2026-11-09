@@ -43,6 +43,11 @@ const (
 	// restoreTakeoverWait bounds how long a POST waits for the restore lock
 	// of its version. A running restore holds it for its whole run.
 	restoreTakeoverWait = 2 * time.Second
+	// restoreResetAttemptTimeout bounds the synchronous cleanup attempt made
+	// after a restore fails. A caller whose context has ended must not wait for
+	// another object operation to release the restore lock; the recovery loop
+	// below retries the cleanup after this attempt gives up.
+	restoreResetAttemptTimeout = 100 * time.Millisecond
 	// restoreCleanupTimeout bounds each status reset and convergence pass.
 	restoreCleanupTimeout = time.Minute
 )
@@ -639,6 +644,10 @@ func (z *erasureServerPools) recoverRestoreStatus(bucket, object string, opts Ob
 func (z *erasureServerPools) resetRestoreStatus(bucket, object string, opts ObjectOptions) error {
 	ctx, cancel := context.WithTimeout(GlobalContext, restoreCleanupTimeout)
 	defer cancel()
+	return z.resetRestoreStatusWithContext(ctx, bucket, object, opts)
+}
+
+func (z *erasureServerPools) resetRestoreStatusWithContext(ctx context.Context, bucket, object string, opts ObjectOptions) error {
 	lk := z.restoreLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {

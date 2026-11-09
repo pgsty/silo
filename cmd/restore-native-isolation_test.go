@@ -455,7 +455,13 @@ func TestRestoreRecoversStrandedMarker(t *testing.T) {
 						t.Fatal(lerr)
 					}
 					ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+					start := time.Now()
 					err = r.z.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
+					// The canceled caller must not wait for the minute-long
+					// background cleanup deadline before releasing its lock.
+					if elapsed := time.Since(start); elapsed > 5*time.Second {
+						t.Errorf("canceled restore blocked on marker cleanup for %s", elapsed)
+					}
 					cancel()
 					lk.Unlock(lkctx)
 				} else {

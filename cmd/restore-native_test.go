@@ -263,7 +263,13 @@ func TestNativeRestoreWithoutOuterLock(t *testing.T) {
 			before := nativeRestoreSnapshot(t, r)
 			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 			defer cancel()
+			start := time.Now()
 			err = er.RestoreTransitionedObject(ctx, r.bucket, r.object, nativeRestoreOptions(r, oi.VersionID))
+			// Failure cleanup must return while this caller still holds the
+			// object lock, leaving marker recovery to the background retry.
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Errorf("restore blocked on failure cleanup for %s", elapsed)
+			}
 			if err == nil {
 				t.Error("restore wrote through another caller's lock")
 			}

@@ -48,6 +48,8 @@ Native restore:
   than one pool no longer hang, stay in progress or change the restored version
   ([#289](https://github.com/pgsty/silo/issues/289)), and a failed ordinary
   multipart completion stays usable ([#327](https://github.com/pgsty/silo/issues/327)).
+  A failed or canceled restore returns at once and clears its marker in the
+  background, instead of waiting up to a minute for the object lock.
 
 Locking, conditional writes and storage:
 

@@ -793,22 +793,47 @@ func (er erasureObjects) RestoreTransitionedObject(ctx context.Context, bucket, 
 		return lkctx, func() { lk.Unlock(lkctx) }, nil
 	}
 	clearMarker := func() {
-		ctx, cancel := context.WithTimeout(GlobalContext, restoreCleanupTimeout)
-		defer cancel()
-		lkctx, unlock, err := lock(ctx)
-		if err != nil {
-			storageLogIf(ctx, fmt.Errorf("Unable to clear the restore status of %s/%s(%s): %w", bucket, object, opts.VersionID, err))
+		tryClear := func(ctx context.Context) error {
+			lkctx, unlock, err := lock(ctx)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			versionID := opts.VersionID
+			if a := opts.Transition.attempt; a != nil {
+				versionID = a.VersionID
+			}
+			err = er.clearRestoreStatus(lkctx.Context(), bucket, object, versionID, opts.Transition.attempt)
+			if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrMethodNotAllowed(err) {
+				return nil
+			}
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(GlobalContext, restoreResetAttemptTimeout)
+		err := tryClear(ctx)
+		cancel()
+		if err == nil {
 			return
 		}
-		defer unlock()
-		versionID := opts.VersionID
-		if a := opts.Transition.attempt; a != nil {
-			versionID = a.VersionID
-		}
-		if err := er.clearRestoreStatus(lkctx.Context(), bucket, object, versionID, opts.Transition.attempt); err != nil &&
-			!isErrObjectNotFound(err) && !isErrVersionNotFound(err) && !isErrMethodNotAllowed(err) {
-			storageLogIf(ctx, fmt.Errorf("Unable to clear the restore status of %s/%s(%s): %w", bucket, object, versionID, err))
-		}
+
+		go func() {
+			var lastErr error
+			for _, delay := range restoreRecoveryDelays {
+				select {
+				case <-GlobalContext.Done():
+					return
+				case <-time.After(delay):
+				}
+				ctx, cancel := context.WithTimeout(GlobalContext, restoreCleanupTimeout)
+				lastErr = tryClear(ctx)
+				cancel()
+				if lastErr == nil {
+					return
+				}
+			}
+			storageLogIf(GlobalContext, fmt.Errorf("Unable to clear the restore status of %s/%s(%s): %w", bucket, object, opts.VersionID, lastErr))
+		}()
 	}
 	return er.restoreVersion(ctx, bucket, object, opts, restoreHooks{lock: lock, clear: clearMarker})
 }
@@ -835,7 +860,10 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 	opts.SkipDecommissioned = true
 	opts.NoLock = true
 	clearMarker := func() {
-		if err := z.resetRestoreStatus(bucket, object, opts); err != nil {
+		ctx, cancel := context.WithTimeout(GlobalContext, restoreResetAttemptTimeout)
+		err := z.resetRestoreStatusWithContext(ctx, bucket, object, opts)
+		cancel()
+		if err != nil {
 			z.recoverRestoreStatus(bucket, object, opts)
 		}
 	}
