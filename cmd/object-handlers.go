@@ -3193,9 +3193,12 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 	vID := opts.VersionID
 	if replica {
 		opts.SetReplicaStatus(replication.Replica)
-		if opts.VersionPurgeStatus().Empty() {
-			// opts.VersionID holds delete marker version ID to replicate and not yet present on disk
+		if opts.DeleteMarker && opts.VersionPurgeStatus().Empty() {
+			// opts.VersionID names the delete marker to replicate, not yet
+			// present here. It must not replace a stored version this site
+			// protects; a replicated purge keeps the retention check below.
 			vID = ""
+			opts.RefuseLockedOverwrite = true
 		}
 	}
 	opts.SetEvalRetentionBypassFn(func(goi ObjectInfo, gerr error) (err error) {
