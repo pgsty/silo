@@ -74,7 +74,7 @@ jobs:
       - name: Gate release on Object Lock authorization and overwrite tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
-        run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
+        run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|ReplicaDeleteObjectLock|PoolsReplicaDeleteObjectLock|BulkDeleteDirectoryObjectLock|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
 
       - name: Compute release variables
         env:
