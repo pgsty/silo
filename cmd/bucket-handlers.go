@@ -494,6 +494,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	}
 
 	deleteResults := make([]deleteResult, len(deleteObjectsReq.Objects))
+	duplicateOf := make(map[int]int)
 
 	vc, _ := globalBucketVersioningSys.Get(bucket)
 	oss := make([]*objSweeper, len(deleteObjectsReq.Objects))
@@ -536,7 +537,19 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			VersionSuspended: vc.Suspended(),
 		}
 
-		if replicateDeletes || object.VersionID != "" && hasLockEnabled || !globalTierConfigMgr.Empty() {
+		// Physical version deletes in a locked bucket are checked by the
+		// single-object path below, while its mutation lock is held. A lookup
+		// here could miss a later protection update or a protected pool copy.
+		if hasLockEnabled && object.VersionID != "" {
+			if first, ok := objectsToDelete[object]; ok {
+				duplicateOf[index] = first
+			} else {
+				objectsToDelete[object] = index
+			}
+			continue
+		}
+
+		if replicateDeletes || !globalTierConfigMgr.Empty() {
 			if !globalTierConfigMgr.Empty() && object.VersionID == "" && opts.VersionSuspended {
 				opts.VersionID = nullVersionID
 			}
@@ -565,21 +578,10 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 				object.ReplicateDecisionStr = dsc.String()
 			}
 		}
-		if object.VersionID != "" && hasLockEnabled {
-			if err := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); err != nil {
-				apiErr := toAPIError(ctx, err)
-				deleteResults[index].errInfo = DeleteError{
-					Code:      apiErr.Code,
-					Message:   apiErr.Description,
-					Key:       object.ObjectName,
-					VersionID: object.VersionID,
-				}
-				continue
-			}
-		}
-
 		// Avoid duplicate objects, we use map to filter them out.
-		if _, ok := objectsToDelete[object]; !ok {
+		if first, ok := objectsToDelete[object]; ok {
+			duplicateOf[index] = first
+		} else {
 			objectsToDelete[object] = index
 		}
 	}
@@ -598,10 +600,57 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	ctx = bgContext(ctx)
 
 	deleteList := toNames(objectsToDelete)
-	dObjects, errs := deleteObjectsFn(ctx, bucket, deleteList, ObjectOptions{
-		PrefixEnabledFn:  vc.PrefixEnabled,
-		VersionSuspended: vc.Suspended(),
-	})
+	dObjects := make([]DeletedObject, len(deleteList))
+	errs := make([]error, len(deleteList))
+	bulk := make([]ObjectToDelete, 0, len(deleteList))
+	bulkIndex := make([]int, 0, len(deleteList))
+	for i, object := range deleteList {
+		if !hasLockEnabled || object.VersionID == "" {
+			bulk = append(bulk, object)
+			bulkIndex = append(bulkIndex, i)
+			continue
+		}
+		reqInfo.ObjectName, reqInfo.VersionID = object.ObjectName, object.VersionID
+		opts := ObjectOptions{
+			VersionID:        object.VersionID,
+			Versioned:        vc.PrefixEnabled(object.ObjectName),
+			VersionSuspended: vc.Suspended(),
+		}
+		index := objectsToDelete[object]
+		if !globalTierConfigMgr.Empty() {
+			oss[index] = newObjSweeper(bucket, object.ObjectName).WithVersion(object.VersionID).WithVersioning(opts.Versioned, opts.VersionSuspended)
+		}
+		opts.SetEvalRetentionBypassFn(func(oi ObjectInfo, err error) error {
+			return enforceRetentionBypassForDelete(ctx, r, bucket, object, oi, err)
+		})
+		opts.SetEvalMetadataFn(func(oi *ObjectInfo, err error) (ReplicateDecision, error) {
+			if err == nil && oss[index] != nil {
+				oss[index].SetTransitionState(oi.TransitionedObject)
+			}
+			if replicateDeletes {
+				return checkReplicateDelete(ctx, bucket, object, *oi, opts, err), nil
+			}
+			return ReplicateDecision{}, nil
+		})
+		// DeleteObject merges protection across pools before evaluating these
+		// callbacks and holds the same lock as retention and legal-hold writes.
+		oi, err := objectAPI.DeleteObject(ctx, bucket, object.ObjectName, opts)
+		dObjects[i] = DeletedObject{
+			ObjectName:       object.ObjectName,
+			VersionID:        object.VersionID,
+			ReplicationState: oi.ReplicationState(),
+		}
+		errs[i] = err
+	}
+	if len(bulk) > 0 {
+		deleted, bulkErrs := deleteObjectsFn(ctx, bucket, bulk, ObjectOptions{
+			PrefixEnabledFn:  vc.PrefixEnabled,
+			VersionSuspended: vc.Suspended(),
+		})
+		for i, index := range bulkIndex {
+			dObjects[index], errs[index] = deleted[i], bulkErrs[i]
+		}
+	}
 
 	// Are all objects saying bucket not found?
 	if isAllBucketsNotFound(errs) {
@@ -610,23 +659,11 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	}
 
 	for i := range errs {
-		// DeleteMarkerVersionID is not used specifically to avoid
-		// lookup errors, since DeleteMarkerVersionID is only
-		// created during DeleteMarker creation when client didn't
-		// specify a versionID.
-		objToDel := ObjectToDelete{
-			ObjectV: ObjectV{
-				ObjectName: decodeDirObject(dObjects[i].ObjectName),
-				VersionID:  dObjects[i].VersionID,
-			},
-			VersionPurgeStatus:            dObjects[i].VersionPurgeStatus(),
-			VersionPurgeStatuses:          dObjects[i].ReplicationState.VersionPurgeStatusInternal,
-			DeleteMarkerReplicationStatus: dObjects[i].ReplicationState.ReplicationStatusInternal,
-			ReplicateDecisionStr:          dObjects[i].ReplicationState.ReplicateDecisionStr,
-		}
-		dindex := objectsToDelete[objToDel]
+		// Match by the input identity: replication decisions may have changed
+		// under the mutation lock, and a missing version has no stored identity.
+		dindex := objectsToDelete[deleteList[i]]
 		if errs[i] == nil || isErrObjectNotFound(errs[i]) || isErrVersionNotFound(errs[i]) {
-			if replicateDeletes {
+			if replicateDeletes && (!hasLockEnabled || deleteList[i].VersionID == "") {
 				dObjects[i].ReplicationState = deleteList[i].ReplicationState()
 			}
 			deleteResults[dindex].delInfo = dObjects[i]
@@ -640,20 +677,28 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			VersionID: deleteList[i].VersionID,
 		}
 	}
+	for index, first := range duplicateOf {
+		deleteResults[index] = deleteResults[first]
+	}
 
 	// Generate response
 	deleteErrors := make([]DeleteError, 0, len(deleteObjectsReq.Objects))
 	deletedObjects := make([]DeletedObject, 0, len(deleteObjectsReq.Objects))
-	for _, deleteResult := range deleteResults {
+	eventObjects := make([]DeletedObject, 0, len(deleteObjectsReq.Objects))
+	for index, deleteResult := range deleteResults {
+		// Storage normalizes a directory to the null version. The response
+		// retains the caller's version identity, including an explicit null.
+		if isDirObject(deleteObjectsReq.Objects[index].ObjectName) {
+			deleteResult.delInfo.VersionID = deleteObjectsReq.Objects[index].VersionID
+			deleteResult.errInfo.VersionID = deleteObjectsReq.Objects[index].VersionID
+		}
 		if deleteResult.errInfo.Code != "" {
 			deleteErrors = append(deleteErrors, deleteResult.errInfo)
 		} else {
-			// All deletes on directory objects was with `nullVersionID`.
-			// Remove it from response.
-			if isDirObject(deleteResult.delInfo.ObjectName) && deleteResult.delInfo.VersionID == nullVersionID {
-				deleteResult.delInfo.VersionID = ""
-			}
 			deletedObjects = append(deletedObjects, deleteResult.delInfo)
+			if _, duplicate := duplicateOf[index]; !duplicate {
+				eventObjects = append(eventObjects, deleteResult.delInfo)
+			}
 		}
 	}
 
@@ -662,7 +707,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 
 	// Write success response.
 	writeSuccessResponseXML(w, encodedSuccessResponse)
-	for _, dobj := range deletedObjects {
+	for _, dobj := range eventObjects {
 		if dobj.ObjectName == "" {
 			continue
 		}
@@ -705,8 +750,8 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	}
 
 	// Clean up transitioned objects from remote tier
-	for _, os := range oss {
-		if os == nil { // skip objects that weren't deleted due to invalid versionID etc.
+	for index, os := range oss {
+		if os == nil || deleteResults[index].errInfo.Code != "" { // Sweep only successful deletions.
 			continue
 		}
 		os.Sweep()
