@@ -18,8 +18,8 @@ ENV CGO_ENABLED=0
 
 ARG MC_REPO=pgsty/mc
 ARG MC_VERSION=RELEASE.2026-10-26T00-00-00Z
-ARG MC_AMD64_SHA256=54bd131039dad6677f083a75207b28f82818c067c8e65fae1973f51510d268e1
-ARG MC_ARM64_SHA256=9bb294f1912f8c6b9ac08c9a0b8d2964b86306a7c440b987ee5f0570d18de3c5
+ARG MC_AMD64_SHA256=e86295bb11ed59369c0560f030d59abd42fb64a376b1d7e9799ec2e8596ebf64
+ARG MC_ARM64_SHA256=47b1a558f766f26bef5beeedd5300e082bcdec07a5e7d4a16f5f9d168f5275d1
 
 RUN apk add -U --no-cache \
     ca-certificates \
@@ -65,7 +65,9 @@ RUN apk add -U --no-cache \
       echo "No mc or mcli binary found in archive:"; ls -la /tmp/mcli-extract/; exit 1; \
     fi && \
     chmod +x /go/bin/mcli && \
-    ln -sf mcli /go/bin/mc
+    ln -sf mcli /go/bin/mc && \
+    mkdir -p /go/share/mcli && \
+    cp /tmp/mcli-extract/LICENSE /tmp/mcli-extract/NOTICE /tmp/mcli-extract/CREDITS /go/share/mcli/
 
 FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3 AS certs
 # Native root blocklist mitigation: https://access.redhat.com/security/vulnerabilities/RHSB-2026-012
@@ -107,6 +109,8 @@ ENV MINIO_ACCESS_KEY_FILE=access_key \
 COPY --from=certs /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY silo /usr/bin/silo
 COPY --from=build /go/bin/mcli /usr/bin/mcli
+# mcli's own legal files, from the same verified archive as the binary.
+COPY --from=build /go/share/mcli /licenses/mcli
 COPY --from=curl-build /go/bin/curl /usr/bin/curl
 COPY --from=curl-build /go/share/curl /licenses/curl
 COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
