@@ -17,6 +17,8 @@
   request validation and AWS FIPS endpoint signing fixes.
 - Bundle verified mcli 20261109 archives in source container builds and use
   that release by default in the integration-test client installer.
+- Prevent replication worker metrics from panicking when the replication
+  pool is absent, while retaining historical averages and peak counts.
 
 ## RELEASE.2026-10-26T00-00-00Z
 
