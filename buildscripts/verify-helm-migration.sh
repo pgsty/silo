@@ -112,8 +112,17 @@ helm_run template my-release "${new_chart}" \
 
 go run ./buildscripts/helm-migration-guard "${old_render}" "${new_render}"
 
+# The templates deploy values.image.tag, not appVersion; a release must move both.
+chart_version="$(sed -n 's/^version: *//p' helm/silo/Chart.yaml)"
+app_version="$(sed -n 's/^appVersion: *//p' helm/silo/Chart.yaml)"
+image_tag="$(sed -n '/^image:/,/^[^ ]/s/^  tag: *//p' helm/silo/values.yaml)"
+if [ -z "${app_version}" ] || [ "${image_tag}" != "${app_version}" ]; then
+	echo "helm/silo: image.tag '${image_tag}' must equal appVersion '${app_version}'" >&2
+	exit 1
+fi
+
 helm_run package "${new_chart}" --destination "${output_dir}" >/dev/null
-test -s "${work_dir}/silo-7.0.3.tgz"
+test -s "${work_dir}/silo-${chart_version}.tgz"
 if find "${work_dir}" -maxdepth 1 -type f -name 'minio-*.tgz' | grep -q .; then
 	echo "Helm packaging emitted a legacy MinIO chart name" >&2
 	exit 1
