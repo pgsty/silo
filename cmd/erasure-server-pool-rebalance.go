@@ -779,7 +779,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// if all versions were rebalanced, we can delete the object versions.
 			if rebalanced == len(fivs.Versions) {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceRemoveObject, poolIdx, bucket, entry.name)
-				err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions, expired)
+				_, err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions, expired)
 				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {

@@ -271,16 +271,17 @@ func (z *erasureServerPools) applyMigrationExpiry(ctx context.Context, bucket, o
 // in the source until the ordinary expiry path has deleted them: that path
 // owns replication state and tier cleanup, and it re-evaluates the current
 // lifecycle rule. A migration cleanup must never turn an asynchronous ILM
-// decision into an unconditional physical purge.
-func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) error {
+// decision into an unconditional physical purge. It returns how many source
+// versions it deleted.
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) (removed int, err error) {
 	if err := z.applyMigrationExpiry(ctx, bucket, object, source, expired); err != nil {
-		return err
+		return 0, err
 	}
 	object = encodeDirObject(object)
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
@@ -294,7 +295,7 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 			continue
 		}
 		if err != nil {
-			return err
+			return removed, err
 		}
 		var src *ObjectInfo
 		var retained []PoolObjInfo
@@ -309,7 +310,7 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 			continue
 		}
 		if !src.ModTime.Equal(version.ModTime) || src.DeleteMarker != version.Deleted {
-			return PreConditionFailed{}
+			return removed, PreConditionFailed{}
 		}
 		if isExpiredVersion(expired, version) {
 			// The logical expiry path owns this version. Keeping the source is
@@ -319,17 +320,20 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		// Successful movement is not enough if the destination changed again.
 		// Keep the source unless another copy still preserves its read result.
 		if len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime) {
-			return PreConditionFailed{}
+			return removed, PreConditionFailed{}
 		}
 		_, err = z.serverPools[source].DeleteObject(ctx, bucket, object, ObjectOptions{
 			VersionID: vid, NoLock: true, NoAuditLog: true,
 			SkipFreeVersion: true, // preserve the old prefix cleanup's tier-GC behavior
 		})
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			return err
+			return removed, err
+		}
+		if err == nil {
+			removed++
 		}
 	}
-	return nil
+	return removed, nil
 }
 
 // ilmDeletesVersionOnly reports whether the ILM action queued for a version
