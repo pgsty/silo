@@ -1,6 +1,109 @@
 # Changelog
 
-## Unreleased
+## RELEASE.2026-11-09T00-00-00Z
+
+Package version: `20261109000000.0.0`. Publication status and artifacts are
+listed in [GitHub Releases](https://github.com/pgsty/silo/releases). This
+section covers the changes after the published 20261026 source `c3ad836aed0d`.
+Most fixes come from reports and patches by
+[@botdeniska](https://github.com/botdeniska); see [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
+Lifecycle, multi-pool and tiering:
+
+- Decide an ILM expiry under the object lock against the versions of the key
+  in all pools, and refuse one that does not hold for the whole object or whose
+  history or lock protection lacks an authoritative quorum. Decommission and
+  rebalance move such versions instead of dropping them, and an approved
+  version expiry deletes every copy ([#278](https://github.com/pgsty/silo/issues/278)).
+- Expire the restored copy of a current version instead of the object
+  ([#281](https://github.com/pgsty/silo/issues/281)). Keep lifecycle delete-all
+  (`ExpiredObjectAllVersions`, `DelMarkerExpiration`, batch expiration with
+  `retainVersions: 0`) on the expired key instead of the keys below it; a key
+  with a tiered or Object Lock protected version is refused
+  ([#297](https://github.com/pgsty/silo/issues/297)).
+- Stop taking the free version of a deleted tiered version for a version
+  ([#263](https://github.com/pgsty/silo/issues/263)), apply rules whose only
+  action is `DelMarkerExpiration` ([#268](https://github.com/pgsty/silo/issues/268)),
+  and report and account only the removals that happened
+  ([#305](https://github.com/pgsty/silo/issues/305)).
+- Keep remote tier data that another pool still references after a version
+  expiry or tier cleanup ([#306](https://github.com/pgsty/silo/issues/306),
+  [#308](https://github.com/pgsty/silo/issues/308)). Heal versions whose queued
+  expiry is refused ([#303](https://github.com/pgsty/silo/issues/303)), and read
+  a key's history once in migration prechecks ([#304](https://github.com/pgsty/silo/issues/304)).
+- Decommission and rebalance: move objects whose copies have two erasure
+  layouts ([#261](https://github.com/pgsty/silo/issues/261)) and ILM-expired
+  current versions ([#265](https://github.com/pgsty/silo/issues/265)), continue
+  with later buckets when one cannot finish and keep cancellation
+  ([#307](https://github.com/pgsty/silo/issues/307)), and do not panic when a
+  rebalance stop finds no metadata ([#270](https://github.com/pgsty/silo/issues/270)).
+- Do not replicate the delete markers and version purges that lifecycle
+  creates, as in S3. [PR #240](https://github.com/pgsty/silo/pull/240) remains
+  open as a proposal.
+
+Native restore:
+
+- Restore in two phases, without holding the object write lock during the tier
+  download ([#284](https://github.com/pgsty/silo/issues/284)). Restores with more
+  than one pool no longer hang, stay in progress or change the restored version
+  ([#289](https://github.com/pgsty/silo/issues/289)), and a failed ordinary
+  multipart completion stays usable ([#327](https://github.com/pgsty/silo/issues/327)).
+
+Locking, conditional writes and storage:
+
+- Lock every write and delete of a single pool in the object's own erasure set
+  ([#298](https://github.com/pgsty/silo/issues/298)). Fix CopyObject waiting on
+  its own lock for normalized aliases ([#299](https://github.com/pgsty/silo/issues/299))
+  and starving its destination while waiting for the source
+  ([#300](https://github.com/pgsty/silo/issues/300)); delete the set groups of a
+  bulk delete concurrently ([#301](https://github.com/pgsty/silo/issues/301)).
+- Evaluate `If-Match` and `If-None-Match` of a multi-pool CreateMultipartUpload
+  against the current object ([#291](https://github.com/pgsty/silo/issues/291),
+  [PR #292](https://github.com/pgsty/silo/pull/292)).
+- Answer a retryable `503` instead of `NoSuchKey` when a node sees only some
+  drives of an existing object ([#302](https://github.com/pgsty/silo/issues/302)), remove the empty object
+  directory of a failed write ([#285](https://github.com/pgsty/silo/issues/285),
+  [PR #286](https://github.com/pgsty/silo/pull/286)), classify `xl.meta`
+  checksum failures for healing ([#309](https://github.com/pgsty/silo/issues/309)),
+  and keep a heal dry run from deleting data
+  ([PR #280](https://github.com/pgsty/silo/pull/280), thanks to
+  [@dihmandrake](https://github.com/dihmandrake)).
+
+Object Lock, IAM and batch jobs:
+
+- Keep the target's legal hold and retention on a replicated delete; a source
+  purge that bypassed GOVERNANCE retention is refused by a target copy that
+  still carries it, and the source retries. Check a directory object's lock
+  before a bulk delete removes its null version.
+- Batch jobs enforce the submitter's data permissions throughout execution and
+  leave Object Lock protected versions alone ([#310](https://github.com/pgsty/silo/issues/310),
+  [#311](https://github.com/pgsty/silo/issues/311)). Key rotation keeps other
+  pool copies readable ([#312](https://github.com/pgsty/silo/issues/312)).
+  Transient failures pause work instead of ending it, saved jobs are found
+  after a failed startup scan, and running replication resumes
+  ([#313](https://github.com/pgsty/silo/issues/313), [#314](https://github.com/pgsty/silo/issues/314),
+  [#324](https://github.com/pgsty/silo/issues/324)). A completed expiration job
+  stays completed after a restart ([#315](https://github.com/pgsty/silo/issues/315)).
+  Authorization skips deleted policies a mapping still names, refuses a job
+  only for a Deny that needs request context, and survives metadata edits and
+  LDAP refreshes that keep the credential
+  ([#318](https://github.com/pgsty/silo/issues/318)–[#320](https://github.com/pgsty/silo/issues/320)).
+  Live metrics keep pause reasons and skipped or refused counts
+  ([#325](https://github.com/pgsty/silo/issues/325)), and `make check-gen`
+  leaves the runtime policy snapshot alone ([#326](https://github.com/pgsty/silo/issues/326)).
+- IAM refuses incomplete policy loads, keeps cached authentication available
+  during lazy loads, and applies edits, LDAP group refreshes and service-account
+  creation to the stored record, so a stale node cannot restore old credentials
+  or resurrect deleted identities ([#316](https://github.com/pgsty/silo/issues/316),
+  [#317](https://github.com/pgsty/silo/issues/317), [#321](https://github.com/pgsty/silo/issues/321)–[#323](https://github.com/pgsty/silo/issues/323)).
+- Log in LDAP users with long DNs on erasure sets, and root to the embedded
+  Console with LDAP enabled ([#271](https://github.com/pgsty/silo/issues/271),
+  [#272](https://github.com/pgsty/silo/issues/272)). Keep audit and logger
+  webhook targets running on every server after a configuration reload
+  ([#259](https://github.com/pgsty/silo/issues/259), reported by
+  [@haf](https://github.com/haf)).
+
+Components and packaging:
 
 - Embed the published Console v2.7.0 source `4e91ae506e70`, including its
   ten-language UI, rebuilt frontend assets, Swagger array-validation fixes,
@@ -21,6 +124,31 @@
   that release by default in the integration-test client installer.
 - Prevent replication worker metrics from panicking when the replication
   pool is absent, while retaining historical averages and peak counts.
+- Give the distroless image the same CA roots as the standard image, and ship
+  mcli's license files in both ([#295](https://github.com/pgsty/silo/pull/295)).
+- Deploy SILO and mcli `RELEASE.2026-11-09T00-00-00Z` by default from Helm
+  chart 7.0.4; the server image tag was left at 20260916 before
+  ([#296](https://github.com/pgsty/silo/issues/296)).
+
+Upgrade notes:
+
+- A single pool whose erasure sets do not all use the same hosts (with the
+  automatic layout, 18 or more hosts) needs a drained restart, not a rolling
+  upgrade: old and new nodes lock deletes and copies in different sets and do
+  not exclude each other. Stop every old process before a new one serves.
+- During a rolling upgrade, upgraded nodes answer `POST ?restore` with `503`
+  while any peer is old or unreachable. Pause new restores until every node is
+  upgraded. Multi-pool lifecycle protection is complete only after a full
+  upgrade.
+- `helm upgrade --reuse-values` keeps the previously stored `image.tag`; set it
+  explicitly when upgrading such a release.
+
+Known issues: `ListMultipartUploads` prefix and paging
+([#79](https://github.com/pgsty/silo/issues/79)), multi-site delete-marker purge
+([#217](https://github.com/pgsty/silo/issues/217)), replayed bucket creation
+under site replication ([PR #241](https://github.com/pgsty/silo/pull/241)), and
+`403` instead of the server error for reads allowed only by object tags while
+the object is unreadable ([#293](https://github.com/pgsty/silo/issues/293)).
 
 ## RELEASE.2026-10-26T00-00-00Z
 

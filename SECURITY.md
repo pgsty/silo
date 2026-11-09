@@ -38,7 +38,7 @@ For vulnerabilities in this fork:
 
 1. Follow the fork-specific expectations in [VULNERABILITY_REPORT.md](VULNERABILITY_REPORT.md).
 2. Prefer this repository's [private GitHub security advisory](https://github.com/pgsty/silo/security/advisories/new) workflow.
-3. If you cannot use GitHub private reporting, email [ron@pgsty.com](mailto:ron@pgsty.com)
+3. If you cannot use GitHub private reporting, email [ron@pgsty.com](mailto:ron@pgsty.com) or rh@vonng.com
    directly. Do not publish vulnerability details or exploit code in public
    issues or pull requests.
 4. If you confirm the issue also affects upstream `minio/minio`, report it upstream separately.

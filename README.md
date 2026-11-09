@@ -32,28 +32,25 @@
 > [!IMPORTANT]
 > **PGSTY Silo** (hereinafter “Silo”) is an independent, community-maintained fork of the open-source MinIO server, published by [Pigsty](https://pigsty.io) from [`pgsty/silo`](https://github.com/pgsty/silo). It is not affiliated with, endorsed by, or sponsored by MinIO, Inc. “MinIO” is used only to identify the upstream project and compatibility lineage.
 
-> [!NOTE]
-> Renamed from `pgsty/minio` to `pgsty/silo`, default branch `master` → `main`, on 2026-08-06. Artifacts under the original MinIO identity stay published on the archived [`minio`](https://github.com/pgsty/silo/tree/minio) branch and in releases up to [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z).
-
-## SILO 20261026000000
-
-[SILO 20261026000000](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-26T00-00-00Z) is available as platform archives, Linux packages, and standard or distroless Docker images for amd64 and arm64. The release tag is `RELEASE.2026-10-26T00-00-00Z`; the package version is `20261026000000.0.0`, built from source `c3ad836aed0d`.
-
-This release fixes LDAP long-DN login, IAM policy refresh, multi-pool deletion safety, tiered-object expiry, multipart replication checksums, and remote rollback-option propagation. It embeds Console v2.5.1 (`fff1618d9abb`) and uses silo-pkg v3.15.2, Go 1.27.3, and upstream minio-go `v7.4.2-0.20261025165926-320af050c445`. Use mcli 20261026 for administration; the container images bundle it as `mcli`.
-
-The Server IAM cache repair enables Console's **Reset to default** action. Existing storage timeouts and cancellation behavior remain: a timeout does not prove that a disk operation stopped or a write did not commit. Read the [coordinated release notes](https://silo.pgsty.com/blog/release/silo-20261026/) and [remaining storage limits](CHANGELOG.md#release2026-10-26t00-00-00z) before upgrading. See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the people behind the code, reports, and documentation.
-
 ## Overview
 
 PGSTY SILO keeps one maintained release line of the open-source MinIO server alive after upstream ended community distribution: builds, packages, multi-arch images, security fixes, and the full web console. Pigsty runs it in production as its PostgreSQL backup repository.
 
 It follows one rule — **the product and its delivery surfaces are renamed; the protocol and your data are not.** Everything else lives on [silo.pgsty.com](https://silo.pgsty.com/).
 
-**Related:** [`pgsty/mc`](https://github.com/pgsty/mc) client (shipped as `mcli`) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
+**Related:** [`pgsty/mc`](https://github.com/pgsty/mc) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/kes`](https://github.com/pgsty/kes) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
 
 <p align="center">
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo Console">
 </p>
+
+#### SILO 20261109
+
+> [!WARNING]
+> [SILO 20261109](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z) fixes bugs and security vulnerabilities. We strongly recommend scheduling an upgrade to reduce security risks.
+
+> [!NOTE]
+> On 2026-08-06, `pgsty/minio` became `pgsty/silo`, and the default branch changed from `master` to `main`. The last MinIO-branded release is [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) on the [`minio`](https://github.com/pgsty/silo/tree/minio) branch.
 
 ## Quick Start
 
@@ -62,7 +59,7 @@ docker run -d --name silo -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=change-me-long-password \
   -v "$PWD/data:/data" \
-  docker.io/pgsty/silo:RELEASE.2026-10-26T00-00-00Z server /data --console-address ":9001"
+  docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z server /data --console-address ":9001"
 ```
 
 <p align="center">
