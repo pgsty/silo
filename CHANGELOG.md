@@ -76,7 +76,12 @@ Object Lock, IAM and batch jobs:
 - Keep the target's legal hold and retention on a replicated delete; a source
   purge that bypassed GOVERNANCE retention is refused by a target copy that
   still carries it, and the source retries. Check a directory object's lock
-  before a bulk delete removes its null version.
+  before a bulk delete removes its null version. S3 `DeleteObjects` checks
+  physical version removals under the mutation lock and merges protection
+  across pools, including concurrent legal-hold and retention updates. These
+  removals in Object Lock buckets use the single-object path sequentially;
+  large version-purge batches can take longer. Marker creation and ordinary
+  buckets retain the bulk path.
 - Batch jobs enforce the submitter's data permissions throughout execution and
   leave Object Lock protected versions alone ([#310](https://github.com/pgsty/silo/issues/310),
   [#311](https://github.com/pgsty/silo/issues/311)). Key rotation keeps other
@@ -142,6 +147,18 @@ Upgrade notes:
   while any peer is old or unreachable. Pause new restores until every node is
   upgraded. Multi-pool lifecycle protection is complete only after a full
   upgrade.
+- Stop batch submissions and drain or cancel unfinished jobs before changing
+  versions. Unfinished legacy jobs require resubmission after all nodes upgrade;
+  completed jobs stay completed. Submitter-bound manifests and progress reports
+  use a new format that 20261026 cannot execute or resume. Do not downgrade
+  with pending or paused new jobs. An old node can still execute old-format
+  jobs, so mixed-version execution is not protected by the new authorization
+  rules. Preserve job definitions and reconcile completed work before resubmitting.
+- `healthcheck ready` remains a process/dependency probe and can succeed before
+  storage or IAM load. `cluster` reports quorum, which can precede a restarted
+  node reconnecting its remote drives. Before resuming applications, run bounded
+  signed write/read checks through every node; neither HTTP probe alone proves
+  data-path readiness. Preserve peer discovery during bootstrap.
 - `helm upgrade --reuse-values` keeps the previously stored `image.tag`; set it
   explicitly when upgrading such a release.
 
