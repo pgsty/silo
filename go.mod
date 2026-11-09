@@ -4,7 +4,7 @@ go 1.27.3
 
 // Console and MC retain their historical module paths for best-effort upstream
 // compatibility. Pin the maintained PGSTY implementations used by SILO.
-replace github.com/minio/console => github.com/pgsty/silo-console v0.0.0-20261109060514-26ce922424f1
+replace github.com/minio/console => github.com/pgsty/silo-console v0.0.0-20261109114619-4e91ae506e70
 
 replace github.com/minio/mc => github.com/pgsty/mc v0.0.0-20261109021353-e1d4cc5abfe0
 

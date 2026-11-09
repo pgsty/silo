@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- Embed Console 2.7.0 source `26ce922424f1`, including its ten-language UI,
-  rebuilt frontend assets, Swagger array-validation fixes and Redoc routing.
-  Select the published mcli 20261109 source `e1d4cc5abfe0` and silo-pkg
-  v3.16.0 directly in the maintained dependency graph.
+- Embed the published Console v2.7.0 source `4e91ae506e70`, including its
+  ten-language UI, rebuilt frontend assets, Swagger array-validation fixes,
+  Redoc routing, plain-HTTP folder-size and key-copy actions, usage-worker TLS
+  roots and scan budgets, and malformed-multipart rejection. Select the
+  published mcli 20261109 source `e1d4cc5abfe0` and silo-pkg v3.16.0 directly
+  in the maintained dependency graph.
 - Adopt go-jose/v4 v4.1.9, cpuid/v2 v2.4.2, YAML v3.0.6 and gjson v1.20.1,
   plus Console's runtime/server-middleware v0.33.4. Preserve Go 1.27.3, the
   verified upstream minio-go commit, networking/crypto security floors and
