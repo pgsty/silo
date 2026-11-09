@@ -64,6 +64,41 @@ func (z *erasureServerPools) objectPoolInfos(ctx context.Context, bucket, object
 	return copies, nil
 }
 
+// checkCurrentPreconditions evaluates the public write conditions in
+// opts.CheckPrecondFn against the logical current object across pools,
+// including draining pools. The pool that receives a write may be empty or
+// hold a stale copy, so its local state cannot decide the condition. A
+// current delete marker reads as an absent key: If-Match then fails with
+// ObjectNotFound and If-None-Match may proceed. An unreadable pool may hold
+// the newest object; it is not absence, and its error is returned without
+// evaluating the condition. The caller must hold the pools-layer object lock
+// and, once the condition is accepted, clear the callback so the destination
+// does not evaluate it again against its local copy.
+func (z *erasureServerPools) checkCurrentPreconditions(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+	copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{
+		VersionID:        "", // Compare the current object, not the write's version.
+		Versioned:        opts.Versioned,
+		VersionSuspended: opts.VersionSuspended,
+		NoAuditLog:       true,
+	})
+	if err == nil && copies[0].ObjInfo.DeleteMarker {
+		err = toObjectErr(errFileNotFound, bucket, decodeDirObject(object))
+	}
+	switch {
+	case err == nil:
+		if opts.CheckPrecondFn(copies[0].ObjInfo) {
+			return PreConditionFailed{}
+		}
+		return nil
+	case !isErrObjectNotFound(err) && !isErrVersionNotFound(err):
+		return err
+	case opts.HasIfMatch:
+		return err
+	default:
+		return nil
+	}
+}
+
 // checkDataMovementCopies rejects moving a version when another pool holds a
 // newer copy of it, which reads return instead. A cross-pool overwrite can
 // leave such a copy, and a client write can add one while the move copies.
