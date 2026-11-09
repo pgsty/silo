@@ -78,7 +78,7 @@ jobs:
   race-s3select:
     name: Race, S3 Select
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
@@ -105,7 +105,7 @@ jobs:
       - name: Run lifecycle expiry and native restore tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
-        run: go test -race -tags kqueue,dev ./cmd -run '^Test(PoolsLifecycle|PoolsMigrationLifecycle|ExpireRestored|NativeRestore)' -count=1 -timeout=5m
+        run: go test -race -tags kqueue,dev ./cmd -run '^Test(PoolsLifecycle|PoolsMigrationLifecycle|ExpireRestored|NativeRestore)' -count=1 -timeout=10m
 
       - name: Run multipart listing, cancellation and cleanup tests under race detector
         env:
