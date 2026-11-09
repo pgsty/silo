@@ -1,0 +1,12 @@
+version: 2
+
+updates:
+  # Dockerfile.goreleaser and Dockerfile.distroless pin their bases by digest
+  # so a release tag rebuilds from the same bytes. Without this the pins would
+  # silently rot and stop receiving base-image CVE fixes.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
