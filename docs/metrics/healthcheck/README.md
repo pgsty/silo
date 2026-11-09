@@ -29,6 +29,8 @@ healthcheck:
   retries: 5
 ```
 
+`ready` turns healthy as soon as the process accepts connections, before storage and IAM finish loading, so that distributed nodes can reach each other while they start. To hold back a dependent service until the server answers S3 requests (for example Compose `depends_on: condition: service_healthy`), probe `cluster` instead.
+
 `silo healthcheck --maintenance cluster` answers the pre-drain question documented below: exit `0` when the node can be taken down safely, exit `1` (HTTP 412) when doing so would lose HA. Keep the `cluster` checks out of per-container liveness probes — they reflect cluster-wide quorum, not this process.
 
 ## Liveness probe
@@ -50,7 +52,7 @@ livenessProbe:
 
 ## Readiness probe
 
-This probe responds with '200 OK' once the server process is up: it fails only while the request queue is overloaded, or when the health operation against the configured KMS or 'etcd' fails. When readiness probe fails, Kubernetes like platforms turn-off routing to the container.
+This probe responds with '200 OK' once the server process is up: it fails only while the request queue is overloaded, or when the health operation against the configured KMS or 'etcd' fails. It does not wait for storage or IAM to load, because a distributed node must be reachable by its peers before it can load them; the headless service of a StatefulSet should still publish not-ready addresses. When readiness probe fails, Kubernetes like platforms turn-off routing to the container.
 
 ```
 readinessProbe:
