@@ -90,8 +90,8 @@ jobs:
       - name: Run S3 Select tests under race detector
         run: go test -race ./internal/s3select/... -count=1
 
-      - name: Run conditional PUT tests under race detector
-        run: go test -race ./cmd -run '^Test(PoolsConditionalPut|SinglePoolConditionalPutHTTP)' -count=1 -timeout=5m
+      - name: Run conditional PUT and multipart tests under race detector
+        run: go test -race ./cmd -run '^Test(PoolsConditionalPut|SinglePoolConditionalPutHTTP|PoolsMultipartCondition)' -count=1 -timeout=5m
 
       - name: Run multi-pool delete consistency tests under race detector
         run: go test -race ./cmd -run '^Test(Pools(Delete|BulkDelete|RetiringCopyPreservesSharedTierObject)|BulkDeleteQuorumEvidence)' -count=1 -timeout=5m

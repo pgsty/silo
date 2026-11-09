@@ -1,4 +1,5 @@
 // Copyright (c) 2026 Denis Babchuk
+// Copyright (c) 2026 Feng Ruohang
 //
 // This file is part of Silo Object Storage stack
 //
@@ -18,10 +19,13 @@
 package cmd
 
 import (
+	"context"
+	"encoding/xml"
 	"fmt"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,5 +194,196 @@ func TestPoolsMultipartConditionalInitiateUnreadable(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+type multipartInitiateMetadataGate struct {
+	entered, resume chan struct{}
+	once            sync.Once
+}
+
+type multipartInitiateMetadataDisk struct {
+	StorageAPI
+	gate *multipartInitiateMetadataGate
+}
+
+func (d multipartInitiateMetadataDisk) WriteMetadata(ctx context.Context, orig, volume, path string, fi FileInfo) error {
+	if volume == minioMetaMultipartBucket {
+		d.gate.once.Do(func() { close(d.gate.entered) })
+		select {
+		case <-d.gate.resume:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return d.StorageAPI.WriteMetadata(ctx, orig, volume, path, fi)
+}
+
+// The pools-layer lock must cover placement of the upload, not just reading
+// the current object. Pause the metadata write after the condition passed and
+// require a concurrent public overwrite or delete to wait for that placement.
+func TestPoolsMultipartConditionalInitiateHoldsLockThroughPersistence(t *testing.T) {
+	for _, mutation := range []string{"overwrite", "delete"} {
+		t.Run(mutation, func(t *testing.T) {
+			z, bucket := consistencyPools(t)
+			object := "locked-initiate"
+			current := putConsistencyObject(t, z, bucket, object, 1, "current", ObjectOptions{})
+			if _, err := z.serverPools[0].NewMultipartUpload(t.Context(), bucket, object, ObjectOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			gate := &multipartInitiateMetadataGate{entered: make(chan struct{}), resume: make(chan struct{})}
+			restoreDisks := conditionalPutSwapDisks(z.serverPools[0], object, func(d StorageAPI) StorageAPI {
+				return multipartInitiateMetadataDisk{StorageAPI: d, gate: gate}
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			var workers sync.WaitGroup
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(gate.resume) }) }
+			defer func() {
+				release()
+				cancel()
+				workers.Wait()
+				restoreDisks()
+			}()
+
+			initiated := make(chan error, 1)
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				_, err := z.NewMultipartUpload(ctx, bucket, object, ObjectOptions{
+					HasIfMatch: true,
+					CheckPrecondFn: func(oi ObjectInfo) bool {
+						return oi.ETag != current.ETag
+					},
+				})
+				initiated <- err
+			}()
+			select {
+			case <-gate.entered:
+			case err := <-initiated:
+				t.Fatalf("initiate returned before persistence: %v", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+
+			mutated := make(chan error, 1)
+			started := make(chan struct{})
+			reader := mustGetPutObjReader(t, strings.NewReader("new"), 3, "", "")
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				close(started)
+				var err error
+				if mutation == "delete" {
+					_, err = z.DeleteObject(ctx, bucket, object, ObjectOptions{})
+				} else {
+					_, err = z.PutObject(ctx, bucket, object, reader, ObjectOptions{})
+				}
+				mutated <- err
+			}()
+			<-started
+			select {
+			case err := <-mutated:
+				t.Fatalf("mutation escaped initiate lock: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			release()
+			for _, result := range []<-chan error{initiated, mutated} {
+				select {
+				case err := <-result:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+		})
+	}
+}
+
+// Initiate only checks the current state; it does not reserve the object or
+// persist a condition for completion. Completion must carry its own condition,
+// compares ETags rather than object generations, and leaves parts available
+// for retry when a condition fails.
+func TestPoolsMultipartConditionalInitiateLifecycle(t *testing.T) {
+	z, _ := consistencyPools(t)
+	bucket, router := conditionalPutBucket(t, z, "unversioned")
+	for _, change := range []string{"overwrite", "delete", "recreate-same-etag", "omit-complete-condition"} {
+		t.Run(change, func(t *testing.T) {
+			object := "lifecycle-" + change
+			current := putConsistencyObject(t, z, bucket, object, 1, "original", ObjectOptions{})
+			defer conditionalPutPool(t, z, object, 0)()
+			headers := map[string]string{xhttp.IfMatch: fmt.Sprintf("%q", current.ETag)}
+			initiate := multipartConditionRequest(t, router, http.MethodPost, getNewMultipartURL("", bucket, object), "", headers)
+			if initiate.Code != http.StatusOK {
+				t.Fatalf("initiate: %d %s", initiate.Code, initiate.Body.String())
+			}
+			var upload InitiateMultipartUploadResponse
+			if err := xml.Unmarshal(initiate.Body.Bytes(), &upload); err != nil || upload.UploadID == "" {
+				t.Fatalf("upload ID: %v %s", err, initiate.Body.String())
+			}
+			const finalBody = "multipart-final"
+			part, err := z.PutObjectPart(t.Context(), bucket, object, upload.UploadID, 1,
+				mustGetPutObjReader(t, strings.NewReader(finalBody), int64(len(finalBody)), "", ""), ObjectOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if change == "delete" || change == "recreate-same-etag" {
+				if _, err := z.DeleteObject(t.Context(), bucket, object, ObjectOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change != "delete" {
+				body := "concurrent"
+				if change == "recreate-same-etag" {
+					body = "original"
+				}
+				if _, err := z.PutObject(t.Context(), bucket, object,
+					mustGetPutObjReader(t, strings.NewReader(body), int64(len(body)), "", ""), ObjectOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change == "omit-complete-condition" {
+				headers = nil
+			}
+			url := getCompleteMultipartUploadURL("", bucket, object, upload.UploadID)
+			body := multipartConditionCompleteBody([]CompletePart{{PartNumber: 1, ETag: part.ETag}})
+			complete := multipartConditionRequest(t, router, http.MethodPost, url, body, headers)
+			want := http.StatusOK
+			if change == "overwrite" {
+				want = http.StatusPreconditionFailed
+			}
+			if change == "delete" {
+				want = http.StatusNotFound
+			}
+			if complete.Code != want {
+				t.Fatalf("complete: %d, want %d: %s", complete.Code, want, complete.Body.String())
+			}
+			if want != http.StatusOK {
+				parts, err := z.ListObjectParts(t.Context(), bucket, object, upload.UploadID, 0, 100, ObjectOptions{})
+				if err != nil || len(parts.Parts) != 1 || parts.Parts[0].ETag != part.ETag {
+					t.Fatalf("failed condition consumed upload: %v %+v", err, parts)
+				}
+				if change == "overwrite" {
+					oi, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					headers = map[string]string{xhttp.IfMatch: fmt.Sprintf("%q", oi.ETag)}
+				} else {
+					headers = map[string]string{xhttp.IfNoneMatch: "*"}
+				}
+				complete = multipartConditionRequest(t, router, http.MethodPost, url, body, headers)
+				if complete.Code != http.StatusOK {
+					t.Fatalf("retry with new condition: %d %s", complete.Code, complete.Body.String())
+				}
+			}
+			get := multipartConditionRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object), "", nil)
+			if get.Code != http.StatusOK || get.Body.String() != finalBody {
+				t.Fatalf("committed body: %d %q", get.Code, get.Body.String())
+			}
+		})
 	}
 }
