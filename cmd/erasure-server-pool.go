@@ -1157,28 +1157,8 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	// metadata reconciliation at the set layer.
 	if opts.CheckPrecondFn != nil && !opts.ReplicationRequest &&
 		!opts.ReplicaLockReconcile && !opts.DataMovement {
-		copies, lerr := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{
-			VersionID:        "", // Compare the current object, not the write's version.
-			Versioned:        opts.Versioned,
-			VersionSuspended: opts.VersionSuspended,
-			NoAuditLog:       true,
-		})
-		var latest ObjectInfo
-		if lerr == nil {
-			latest = copies[0].ObjInfo
-			if latest.DeleteMarker {
-				lerr = toObjectErr(errFileNotFound, bucket, object)
-			}
-		}
-		// An unreadable pool may hold the newest object; it is not absence.
-		if lerr != nil && !isErrObjectNotFound(lerr) && !isErrVersionNotFound(lerr) {
-			return ObjectInfo{}, lerr
-		}
-		if lerr == nil && opts.CheckPrecondFn(latest) {
-			return ObjectInfo{}, PreConditionFailed{}
-		}
-		if lerr != nil && opts.HasIfMatch {
-			return ObjectInfo{}, lerr
+		if err := z.checkCurrentPreconditions(ctx, bucket, object, opts); err != nil {
+			return ObjectInfo{}, err
 		}
 		// Do not repeat an accepted condition against the destination's copy.
 		opts.CheckPrecondFn = nil
@@ -2211,6 +2191,33 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 		return z.serverPools[0].NewMultipartUpload(ctx, bucket, object, opts)
 	}
 
+	// The upload goes to the pool of a pending upload of the key or to the
+	// pool selected by capacity; neither has to hold the current object. As
+	// for PutObject, public write conditions compare the logical current
+	// object under the pools-layer write lock, which is kept while the upload
+	// is placed. Replica and data-movement callbacks keep their set-layer
+	// semantics.
+	locked := false
+	if opts.CheckPrecondFn != nil && !opts.ReplicationRequest &&
+		!opts.ReplicaLockReconcile && !opts.DataMovement {
+		if !opts.NoLock {
+			lk := z.NewNSLock(bucket, encodeDirObject(object))
+			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+			if err != nil {
+				return nil, err
+			}
+			ctx = lkctx.Context()
+			defer lk.Unlock(lkctx)
+			opts.NoLock = true
+		}
+		locked = true
+		if err := z.checkCurrentPreconditions(ctx, bucket, encodeDirObject(object), opts); err != nil {
+			return nil, err
+		}
+		// Do not repeat an accepted condition against the destination's copy.
+		opts.CheckPrecondFn = nil
+	}
+
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) || z.IsPoolRebalancing(idx) {
 			continue
@@ -2229,8 +2236,9 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 	}
 
 	// any parallel writes on the object will block for this poolIdx
-	// to return since this holds a read lock on the namespace.
-	idx, err := z.getPoolIdx(ctx, bucket, object, -1)
+	// to return since this holds a read lock on the namespace, or the
+	// write lock taken above for a conditional upload.
+	idx, err := z.getWritePoolIdx(ctx, bucket, object, -1, locked)
 	if err != nil {
 		return nil, err
 	}
@@ -2454,33 +2462,8 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		// Once satisfied, the callback is cleared so the set layer does not
 		// re-evaluate it against its local copy.
 		if opts.CheckPrecondFn != nil {
-			copies, lerr := z.objectPoolInfos(ctx, bucket, encodeDirObject(object), ObjectOptions{
-				// Conditions always compare the logical current object,
-				// independently of the completion's destination version.
-				VersionID:        "",
-				Versioned:        opts.Versioned,
-				VersionSuspended: opts.VersionSuspended,
-				NoAuditLog:       true,
-			})
-			var latest ObjectInfo
-			if lerr == nil {
-				latest = copies[0].ObjInfo
-				if latest.DeleteMarker {
-					// A delete-marker latest reads as an absent key, matching
-					// the set layer's getObjectInfo.
-					lerr = toObjectErr(errFileNotFound, bucket, object)
-				}
-			}
-			if lerr == nil && opts.CheckPrecondFn(latest) {
-				return ObjectInfo{}, PreConditionFailed{}
-			}
-			if lerr != nil && !isErrVersionNotFound(lerr) && !isErrObjectNotFound(lerr) {
-				return ObjectInfo{}, lerr
-			}
-			// if object doesn't exist return error for If-Match conditional requests
-			// If-None-Match should be allowed to proceed for non-existent objects
-			if lerr != nil && opts.HasIfMatch && (isErrObjectNotFound(lerr) || isErrVersionNotFound(lerr)) {
-				return ObjectInfo{}, lerr
+			if err := z.checkCurrentPreconditions(ctx, bucket, encodeDirObject(object), opts); err != nil {
+				return ObjectInfo{}, err
 			}
 			opts.CheckPrecondFn = nil
 		}
