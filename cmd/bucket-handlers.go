@@ -523,6 +523,13 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			}
 		}
 
+		// All deletes on directory objects needs to be for `nullVersionID`.
+		// Decide this before the lookup below, so that the retention check
+		// reads the version the delete removes.
+		if isDirObject(object.ObjectName) && object.VersionID == "" {
+			object.VersionID = nullVersionID
+		}
+
 		opts := ObjectOptions{
 			VersionID:        object.VersionID,
 			Versioned:        vc.PrefixEnabled(object.ObjectName),
@@ -539,11 +546,6 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		if !globalTierConfigMgr.Empty() {
 			oss[index] = newObjSweeper(bucket, object.ObjectName).WithVersion(opts.VersionID).WithVersioning(opts.Versioned, opts.VersionSuspended)
 			oss[index].SetTransitionState(goi.TransitionedObject)
-		}
-
-		// All deletes on directory objects needs to be for `nullVersionID`
-		if isDirObject(object.ObjectName) && object.VersionID == "" {
-			object.VersionID = nullVersionID
 		}
 
 		if replicateDeletes {
