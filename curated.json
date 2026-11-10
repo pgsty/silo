@@ -1,6 +1,6 @@
 {
   "updated": "2026-11-09T05:40:48+00:00",
-  "revision": "72eaa6f7175081c12741435574e83f4bb370e7d9",
+  "revision": "5a9fa30f649c092131610b8ba7d1bbcc79dffc59",
   "repositories": [
     "pgsty/silo",
     "pgsty/silo-console",
@@ -132,7 +132,7 @@
       "handle": "botdeniska",
       "group": "code",
       "featured": true,
-      "what": "Contributed multi-pool migration, deletion and lifecycle safety, native restore reports and verification, LDAP login and storage cleanup fixes, replication checksum repairs, and faster policy evaluation",
+      "what": "Contributed multi-pool migration, deletion and lifecycle safety, conditional multipart checks, native restore reports and verification, LDAP login and storage cleanup fixes, replication checksum repairs, and faster policy evaluation",
       "firstContribution": "2026-10-17"
     },
     {
