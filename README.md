@@ -36,7 +36,7 @@
 
 PGSTY SILO keeps one maintained release line of the open-source MinIO server alive after upstream ended community distribution: builds, packages, multi-arch images, security fixes, and the full web console. Pigsty runs it in production as its PostgreSQL backup repository.
 
-It follows one rule — **the product and its delivery surfaces are renamed; the protocol and your data are not.** Everything else lives on [silo.pgsty.com](https://silo.pgsty.com/).
+It follows one rule: **the product and its delivery surfaces are renamed; the protocol and your data are not.** Full documentation is published at [silo.pgsty.com](https://silo.pgsty.com/).
 
 **Related:** [`pgsty/mc`](https://github.com/pgsty/mc) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/kes`](https://github.com/pgsty/kes) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
 
@@ -44,10 +44,10 @@ It follows one rule — **the product and its delivery surfaces are renamed; the
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo Console">
 </p>
 
-#### SILO 20261109
+### SILO 20261109
 
 > [!WARNING]
-> [SILO 20261109](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z) fixes bugs and security vulnerabilities. We strongly recommend scheduling an upgrade to reduce security risks.
+> [SILO 20261109](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z) (`20261109000000.0.0`, source `d998292387cc`) fixes storage, lifecycle, native restore, Object Lock, batch authorization, and IAM defects, embedding Console `v2.7.0` with `mcli 20261109`, `silo-pkg v3.16.0`, and Go `1.27.3`. Review the [release notes and upgrade requirements](https://silo.pgsty.com/blog/release/silo-20261109/) before upgrading.
 
 > [!NOTE]
 > On 2026-08-06, `pgsty/minio` became `pgsty/silo`, and the default branch changed from `master` to `main`. The last MinIO-branded release is [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) on the [`minio`](https://github.com/pgsty/silo/tree/minio) branch.
@@ -86,7 +86,7 @@ docker exec silo mcli mb local/demo && docker exec silo mcli ls local
 | Kubernetes | Helm chart, see [Download & Install](https://silo.pgsty.com/download/) |
 | Source | `go build -o silo . && ./silo --version` |
 
-Every release ships checksums, SPDX SBOMs, Sigstore-signed manifests, and GitHub build attestations. Installation methods and verification commands are documented at [Download & Install](https://silo.pgsty.com/download/); migrating from upstream MinIO — taking over an existing `minio.service` and its `/etc/default/minio`, and keeping data ownership stable with a `/etc/systemd/system/silo.service.d/10-legacy-user.conf` drop-in — is covered by the [migration guide](https://silo.pgsty.com/compatibility/migration/) and the [binary & service notes](https://silo.pgsty.com/compatibility/binary/).
+Every release ships checksums, SPDX SBOMs, Sigstore-signed manifests, and GitHub build attestations. Installation methods and verification commands are documented at [Download & Install](https://silo.pgsty.com/download/). To migrate from upstream MinIO, take over `minio.service` and `/etc/default/minio`, and preserve data ownership with a `/etc/systemd/system/silo.service.d/10-legacy-user.conf` drop-in. See the [migration guide](https://silo.pgsty.com/compatibility/migration/) and [binary & service notes](https://silo.pgsty.com/compatibility/binary/).
 
 ## Compatibility
 
@@ -98,7 +98,7 @@ Every divergence from upstream is listed in the code-verified [compatibility aud
 
 ### TLS and Go upgrades
 
-Server 20260916 restored Go's default key exchange; Server 20261018 retains it with Go 1.27.2.
+Server 20260916 restored Go's default key exchange; Server 20261109 retains it with Go 1.27.3.
 TLS key exchange follows Go's defaults across the S3 listener, node links,
 replication, identity providers, etcd, and external HTTP services. If an endpoint
 cannot accept ML-KEM, `GODEBUG=tlsmlkem=0` disables the default hybrid exchanges
