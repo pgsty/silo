@@ -27,22 +27,24 @@ import (
 
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
 	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/pgsty/silo-pkg/v3/policy/condition"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
-// authorizeRequestWithUnreadTags authorizes action on an object whose stored
-// tags could not be read because reading the object failed with readErr.
+// authorizeRequestWithUnreadTags decides whether to disclose readErr for an
+// object whose stored tags could not be read. It must not grant object access.
 //
 // Without the tags, an Allow statement that tests s3:ExistingObjectTag cannot
 // match, so a caller allowed only by such a statement would get AccessDenied,
 // which clients do not retry, for a transient server error such as lost read
-// quorum. For a server error the request is therefore also authorized as if
-// the object carried tags that the policies ask for: a caller that some tags
-// let through gets the error, a caller that no tags let through still gets
-// AccessDenied. For any other error, NoSuchKey among them, the tags stay empty.
+// quorum. For a server error, try a bounded set of tags from the caller's
+// policies and return the storage error if normal authorization accepts one.
+// If no candidate passes, keep AccessDenied. This is not an exhaustive policy
+// solver. For any other error, NoSuchKey among them, the tags stay empty.
 func authorizeRequestWithUnreadTags(ctx context.Context, r *http.Request, action policy.Action, readErr error) APIErrorCode {
 	s3Err := authorizeRequest(ctx, r, action)
 	if s3Err == ErrNone || toAPIError(ctx, readErr).HTTPStatusCode < http.StatusInternalServerError {
@@ -76,17 +78,16 @@ func policyExistingObjectTags(ctx context.Context, r *http.Request, action polic
 	bucket, object := reqInfo.BucketName, reqInfo.ObjectName
 	var (
 		allows [][]map[string]string // per policy set, the tags its Allow statements ask for
-		denies []map[string]string   // tags that keep a Deny statement from matching
+		denies [][]map[string]string // per Deny statement, alternative tags that keep it from matching
 	)
-	// add files the tags of a statement that applies to action on the
+	// add collects the tags of a statement that applies to action on the
 	// object, whatever its conditions.
 	add := func(effect policy.Effect, conditions condition.Functions, values map[string][]string, fromSet *[]map[string]string) {
-		if tagMap, ok := existingObjectTagsFor(effect, conditions, values); ok {
-			if effect == policy.Allow {
-				*fromSet = append(*fromSet, tagMap)
-			} else {
-				denies = append(denies, tagMap)
-			}
+		candidates := existingObjectTagsCandidatesFor(effect, conditions, values)
+		if effect == policy.Allow {
+			*fromSet = append(*fromSet, candidates...)
+		} else if len(candidates) > 0 {
+			denies = append(denies, candidates)
 		}
 	}
 	switch {
@@ -107,17 +108,7 @@ func policyExistingObjectTags(ctx context.Context, r *http.Request, action polic
 		allows = append(allows, fromSet)
 	case newGlobalAuthZPluginFn() == nil && globalIAMSys.Initialized():
 		values := getConditionValues(r, "", reqInfo.Cred)
-		// From the cache only: reading the drives may be what just failed.
-		docs, _ := globalIAMSys.store.listPolicyDocs(ctx, "")
-		policySets := [][]policy.Policy{nil}
-		for _, name := range slices.Sorted(maps.Keys(docs)) {
-			policySets[0] = append(policySets[0], docs[name].Policy)
-		}
-		if sp, ok := reqInfo.Cred.Claims[sessionPolicyNameExtracted].(string); ok {
-			if p, err := policy.ParseConfig(strings.NewReader(sp)); err == nil {
-				policySets = append(policySets, []policy.Policy{*p})
-			}
-		}
+		policySets := globalIAMSys.unreadTagPolicySets(reqInfo.Cred)
 		for _, policies := range policySets {
 			var fromSet []map[string]string
 			for _, p := range policies {
@@ -132,72 +123,131 @@ func policyExistingObjectTags(ctx context.Context, r *http.Request, action polic
 			allows = append(allows, fromSet)
 		}
 	}
-	return combineExistingObjectTags(allows, denies)
+	return combineExistingObjectTags(append(allows, denies...))
 }
 
-// combineExistingObjectTags merges the tags of one Allow statement of each
-// policy set, or of none for a set that may allow without tags, and tries each
-// result also with the tags that keep the Deny statements from matching. The
-// first tags win a conflict; the authorization of the result settles it.
-func combineExistingObjectTags(allows [][]map[string]string, denies []map[string]string) []string {
-	merge := func(parts ...map[string]string) map[string]string {
-		merged := make(map[string]string)
-		for _, part := range parts {
-			for k, v := range part {
-				if _, ok := merged[k]; !ok {
-					merged[k] = v
+// unreadTagMappings reuses the normal user/group mapping lookup without lazy
+// storage reads. Missing cache entries contribute no candidates; the regular
+// authorization still decides whether any candidate is allowed.
+type unreadTagMappings struct {
+	*IAMStoreSys
+}
+
+func (unreadTagMappings) loadMappedPolicy(context.Context, string, IAMUserType, bool, *xsync.MapOf[string, MappedPolicy]) error {
+	return errNoSuchPolicy
+}
+
+func (unreadTagMappings) loadGroup(context.Context, string, map[string]GroupInfo) error {
+	return errNoSuchGroup
+}
+
+// unreadTagPolicySets selects only this credential's cached policies. Base
+// and session policies remain separate because both must allow the request.
+// This only supplies candidates, so identity, claims and policy validity are
+// left to the normal authorization on each candidate.
+func (sys *IAMSys) unreadTagPolicySets(cred auth.Credentials) [][]policy.Policy {
+	derived := cred.IsTemp() || cred.IsServiceAccount()
+	name := cred.AccessKey
+	if derived {
+		name = cred.ParentUser
+	}
+	cache := sys.store.rlock()
+	defer sys.store.runlock()
+	var names []string
+	roleARN := (policy.Args{Claims: cred.Claims}).GetRoleArn()
+	switch {
+	case name == globalActiveCred.AccessKey:
+	case derived && roleARN != "":
+		parsed, err := arn.Parse(roleARN)
+		if err != nil {
+			return nil
+		}
+		names = newMappedPolicy(sys.rolesMap[parsed]).toSlice()
+	default:
+		loader := unreadTagMappings{sys.store}
+		var err error
+		names, _, err = cache.policyDBGet(loader, name, false, false)
+		if err != nil {
+			return nil
+		}
+		groups, err := cache.policyDBGetGroups(loader, len(names) > 0, cred.Groups...)
+		if err != nil {
+			return nil
+		}
+		names = append(names, groups...)
+		if derived && len(names) == 0 {
+			claims, _ := policy.GetPoliciesFromClaims(cred.Claims, iamPolicyClaimNameOpenID())
+			names = claims.ToSlice()
+		}
+	}
+
+	sets := [][]policy.Policy{nil}
+	slices.Sort(names)
+	for _, name := range slices.Compact(names) {
+		if doc, ok := cache.iamPolicyDocsMap[name]; ok {
+			sets[0] = append(sets[0], doc.Policy)
+		}
+	}
+	if derived && (cred.IsTemp() || cred.Claims[iamPolicyClaimNameSA()] != inheritedPolicyType) {
+		if sp, ok := cred.Claims[sessionPolicyNameExtracted].(string); ok {
+			if p, err := policy.ParseConfig(strings.NewReader(sp)); err == nil {
+				sets = append(sets, []policy.Policy{*p})
+			}
+		}
+	}
+	return sets
+}
+
+// combineExistingObjectTags combines alternatives from each base/session
+// Allow set and each tag-dependent Deny. A set may also contribute no tags:
+// another statement or another set may already supply what it needs. First
+// values win conflicts; the normal authorization decides whether they work.
+func combineExistingObjectTags(sets [][]map[string]string) []string {
+	combos := []map[string]string{{}}
+	for _, fromSet := range sets {
+		fromSet = append(uniqueExistingObjectTagMaps(fromSet), nil)
+		var next []map[string]string
+		seen := set.NewStringSet()
+	combinations:
+		for _, combo := range combos {
+			for _, addition := range fromSet {
+				merged := maps.Clone(combo)
+				for k, v := range addition {
+					if _, ok := merged[k]; !ok {
+						merged[k] = v
+					}
+				}
+				t, err := tags.MapToObjectTags(merged)
+				if err != nil || seen.Contains(t.String()) {
+					continue
+				}
+				seen.Add(t.String())
+				next = append(next, merged)
+				if len(next) == maxExistingTagCandidates {
+					break combinations
 				}
 			}
 		}
-		return merged
+		combos = next
 	}
-	combos := [][]map[string]string{nil}
-	for _, fromSet := range allows {
-		// Many statements ask for the same tags.
-		seen := set.NewStringSet()
-		fromSet = slices.DeleteFunc(slices.Clone(fromSet), func(tagMap map[string]string) bool {
-			t, err := tags.MapToObjectTags(tagMap)
-			if err != nil || seen.Contains(t.String()) {
-				return true
-			}
-			seen.Add(t.String())
-			return false
-		})
-		next := make([][]map[string]string, 0, len(combos)*(len(fromSet)+1))
-		for _, combo := range combos {
-			next = append(next, combo)
-			for _, tagMap := range fromSet {
-				next = append(next, append(slices.Clip(combo), tagMap))
-			}
-		}
-		combos = next[:min(len(next), maxExistingTagCandidates)]
-	}
-	deny := merge(denies...)
-	found := set.NewStringSet()
 	var candidates []string
 	for _, combo := range combos {
-		for _, tagMap := range []map[string]string{merge(combo...), merge(append(slices.Clip(combo), deny)...)} {
-			t, err := tags.MapToObjectTags(tagMap)
-			if len(tagMap) == 0 || err != nil || found.Contains(t.String()) {
-				continue
-			}
-			found.Add(t.String())
-			if candidates = append(candidates, t.String()); len(candidates) == maxExistingTagCandidates {
-				return candidates
-			}
+		if len(combo) != 0 { // empty tags were already authorized
+			t, _ := tags.MapToObjectTags(combo)
+			candidates = append(candidates, t.String())
 		}
 	}
 	return candidates
 }
 
-// existingObjectTagsFor returns tags under which the s3:ExistingObjectTag tests
-// of conditions all pass, for an Allow statement, or one of them fails, for a
-// Deny statement; a tag left out is absent. It returns false if the conditions
-// test no tag, or if no such tags were found among those tried for each tag:
-// none, the values the tests name, with policy variables taken from values and
-// wildcards filled, and the fillers "" and "_". The policy engine itself
-// evaluates the tests for each of them.
-func existingObjectTagsFor(effect policy.Effect, conditions condition.Functions, values map[string][]string) (map[string]string, bool) {
+// existingObjectTagsCandidatesFor returns tag sets under which the
+// s3:ExistingObjectTag tests of conditions all pass, for an Allow statement,
+// or one of them fails, for a Deny statement; a tag left out is absent. For an
+// Allow, values for different tag keys are combined, while a Deny needs only
+// one failing key. It tries the values named in the conditions, with policy
+// variables resolved, wildcard fillers, and absence, then lets the policy
+// engine decide whether each candidate really satisfies the conditions.
+func existingObjectTagsCandidatesFor(effect policy.Effect, conditions condition.Functions, values map[string][]string) []map[string]string {
 	// Each function tests one key, so the tests of one tag pass or fail
 	// whatever the other tags are.
 	byKey := make(map[string]condition.Functions)
@@ -209,47 +259,74 @@ func existingObjectTagsFor(effect policy.Effect, conditions condition.Functions,
 		}
 	}
 	if len(byKey) == 0 {
-		return nil, false
+		return nil
 	}
-	tagMap := make(map[string]string)
-	for _, key := range slices.Sorted(maps.Keys(byKey)) {
-		tagKey := strings.TrimPrefix(key, condition.ExistingObjectTag.Name()+"/")
-		value, present, found := existingObjectTagValue(key, tagKey, byKey[key], values, effect == policy.Allow)
-		switch {
-		case effect == policy.Deny && found:
-			if present {
-				tagMap[tagKey] = value
-			}
-			return tagMap, true
-		case effect == policy.Allow && !found:
-			return nil, false
-		case present:
-			tagMap[tagKey] = value
-		}
-	}
+
+	keys := slices.Sorted(maps.Keys(byKey))
 	if effect == policy.Deny {
-		return nil, false
+		var candidates []map[string]string
+		for _, key := range keys {
+			candidates = append(candidates, existingObjectTagValues(key, strings.TrimPrefix(key, condition.ExistingObjectTag.Name()+"/"), byKey[key], values, false)...)
+		}
+		return uniqueExistingObjectTagMaps(candidates)
 	}
-	return tagMap, true
+
+	candidates := []map[string]string{{}}
+	for _, key := range keys {
+		keyCandidates := existingObjectTagValues(key, strings.TrimPrefix(key, condition.ExistingObjectTag.Name()+"/"), byKey[key], values, true)
+		if len(keyCandidates) == 0 {
+			return nil
+		}
+		next := make([]map[string]string, 0, min(maxExistingTagCandidates, len(candidates)*len(keyCandidates)))
+		for _, base := range candidates {
+			for _, keyCandidate := range keyCandidates {
+				merged := maps.Clone(base)
+				maps.Copy(merged, keyCandidate)
+				next = append(next, merged)
+				if len(next) == maxExistingTagCandidates {
+					break
+				}
+			}
+			if len(next) == maxExistingTagCandidates {
+				break
+			}
+		}
+		candidates = next
+	}
+	return uniqueExistingObjectTagMaps(candidates)
 }
 
-// existingObjectTagValue looks for a value of tag tagKey, or its absence,
-// under which tests, the functions that test the condition key key, evaluate
-// to want.
-func existingObjectTagValue(key, tagKey string, tests condition.Functions, values map[string][]string, want bool) (value string, present, found bool) {
+func uniqueExistingObjectTagMaps(candidates []map[string]string) []map[string]string {
+	seen := set.NewStringSet()
+	unique := make([]map[string]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		t, err := tags.MapToObjectTags(candidate)
+		if err != nil || seen.Contains(t.String()) {
+			continue
+		}
+		seen.Add(t.String())
+		unique = append(unique, candidate)
+	}
+	return unique
+}
+
+// existingObjectTagValues looks for values of tag tagKey, or its absence,
+// under which the functions that test the condition key key evaluate to want.
+func existingObjectTagValues(key, tagKey string, tests condition.Functions, values map[string][]string, want bool) []map[string]string {
 	defer delete(values, key)
 	delete(values, key)
+	var candidates []map[string]string
 	if tests.Evaluate(values) == want {
-		return "", false, true
+		candidates = append(candidates, map[string]string{})
 	}
 	// The functions keep their values unexported; JSON exposes them.
 	buf, err := json.Marshal(tests)
 	if err != nil {
-		return "", false, false
+		return candidates
 	}
 	var byName map[string]map[string]condition.ValueSet
 	if err = json.Unmarshal(buf, &byName); err != nil {
-		return "", false, false
+		return candidates
 	}
 	var tried []string
 	for name, byKey := range byName {
@@ -270,10 +347,13 @@ func existingObjectTagValue(key, tagKey string, tests condition.Functions, value
 		}
 		values[key] = []string{v}
 		if tests.Evaluate(values) == want {
-			return v, true, true
+			candidates = append(candidates, map[string]string{tagKey: v})
+			if len(candidates) == maxExistingTagCandidates {
+				break
+			}
 		}
 	}
-	return "", false, false
+	return uniqueExistingObjectTagMaps(candidates)
 }
 
 // substituteConditionVariables resolves the policy variables in v from the

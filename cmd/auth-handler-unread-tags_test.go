@@ -20,6 +20,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -29,8 +30,10 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/pgsty/silo-pkg/v3/policy"
@@ -108,6 +111,45 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 		}
 		return cred
 	}
+	newTempUser := func(parent auth.Credentials, statements string) auth.Credentials {
+		session := `{"Version": "2012-10-17", "Statement": [` + statements + `]}`
+		secret, err := getTokenSigningKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{
+			parentClaim: parent.AccessKey, "exp": UTCNow().Add(time.Hour).Unix(),
+			policy.SessionPolicyName: base64.StdEncoding.EncodeToString([]byte(session)),
+		}, secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cred.ParentUser = parent.AccessKey
+		if _, err := globalIAMSys.SetTempUser(ctx, cred.AccessKey, cred, ""); err != nil {
+			t.Fatal(err)
+		}
+		return cred
+	}
+	// An unrelated cached policy must not consume the candidate limit. The
+	// target user's policy is created below and sorts after this policy.
+	fillerStatements := make([]string, 0, maxExistingTagCandidates)
+	for i := range maxExistingTagCandidates {
+		fillerStatements = append(fillerStatements, statement("Allow", "*",
+			fmt.Sprintf(`{"StringEquals": {"s3:ExistingObjectTag/fill%02d": "v"}}`, i)))
+	}
+	fillerPolicy, err := policy.ParseConfig(strings.NewReader(`{"Version": "2012-10-17", "Statement": [` + strings.Join(fillerStatements, ",") + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillerPolicyName := "000-unread-tags-filler-" + mustGetUUID()
+	if _, err = globalIAMSys.SetPolicy(ctx, fillerPolicyName, *fillerPolicy); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := globalIAMSys.DeletePolicy(ctx, fillerPolicyName, false); err != nil {
+			t.Logf("delete filler policy: %v", err)
+		}
+	}()
 
 	type user struct {
 		name  string
@@ -146,6 +188,35 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 		// asks for j=w: only an object carrying both lets it through.
 		allowedByTags("serviceAccount", newServiceAccount(newUser(tagStatement("Allow", "*", "v")),
 			statement("Allow", "*", `{"StringEquals": {"s3:ExistingObjectTag/j": "w"}}`))),
+		allowedByTags("temporary", newTempUser(newUser(tagStatement("Allow", "*", "v")),
+			statement("Allow", "*", `{"StringEquals": {"s3:ExistingObjectTag/j": "w"}}`))),
+		allowedByTags("rootTemporary", newTempUser(globalActiveCred, tagStatement("Allow", "*", "v"))),
+		allowedByTags("rootServiceAccount", newServiceAccount(globalActiveCred, tagStatement("Allow", "*", "v"))),
+		// The effective policy must be selected before applying the candidate
+		// limit; the unrelated cached policy above has 64 other tag statements.
+		allowedByTags("unrelatedPolicies", newUser(statement("Allow", "*",
+			`{"StringEquals": {"s3:ExistingObjectTag/target": "ok"}}`))),
+		// An alternative allowed value must survive a Deny that excludes the
+		// first value. With unread tags, k=v is the only valid candidate.
+		allowedByTags("alternativeAllowedValue", newUser(
+			statement("Allow", "*", `{"StringEquals": {"s3:ExistingObjectTag/k": ["a", "v"]}}`),
+			tagStatement("Deny", "*", "a"))),
+		allowedByTags("alternativeValuesAcrossKeys", newUser(
+			statement("Allow", "*", `{"StringEquals": {"s3:ExistingObjectTag/k": ["a", "v"], "s3:ExistingObjectTag/j": ["b", "w"]}}`),
+			tagStatement("Deny", "*", "a"),
+			statement("Deny", "*", `{"StringEquals": {"s3:ExistingObjectTag/j": "b"}}`))),
+		// Both Deny statements must be avoided. The first candidate (k="")
+		// avoids the Null Deny but still matches the second Deny.
+		allowedByTags("multipleDenies", newUser(statement("Allow", "*", ""),
+			statement("Deny", "*", `{"Null": {"s3:ExistingObjectTag/k": "true"}}`),
+			tagStatement("Deny", "*", ""))),
+		// The Deny can be avoided by k=v OR j=w. Only j=w is compatible
+		// with this Allow, so stopping at the first Deny key loses it.
+		{
+			"alternativeDenyKey", newUser(tagStatement("Allow", "*", "a"),
+				statement("Deny", "*", `{"StringNotEquals": {"s3:ExistingObjectTag/k": "v", "s3:ExistingObjectTag/j": "w"}}`)),
+			http.StatusForbidden, http.StatusServiceUnavailable,
+		},
 
 		// Allowed only for k=w: the decision still depends on the tags.
 		{"otherValue", newUser(tagStatement("Allow", "*", "w")), http.StatusForbidden, http.StatusServiceUnavailable},
@@ -170,7 +241,7 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 
 	const object, missing = "tagged", "missing"
 	if _, err := z.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("data")), 4, "", ""),
-		ObjectOptions{UserDefined: map[string]string{xhttp.AmzObjectTagging: "k=v&j=w&np=1&ne=1&fa=1&du=1&owner=" + owner.AccessKey}}); err != nil {
+		ObjectOptions{UserDefined: map[string]string{xhttp.AmzObjectTagging: "k=v&j=w&np=1&ne=1&fa=1&du=1&target=ok&owner=" + owner.AccessKey}}); err != nil {
 		t.Fatal(err)
 	}
 	// Anonymous reads are allowed by the bucket policy while the object carries k=v.
@@ -207,7 +278,14 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 			if req.body != nil {
 				body = bytes.NewReader(req.body)
 			}
-			signed, err := newTestSignedRequestV4(req.method, req.target, int64(len(req.body)), body, creds.AccessKey, creds.SecretKey, req.header)
+			header := make(map[string]string)
+			for k, v := range req.header {
+				header[k] = v
+			}
+			if creds.IsTemp() {
+				header[xhttp.AmzSecurityToken] = creds.SessionToken
+			}
+			signed, err := newTestSignedRequestV4(req.method, req.target, int64(len(req.body)), body, creds.AccessKey, creds.SecretKey, header)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -289,10 +367,11 @@ func TestExistingObjectTagsFor(t *testing.T) {
 				t.Fatalf("%s: %v", tc.conditions, err)
 			}
 		}
-		tagMap, ok := existingObjectTagsFor(tc.effect, conditions, values)
+		candidates := existingObjectTagsCandidatesFor(tc.effect, conditions, values)
+		ok := len(candidates) > 0
 		got := ""
-		if len(tagMap) > 0 {
-			encoded, err := tags.MapToObjectTags(tagMap)
+		if ok {
+			encoded, err := tags.MapToObjectTags(candidates[0])
 			if err != nil {
 				t.Fatalf("%s: %v", tc.conditions, err)
 			}
@@ -301,5 +380,60 @@ func TestExistingObjectTagsFor(t *testing.T) {
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("%s %s: got %q %v, want %q %v", tc.effect, tc.conditions, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+// Group-only and external identities need mapping lookups that normally
+// fall back to storage. Candidate collection must stay within the cache even
+// for those identities, while still finding their group/claim/role policy.
+func TestUnreadTagPolicySetsCacheOnly(t *testing.T) {
+	ctx, sys, _ := prepareIAMRevisionFixture(t)
+	const policyName = "unread-tag-policy"
+	batchAuthzPolicy(ctx, t, sys, policyName, `{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/k":"v"}}}`)
+	member := iamAdminUser(ctx, t, sys, "unread-group-member", "")
+	_, err := sys.AddUsersToGroup(ctx, "unread-group", []string{member.AccessKey})
+	mustIAM(t, err)
+	_, err = sys.PolicyDBSet(ctx, "unread-group", policyName, regUser, true)
+	mustIAM(t, err)
+	role, err := arn.NewIAMRoleARN("unread-role", "")
+	mustIAM(t, err)
+	sys.rolesMap = map[arn.ARN]string{role: policyName}
+	claimUser := auth.Credentials{
+		AccessKey: "unread-sts", ParentUser: "external-parent", SessionToken: "token",
+		Expiration: UTCNow().Add(time.Hour), Claims: map[string]any{iamPolicyClaimNameOpenID(): policyName},
+	}
+	roleUser := claimUser
+	roleUser.Claims = map[string]any{roleArnClaim: role.String()}
+	original := sys.store.IAMStorageAPI
+	defer func() { sys.store.IAMStorageAPI = original }()
+	for _, tc := range []struct {
+		name string
+		cred auth.Credentials
+	}{
+		{"group", member},
+		{"claims", claimUser},
+		{"role", roleUser},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := tc.cred.AccessKey
+			if tc.cred.ParentUser != "" {
+				name = tc.cred.ParentUser
+			}
+			probe := &batchBlockedIAMStore{
+				IAMStorageAPI: original, mapping: name, doc: policyName,
+				started: make(chan struct{}), release: make(chan struct{}),
+			}
+			close(probe.release) // report an accidental read without blocking the test
+			sys.store.IAMStorageAPI = probe
+			sets := sys.unreadTagPolicySets(tc.cred)
+			select {
+			case <-probe.started:
+				t.Error("candidate collection attempted a storage read")
+			default:
+			}
+			if len(sets) != 1 || len(sets[0]) != 1 {
+				t.Fatalf("expected the cached policy through %s, got %v", tc.name, sets)
+			}
+		})
 	}
 }
