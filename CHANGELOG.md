@@ -15,11 +15,13 @@
 
 ## RELEASE.2026-11-09T00-00-00Z
 
-Package version: `20261109000000.0.0`. Publication status and artifacts are
-listed in [GitHub Releases](https://github.com/pgsty/silo/releases). This
-section covers the changes after the published 20261026 source `c3ad836aed0d`.
-Most fixes come from reports and patches by
-[@botdeniska](https://github.com/botdeniska); see [CONTRIBUTORS.md](CONTRIBUTORS.md).
+Package version: `20261109000000.0.0`; published from source `d998292387cc`.
+Artifacts are listed in the [GitHub release](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z).
+The coordinated [English release notes](https://silo.pgsty.com/blog/release/silo-20261109/)
+and [Chinese release notes](https://silo.pgsty.com/zh/blog/release/silo-20261109/)
+cover all components, upgrade guidance, and validation scope since the
+published 20261026 source `c3ad836aed0d`. Most fixes come from reports and
+patches by [@botdeniska](https://github.com/botdeniska); see [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 Lifecycle, multi-pool and tiering:
 
@@ -34,7 +36,8 @@ Lifecycle, multi-pool and tiering:
   `retainVersions: 0`) on the expired key instead of the keys below it; a key
   with a tiered or Object Lock protected version is refused
   ([#297](https://github.com/pgsty/silo/issues/297)).
-- Stop taking the free version of a deleted tiered version for a version
+- Exclude the internal free-version marker of a deleted tiered version from
+  visible version history and lifecycle decisions
   ([#263](https://github.com/pgsty/silo/issues/263)), apply rules whose only
   action is `DelMarkerExpiration` ([#268](https://github.com/pgsty/silo/issues/268)),
   and report and account only the removals that happened
