@@ -187,9 +187,17 @@ type revisionKey struct {
 // input is canonical: each map, including the part checksums of a legacy
 // version, is its own section with its entry count and sorted,
 // length-prefixed entries, since msgp encodes maps in iteration order and an
-// entry must not move between maps unnoticed. The header of a
-// legacy version carries a signature over its per-shard checksums, so the
-// key replaces it with one from the digest.
+// entry must not move between maps unnoticed.
+//
+// A drive holds the header that the release which wrote the version there
+// stored, and a heal writes the one of its own release: headers from before
+// RELEASE.2024-04-28 carry no erasure coding, and the signature counted
+// empty part ETags until RELEASE.2022-01-25. Reads and heal take such drives
+// for one version (matchesNotStrict), and nothing rewrites them. The key has
+// both as the current release computes them from the metadata, so that the
+// header of a version it wrote stays as stored: the signature also orders
+// versions of one time in the merge. The signature of a legacy version is
+// over its per-shard checksums; the key has one from the digest.
 func versionRevision(ver xlMetaV2ShallowVersion, metaV uint8) revisionKey {
 	h := sha256.New()
 	writeUint := func(n int) {
@@ -267,8 +275,12 @@ func versionRevision(ver xlMetaV2ShallowVersion, metaV uint8) revisionKey {
 			section("fields", 1)
 			writeField(bts)
 			h.Sum(key.digest[:0])
-			if v.Type == LegacyType {
+			switch v.Type {
+			case LegacyType:
 				copy(key.header.Signature[:], key.digest[:])
+			case ObjectType:
+				key.header.Signature = v.ObjectV2.Signature()
+				key.header.EcN, key.header.EcM = uint8(v.ObjectV2.ErasureN), uint8(v.ObjectV2.ErasureM)
 			}
 			return key
 		}
@@ -350,7 +362,7 @@ func authoritativeHistory(ctx context.Context, metas [][]xlMetaV2ShallowVersion,
 	// its count, and one that shares the header could stand in for the
 	// accepted one, so the merge only sees the accepted revision of each
 	// version and free versions as they are. It sees the headers of the
-	// keys, which do not differ between the drives of a legacy version.
+	// keys, which do not differ between the drives of a revision.
 	filtered := make([][]xlMetaV2ShallowVersion, len(metas))
 	for i, versions := range metas {
 		for j, ver := range versions {
