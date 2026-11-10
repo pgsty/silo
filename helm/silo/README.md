@@ -34,9 +34,10 @@ helm install silo ./helm/silo \
   --set rootPassword='replace-with-a-long-random-secret'
 ```
 
-The default server and post-install image is `docker.io/pgsty/silo`. The image
-contains the `silo` server, `mcli`, and an `mc` compatibility symlink. It does
-not contain a `minio` server binary.
+The default server image is `docker.io/pgsty/silo` (which contains the `silo`
+server, `mcli`, and an `mc` client compatibility symlink, without a `minio`
+server binary). Post-install resource jobs use `mcImage` (`docker.io/pgsty/mc`)
+by default.
 
 ## Compatibility contract
 
@@ -99,6 +100,19 @@ Rollback is chart-level: use `helm rollback`, not an image-only downgrade. The
 new chart invokes `silo server`; an old image does not provide that executable.
 The new image accepts a legacy first argv token of `minio` only to support old
 chart commands during the forward migration.
+
+When upgrading an existing Silo release to `RELEASE.2026-11-09T00-00-00Z` (chart
+`7.0.4`):
+
+- `helm upgrade --reuse-values` keeps the previously saved `image.tag` and
+  `mcImage.tag`; pass `--set-string image.tag=RELEASE.2026-11-09T00-00-00Z` and
+  `--set-string mcImage.tag=RELEASE.2026-11-09T00-00-00Z` explicitly.
+- Drain or cancel active batch jobs before upgrading; `20261026` cannot resume
+  new submitter-bound batch manifests on downgrade.
+- Single-pool clusters whose erasure sets do not all share the same pods/hosts
+  require a drained stop-all upgrade rather than a rolling pod restart, and
+  `POST ?restore` returns `503` while mixed versions are serving. See the
+  [20261109 release notes](https://silo.pgsty.com/blog/release/silo-20261109/#upgrade).
 
 ## Persistence and TLS
 
