@@ -144,13 +144,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	zipInfo := zipObjInfo.ArchiveInfo(r.Header)
 	if len(zipInfo) == 0 {
-		opts.EncryptFn, err = zipObjInfo.metadataEncryptFn(r.Header)
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-			return
-		}
-
-		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
+		zipInfo, _, err = readObjectZIPInfo(ctx, objectAPI, bucket, zipPath, opts)
 	}
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -245,8 +239,7 @@ func listObjectsV2InArchive(ctx context.Context, objectAPI ObjectLayer, bucket, 
 
 	zipInfo := zipObjInfo.ArchiveInfo(h)
 	if len(zipInfo) == 0 {
-		// Always update the latest version
-		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, ObjectOptions{})
+		zipInfo, _, err = readObjectZIPInfo(ctx, objectAPI, bucket, zipPath, ObjectOptions{})
 	}
 	if err != nil {
 		return ListObjectsV2Info{}, err
@@ -437,12 +430,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 	zipInfo := zipObjInfo.ArchiveInfo(r.Header)
 	if len(zipInfo) == 0 {
-		opts.EncryptFn, err = zipObjInfo.metadataEncryptFn(r.Header)
-		if err != nil {
-			writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
-			return
-		}
-		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
+		zipInfo, _, err = readObjectZIPInfo(ctx, objectAPI, bucket, zipPath, opts)
 	}
 	if err != nil {
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
@@ -482,15 +470,22 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 	w.WriteHeader(http.StatusOK)
 }
 
-// Update the passed zip object metadata with the zip contents info, file name, modtime, size, etc.
-// The returned zip index will de decrypted.
-func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, error) {
+// readObjectZIPInfo builds an index without modifying the object. A GET, HEAD
+// or archive listing must remain read-only even when no index was stored.
+func readObjectZIPInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, ObjectInfo, error) {
 	files, srcInfo, err := getFilesListFromZIPObject(ctx, objectAPI, bucket, object, opts)
 	if err != nil {
-		return nil, err
+		return nil, srcInfo, err
 	}
 	files.OptimizeSize()
 	zipInfo, err := files.Serialize()
+	return zipInfo, srcInfo, err
+}
+
+// updateObjectMetadataWithZipInfo persists an index only for upload operations
+// that explicitly request extraction. The returned index is decrypted.
+func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, error) {
+	zipInfo, srcInfo, err := readObjectZIPInfo(ctx, objectAPI, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +495,6 @@ func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer,
 		at = archiveTypeEnc
 		zipInfoStr = string(opts.EncryptFn(archiveTypeEnc, zipInfo))
 	}
-	srcInfo.UserDefined[archiveTypeMetadataKey] = at
 	popts := ObjectOptions{
 		MTime:     srcInfo.ModTime,
 		VersionID: srcInfo.VersionID,

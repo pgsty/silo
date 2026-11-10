@@ -1195,6 +1195,7 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	if opts.replicaObjectInfo == nil && (opts.ReplicaLockReconcile || !opts.ReplicationRequest) {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
+	opts.replicaContentGuard = z.guardReplicaContent
 	oi, err := z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
 	if err == nil && opts.ReplicaLockReconcile && !opts.DataMovement {
 		err = z.retireReplicaCopies(ctx, bucket, object, idx, oi)
@@ -1749,6 +1750,9 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		return objInfo, err
 	}
 
+	if !z.SinglePool() {
+		dstOpts.replicaContentGuard = z.guardReplicaContent
+	}
 	if !z.SinglePool() && (dstOpts.ReplicaLockReconcile || !dstOpts.ReplicationRequest) {
 		dstOpts.replicaObjectInfo = z.replicaObjectInfo
 		if dstOpts.ReplicaLockReconcile && !dstOpts.DataMovement {
@@ -1799,6 +1803,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		ReplicaLockReconcile:       dstOpts.ReplicaLockReconcile,
 		DataMovement:               dstOpts.DataMovement,
 		replicaObjectInfo:          dstOpts.replicaObjectInfo,
+		replicaContentGuard:        dstOpts.replicaContentGuard,
 	}
 
 	return z.serverPools[poolIdx].PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
@@ -2524,6 +2529,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 
+	opts.replicaContentGuard = z.guardReplicaContent
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue

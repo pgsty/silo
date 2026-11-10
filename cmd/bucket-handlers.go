@@ -478,15 +478,11 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	getObjectInfoFn := objectAPI.GetObjectInfo
 
 	var (
-		hasLockEnabled bool
-		dsc            ReplicateDecision
-		goi            ObjectInfo
-		gerr           error
+		dsc  ReplicateDecision
+		goi  ObjectInfo
+		gerr error
 	)
 	replicateDeletes := hasReplicationRules(ctx, bucket, deleteObjectsReq.Objects)
-	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled {
-		hasLockEnabled = true
-	}
 
 	type deleteResult struct {
 		delInfo DeletedObject
@@ -537,10 +533,10 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			VersionSuspended: vc.Suspended(),
 		}
 
-		// Physical version deletes in a locked bucket are checked by the
-		// single-object path below, while its mutation lock is held. A lookup
-		// here could miss a later protection update or a protected pool copy.
-		if hasLockEnabled && object.VersionID != "" {
+		// Every physical version delete checks the version's own protection
+		// under its mutation lock. Bucket metadata may be stale or unavailable
+		// and cannot establish that a stored version is unprotected.
+		if object.VersionID != "" {
 			if first, ok := objectsToDelete[object]; ok {
 				duplicateOf[index] = first
 			} else {
@@ -605,7 +601,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	bulk := make([]ObjectToDelete, 0, len(deleteList))
 	bulkIndex := make([]int, 0, len(deleteList))
 	for i, object := range deleteList {
-		if !hasLockEnabled || object.VersionID == "" {
+		if object.VersionID == "" {
 			bulk = append(bulk, object)
 			bulkIndex = append(bulkIndex, i)
 			continue
@@ -663,7 +659,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		// under the mutation lock, and a missing version has no stored identity.
 		dindex := objectsToDelete[deleteList[i]]
 		if errs[i] == nil || isErrObjectNotFound(errs[i]) || isErrVersionNotFound(errs[i]) {
-			if replicateDeletes && (!hasLockEnabled || deleteList[i].VersionID == "") {
+			if replicateDeletes && deleteList[i].VersionID == "" {
 				dObjects[i].ReplicationState = deleteList[i].ReplicationState()
 			}
 			deleteResults[dindex].delInfo = dObjects[i]

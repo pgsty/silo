@@ -13,6 +13,8 @@ package cmd
 import (
 	"context"
 	"net/http"
+	"slices"
+	"strings"
 
 	objectreplication "github.com/minio/minio/internal/bucket/replication"
 	xhttp "github.com/minio/minio/internal/http"
@@ -62,12 +64,31 @@ func isReplicaTrusted(ctx context.Context) bool {
 // grant must not turn client-controlled internal headers into trusted state.
 func replicationPermissionAllowed(ctx context.Context, r *http.Request, bucket, object string, action policy.Action) bool {
 	reqInfo := logger.GetReqInfo(ctx)
-	if reqInfo == nil || reqInfo.Cred.AccessKey == "" {
+	if reqInfo == nil || reqInfo.Cred.AccessKey == "" || !replicationHeadersSigned(r) {
 		return false
 	}
 	reqInfo.BucketName = bucket
 	reqInfo.ObjectName = object
 	return authorizeRequest(ctx, r, action) == ErrNone
+}
+
+// replicationHeadersSigned binds every internal control to the authenticated
+// header signature. Query grants and SigV2 requests cannot confer peer trust.
+// Call only after the request's signature has been verified.
+func replicationHeadersSigned(r *http.Request) bool {
+	if !isRequestSignatureV4(r) || isRequestPresignedSignatureV4(r) {
+		return false
+	}
+	sig, errCode := parseSignV4(r.Header.Get(xhttp.Authorization), globalSite.Region(), serviceS3)
+	if errCode != ErrNone {
+		return false
+	}
+	for _, name := range replicationRequestHeaders {
+		if _, present := r.Header[http.CanonicalHeaderKey(name)]; present && !slices.Contains(sig.SignedHeaders, strings.ToLower(name)) {
+			return false
+		}
+	}
+	return true
 }
 
 // evaluateReplicationTrust decides whether a request may carry replication

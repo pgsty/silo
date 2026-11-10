@@ -1722,6 +1722,9 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		}
 	}
 
+	if err := er.checkReplicaContent(ctx, bucket, object, minioMetaMultipartBucket, uploadIDPath, partsMetadata, onlineDisks, opts); err != nil {
+		return oi, toObjectErr(err, bucket, object)
+	}
 	er.cleanupMultipartPath(ctx, paths...) // cleanup all part.N.meta, and skipped part.N's before final rename().
 
 	defer func() {

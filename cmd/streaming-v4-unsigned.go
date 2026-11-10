@@ -24,6 +24,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 // newUnsignedV4ChunkedReader returns a new s3UnsignedChunkedReader that translates
@@ -42,8 +44,10 @@ func newUnsignedV4ChunkedReader(req *http.Request, trailer bool) (io.ReadCloser,
 	if isRequestPresignedSignatureV4(req) {
 		return nil, ErrSignatureVersionNotSupported
 	}
-	if isRequestSignatureV4(req) {
-		if errCode := reqSignatureV4Verify(req, globalSite.Region(), serviceS3); errCode != ErrNone {
+	// Any claimed header credential must pass the complete SigV4 parser. The
+	// streaming auth classification does not require the algorithm prefix.
+	if req.Header.Get(xhttp.Authorization) != "" {
+		if errCode := doesSignatureMatch(unsignedPayloadTrailer, req, globalSite.Region(), serviceS3); errCode != ErrNone {
 			return nil, errCode
 		}
 	}

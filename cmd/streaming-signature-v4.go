@@ -127,6 +127,9 @@ func calculateSeedSignature(r *http.Request, trailers bool) (cred auth.Credentia
 	if errCode != ErrNone {
 		return cred, "", "", time.Time{}, errCode
 	}
+	if errCode := checkUnsignedHeaders(extractedSignedHeaders, r); errCode != ErrNone {
+		return cred, "", "", time.Time{}, errCode
+	}
 
 	cred, _, errCode = checkKeyValid(r, signV4Values.Credential.accessKey)
 	if errCode != ErrNone {

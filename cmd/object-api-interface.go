@@ -122,6 +122,8 @@ type ObjectOptions struct {
 
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn
+	// Verifies protected content in every pool before a replica commits.
+	replicaContentGuard replicaContentGuardFn
 
 	// RefuseLockedOverwrite refuses, under the destination's write lock, a
 	// write that would replace a stored version Object Lock protects: the

@@ -148,6 +148,17 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 			fi.IsLatest = true // we are creating a new version so this is latest.
 		}
 	}
+	if srcInfo.versionOnly && (dstOpts.ReplicaLockReconcile || dstOpts.ReplicationRequest) && !dstOpts.DataMovement {
+		candidate := slices.Clone(metaArr)
+		for i := range candidate {
+			candidate[i].VersionID = versionID
+			candidate[i].Metadata = srcInfo.UserDefined
+		}
+		readDisks, readMeta := shuffleDisksAndPartsMetadataByIndex(onlineDisks, candidate, fi)
+		if err := er.checkReplicaContent(ctx, dstBucket, dstObject, srcBucket, srcObject, readMeta, readDisks, dstOpts); err != nil {
+			return oi, err
+		}
+	}
 
 	if !dstOpts.ReplicationRequest && !dstOpts.ReplicaLockReconcile && !dstOpts.DataMovement &&
 		(versionID == "" || versionID == nullVersionID) {
@@ -1722,6 +1733,9 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	}
 
 	// Rename the successfully written temporary object to final location.
+	if err := er.checkReplicaContent(ctx, bucket, object, minioMetaTmpBucket, tempObj, partsMetadata, onlineDisks, opts); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 	onlineDisks, versions, oldDataDir, err := renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum)
 	if err != nil {
 		if errors.Is(err, errFileNotFound) {

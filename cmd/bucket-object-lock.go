@@ -491,6 +491,25 @@ func (s objectLockState) legalHoldIsOlderThan(src time.Time) bool {
 	return olderThan(s.legalHoldTimestamp, src)
 }
 
+// A peer's ordering timestamp cannot override an unexpired COMPLIANCE lock.
+// Otherwise it could first remove retention with a same-content retransmit,
+// then replace the now-unprotected version in a second request.
+func (s objectLockState) complianceWouldWeaken(incoming objectLockState) bool {
+	if s.mode != string(objectlock.RetCompliance) {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339Nano, s.retainUntil)
+	if err != nil {
+		return true
+	}
+	now, err := objectlock.UTCNowNTP()
+	if err == nil && !until.After(now) {
+		return false
+	}
+	nextUntil, nextErr := time.Parse(time.RFC3339Nano, incoming.retainUntil)
+	return incoming.mode != string(objectlock.RetCompliance) || nextErr != nil || nextUntil.Before(until)
+}
+
 // restoreRetention and restoreLegalHold put the stored state back into
 // metadata that was rebuilt from a request whose update was not applied.
 func (s objectLockState) restoreRetention(metadata map[string]string) {
@@ -610,7 +629,7 @@ func reconcileStoredObjectLock(metadata map[string]string, stored objectLockStat
 	incoming := storedObjectLockState(metadata)
 
 	incomingRetentionTS, _ := time.Parse(time.RFC3339Nano, incoming.retentionTimestamp)
-	if !stored.retentionIsOlderThan(incomingRetentionTS) {
+	if !stored.retentionIsOlderThan(incomingRetentionTS) || stored.complianceWouldWeaken(incoming) {
 		// The stored retention is at least as new as the incoming one (or the
 		// incoming update is unordered): drop the incoming value and put the stored
 		// state back, which may itself be a removal (value keys absent, timestamp

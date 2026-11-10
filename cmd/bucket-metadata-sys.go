@@ -697,7 +697,7 @@ func (sys *BucketMetadataSys) GetConfig(ctx context.Context, bucket string) (met
 	}
 
 	val, err, _ := sys.group.Do(bucket, func() (val any, err error) {
-		meta, err = loadBucketMetadata(ctx, objAPI, bucket)
+		meta, err := loadBucketMetadata(ctx, objAPI, bucket)
 		if err != nil {
 			if !sys.Initialized() {
 				// bucket metadata not yet initialized
@@ -707,13 +707,18 @@ func (sys *BucketMetadataSys) GetConfig(ctx context.Context, bucket string) (met
 		return meta, err
 	})
 	meta, _ = val.(BucketMetadata)
+	sys.Lock()
+	defer sys.Unlock()
+	// A writer may have published a newer configuration while the disk read
+	// was in flight. Never replace that publication with the older load.
+	if current, ok := sys.metadataMap[bucket]; ok {
+		return current, false, nil
+	}
 	if err != nil {
 		return meta, false, err
 	}
-	sys.Lock()
 	sys.metadataMap[bucket] = meta
 	sys.clearLoadFailure(bucket)
-	sys.Unlock()
 
 	return meta, true, nil
 }
