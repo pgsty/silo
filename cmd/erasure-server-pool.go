@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"net/http"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1541,6 +1542,27 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 
 		derrs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
 		objSets.Add(objects[i].ObjectName)
+	}
+
+	// A name that fails the check keeps its error and goes no further. Joined
+	// to the bucket it can name a path in another bucket or in the meta
+	// bucket, so it is not locked, looked up or sent to a drive. The other
+	// names are deleted as a request of their own: everything below sees only
+	// names that passed.
+	if slices.ContainsFunc(derrs, func(err error) bool { return err != nil }) {
+		valid, at := make([]ObjectToDelete, 0, len(objects)), make([]int, 0, len(objects))
+		for i, obj := range objects {
+			if derrs[i] == nil {
+				valid, at = append(valid, obj), append(at, i)
+			}
+		}
+		if len(valid) > 0 {
+			deleted, errs := z.DeleteObjects(ctx, bucket, valid, opts)
+			for j, i := range at {
+				dobjects[i], derrs[i] = deleted[j], errs[j]
+			}
+		}
+		return dobjects, derrs
 	}
 
 	// A single pool locks each name in the set its writers lock it in, one
