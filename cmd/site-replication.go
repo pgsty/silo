@@ -1256,9 +1256,10 @@ func (c *SiteReplicationSys) IAMChangeHook(ctx context.Context, item madmin.SRIA
 	// The IAM item has already been applied to the local cluster at this
 	// point, and only needs to be updated on all remote peer clusters.
 
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	// What is sent is read from storage before the lock is taken: loading
+	// an identity asks whether site replication is enabled, and a read lock
+	// asked for a second time behind a waiting writer is never granted.
+	if !c.isEnabled() {
 		return nil
 	}
 
@@ -1283,6 +1284,12 @@ func (c *SiteReplicationSys) IAMChangeHook(ctx context.Context, item madmin.SRIA
 	}
 	if err != nil {
 		return err
+	}
+
+	c.RLock()
+	defer c.RUnlock()
+	if !c.enabled {
+		return nil
 	}
 	cerr := c.concDo(nil, func(d string, p madmin.PeerInfo) error {
 		admClient, err := c.getAdminClient(ctx, d)
@@ -2365,41 +2372,11 @@ func (c *SiteReplicationSys) syncToAllPeers(ctx context.Context, addOpts madmin.
 				continue
 			}
 
-			claims, err := globalIAMSys.GetClaimsForSvcAcc(ctx, acc.Credentials.AccessKey)
-			if err != nil {
-				return errSRBackendIssue(err)
-			}
-
-			_, policy, err := globalIAMSys.GetServiceAccount(ctx, acc.Credentials.AccessKey)
-			if err != nil {
-				return errSRBackendIssue(err)
-			}
-
-			var policyJSON []byte
-			if policy != nil {
-				policyJSON, err = json.Marshal(policy)
-				if err != nil {
-					return wrapSRErr(err)
-				}
-			}
-
+			// The hook sends the account as it is stored (see replicationItem).
 			err = c.IAMChangeHook(ctx, madmin.SRIAMItem{
-				Type: madmin.SRIAMItemSvcAcc,
-				SvcAccChange: &madmin.SRSvcAccChange{
-					Create: &madmin.SRSvcAccCreate{
-						Parent:        acc.Credentials.ParentUser,
-						AccessKey:     user,
-						SecretKey:     acc.Credentials.SecretKey,
-						Groups:        acc.Credentials.Groups,
-						Claims:        claims,
-						SessionPolicy: policyJSON,
-						Status:        acc.Credentials.Status,
-						Name:          acc.Credentials.Name,
-						Description:   acc.Credentials.Description,
-						Expiration:    &acc.Credentials.Expiration,
-					},
-				},
-				UpdatedAt: acc.UpdatedAt,
+				Type:         madmin.SRIAMItemSvcAcc,
+				SvcAccChange: &madmin.SRSvcAccChange{Create: &madmin.SRSvcAccCreate{AccessKey: user}},
+				UpdatedAt:    acc.UpdatedAt,
 			})
 			if err != nil {
 				return errSRIAMError(err)
@@ -5485,50 +5462,12 @@ func (c *SiteReplicationSys) healUsers(ctx context.Context, objAPI ObjectLayer, 
 		}
 		creds := u.Credentials
 		if creds.IsServiceAccount() {
-			claims, err := globalIAMSys.GetClaimsForSvcAcc(ctx, creds.AccessKey)
-			if err != nil {
-				replLogOnceIf(ctx,
-					fmt.Errorf("Unable to heal service account from peer site %s -> %s : %w", latestPeerName, peerName, err),
-					fmt.Sprintf("heal-user-%s", user))
-				continue
-			}
-
-			_, policy, err := globalIAMSys.GetServiceAccount(ctx, creds.AccessKey)
-			if err != nil {
-				replLogOnceIf(ctx,
-					fmt.Errorf("Unable to heal service account from peer site %s -> %s : %w", latestPeerName, peerName, err),
-					fmt.Sprintf("heal-user-%s", user))
-				continue
-			}
-
-			var policyJSON []byte
-			if policy != nil {
-				policyJSON, err = json.Marshal(policy)
-				if err != nil {
-					replLogOnceIf(ctx,
-						fmt.Errorf("Unable to heal service account from peer site %s -> %s : %w", latestPeerName, peerName, err),
-						fmt.Sprintf("heal-user-%s", user))
-					continue
-				}
-			}
-
+			// The hook sends the account as it is stored (see
+			// replicationItem), not as this server has it cached.
 			if err := c.IAMChangeHook(ctx, madmin.SRIAMItem{
-				Type: madmin.SRIAMItemSvcAcc,
-				SvcAccChange: &madmin.SRSvcAccChange{
-					Create: &madmin.SRSvcAccCreate{
-						Parent:        creds.ParentUser,
-						AccessKey:     creds.AccessKey,
-						SecretKey:     creds.SecretKey,
-						Groups:        creds.Groups,
-						Claims:        claims,
-						SessionPolicy: policyJSON,
-						Status:        creds.Status,
-						Name:          creds.Name,
-						Description:   creds.Description,
-						Expiration:    &creds.Expiration,
-					},
-				},
-				UpdatedAt: lastUpdate,
+				Type:         madmin.SRIAMItemSvcAcc,
+				SvcAccChange: &madmin.SRSvcAccChange{Create: &madmin.SRSvcAccCreate{AccessKey: creds.AccessKey}},
+				UpdatedAt:    lastUpdate,
 			}); err != nil {
 				replLogOnceIf(ctx,
 					fmt.Errorf("Unable to heal service account from peer site %s -> %s : %w", latestPeerName, peerName, err),

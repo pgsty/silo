@@ -914,21 +914,13 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 	}
 
 	// Call site replication hook - non-root user accounts are replicated.
+	// The hook sends the account as it is stored after this edit, not the
+	// fields the request changed (see replicationItem).
 	if svcAccount.ParentUser != globalActiveCred.AccessKey {
 		replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-			Type: madmin.SRIAMItemSvcAcc,
-			SvcAccChange: &madmin.SRSvcAccChange{
-				Update: &madmin.SRSvcAccUpdate{
-					AccessKey:     accessKey,
-					SecretKey:     opts.secretKey,
-					Status:        opts.status,
-					Name:          opts.name,
-					Description:   opts.description,
-					SessionPolicy: madmin.SRSessionPolicy(updateReq.NewPolicy),
-					Expiration:    updateReq.NewExpiration,
-				},
-			},
-			UpdatedAt: updatedAt,
+			Type:         madmin.SRIAMItemSvcAcc,
+			SvcAccChange: &madmin.SRSvcAccChange{Update: &madmin.SRSvcAccUpdate{AccessKey: accessKey}},
+			UpdatedAt:    updatedAt,
 		}))
 	}
 
@@ -2399,36 +2391,12 @@ func (a adminAPIHandlers) ExportIAM(w http.ResponseWriter, r *http.Request) {
 					// skip site-replication service account.
 					continue
 				}
-				claims, err := globalIAMSys.GetClaimsForSvcAcc(ctx, acc.Credentials.AccessKey)
+				// The stored record only: this server's cache may not have
+				// heard of an edit made through another server.
+				svcAccts[user], err = serviceAccountSnapshot(acc)
 				if err != nil {
 					writeErrorResponse(ctx, w, exportError(ctx, err, iamFile, ""), r.URL)
 					return
-				}
-				sa, policy, err := globalIAMSys.GetServiceAccount(ctx, acc.Credentials.AccessKey)
-				if err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, iamFile, ""), r.URL)
-					return
-				}
-
-				var policyJSON []byte
-				if policy != nil {
-					policyJSON, err = json.Marshal(policy)
-					if err != nil {
-						writeErrorResponse(ctx, w, exportError(ctx, err, iamFile, ""), r.URL)
-						return
-					}
-				}
-				svcAccts[user] = madmin.SRSvcAccCreate{
-					Parent:        acc.Credentials.ParentUser,
-					AccessKey:     user,
-					SecretKey:     acc.Credentials.SecretKey,
-					Groups:        acc.Credentials.Groups,
-					Claims:        claims,
-					SessionPolicy: policyJSON,
-					Status:        acc.Credentials.Status,
-					Name:          sa.Name,
-					Description:   sa.Description,
-					Expiration:    &sa.Expiration,
 				}
 			}
 

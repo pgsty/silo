@@ -172,14 +172,41 @@ func (c *SiteReplicationSys) replicationItem(ctx context.Context, item madmin.SR
 			key = item.SvcAccChange.Update.AccessKey
 		}
 		if key != "" {
-			r, err := loadIAMRevision(ctx, globalIAMSys.store, getUserIdentityPath(key, svcUser))
+			// A create or an edit goes out as the account stored now: the
+			// whole record, under its revision, whatever the caller's item
+			// says. A peer orders items by revision and drops an older one,
+			// so an edit sent as the fields it changed would lose every
+			// earlier edit that did not reach the peer, or reaches it late.
+			// A later write that won before sending goes out in place of
+			// this one.
+			stored := make(map[string]UserIdentity, 1)
+			err := globalIAMSys.store.loadUser(ctx, key, svcUser, stored)
+			if err != nil && !errors.Is(err, errNoSuchUser) {
+				return out, err
+			}
+			u, ok := stored[key]
+			if !ok {
+				// Nothing is sent for an account that is deleted, expired or
+				// of a revoked parent meanwhile; a deletion replicates itself.
+				// A stored token that cannot be read is an error, and the
+				// account is not taken for sent.
+				var raw UserIdentity
+				err := globalIAMSys.store.loadIAMConfig(ctx, &raw, getUserIdentityPath(key, svcUser))
+				if err == nil && !raw.Deleted && !raw.Credentials.IsExpired() {
+					_, err = extractJWTClaims(raw)
+				}
+				if err != nil && !errors.Is(err, errConfigNotFound) {
+					return out, err
+				}
+				return out, errIAMStaleUpdate
+			}
+			snapshot, err := serviceAccountSnapshot(u)
 			if err != nil {
 				return out, err
 			}
-			if r.Deleted || r.timestamp().After(item.UpdatedAt) {
-				return out, errIAMStaleUpdate
-			}
-			out.RevokedBefore = r.RevokedBefore
+			out.SvcAccChange = &madmin.SRSvcAccChange{Create: &snapshot}
+			out.UpdatedAt = u.UpdatedAt
+			out.RevokedBefore = u.RevokedBefore
 		}
 	}
 	if item.Type == madmin.SRIAMItemGroupInfo && item.GroupInfo != nil && !item.GroupInfo.UpdateReq.IsRemove {

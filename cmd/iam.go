@@ -1311,22 +1311,62 @@ func (sys *IAMSys) getServiceAccount(ctx context.Context, accessKey string) (Use
 		return UserIdentity{}, nil, errNoSuchServiceAccount
 	}
 
-	var embeddedPolicy *policy.Policy
+	embeddedPolicy, err := embeddedServiceAccountPolicy(jwtClaims)
+	if err != nil {
+		return UserIdentity{}, nil, err
+	}
+	return sa, embeddedPolicy, nil
+}
 
+// embeddedServiceAccountPolicy returns the policy embedded in the token of a
+// service account, or nil when the account has the policies of its parent.
+func embeddedServiceAccountPolicy(jwtClaims *jwt.MapClaims) (*policy.Policy, error) {
 	pt, ptok := jwtClaims.Lookup(iamPolicyClaimNameSA())
 	sp, spok := jwtClaims.Lookup(policy.SessionPolicyName)
-	if ptok && spok && pt == embeddedPolicyType {
-		policyBytes, err := base64.StdEncoding.DecodeString(sp)
-		if err != nil {
-			return UserIdentity{}, nil, err
-		}
-		embeddedPolicy, err = policy.ParseConfig(bytes.NewReader(policyBytes))
-		if err != nil {
-			return UserIdentity{}, nil, err
+	if !ptok || !spok || pt != embeddedPolicyType {
+		return nil, nil
+	}
+	policyBytes, err := base64.StdEncoding.DecodeString(sp)
+	if err != nil {
+		return nil, err
+	}
+	return policy.ParseConfig(bytes.NewReader(policyBytes))
+}
+
+// serviceAccountSnapshot returns service account u, a record loaded from
+// storage, as the create that replication, the first sync, heal and export
+// carry. Its claims and its embedded policy are read from the token of that
+// record, so that every part of the snapshot is of one revision: a server's
+// cache may hold the account as it was before an edit made through another
+// server.
+func serviceAccountSnapshot(u UserIdentity) (madmin.SRSvcAccCreate, error) {
+	jwtClaims, err := extractJWTClaims(u)
+	if err != nil {
+		return madmin.SRSvcAccCreate{}, err
+	}
+	embeddedPolicy, err := embeddedServiceAccountPolicy(jwtClaims)
+	if err != nil {
+		return madmin.SRSvcAccCreate{}, err
+	}
+	var policyJSON []byte
+	if embeddedPolicy != nil {
+		if policyJSON, err = json.Marshal(embeddedPolicy); err != nil {
+			return madmin.SRSvcAccCreate{}, err
 		}
 	}
-
-	return sa, embeddedPolicy, nil
+	cr := u.Credentials
+	return madmin.SRSvcAccCreate{
+		Parent:        cr.ParentUser,
+		AccessKey:     cr.AccessKey,
+		SecretKey:     cr.SecretKey,
+		Groups:        cr.Groups,
+		Claims:        jwtClaims.Map(),
+		SessionPolicy: policyJSON,
+		Status:        cr.Status,
+		Name:          cr.Name,
+		Description:   cr.Description,
+		Expiration:    &cr.Expiration,
+	}, nil
 }
 
 // GetTemporaryAccount - wrapper method to get information about a temporary account
@@ -1396,25 +1436,6 @@ func (sys *IAMSys) getAccountWithClaims(ctx context.Context, accessKey string) (
 	}
 
 	return acc, jwtClaims, nil
-}
-
-// GetClaimsForSvcAcc - gets the claims associated with the service account.
-func (sys *IAMSys) GetClaimsForSvcAcc(ctx context.Context, accessKey string) (map[string]any, error) {
-	if !sys.Initialized() {
-		return nil, errServerNotInitialized
-	}
-
-	sa, ok := sys.store.GetUser(accessKey)
-	if !ok || !sa.Credentials.IsServiceAccount() {
-		return nil, errNoSuchServiceAccount
-	}
-
-	jwtClaims, err := extractJWTClaims(sa)
-	if err != nil {
-		return nil, err
-	}
-
-	return jwtClaims.Map(), nil
 }
 
 // DeleteServiceAccount - delete a service account
