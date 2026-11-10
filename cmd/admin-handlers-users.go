@@ -885,15 +885,15 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// A request without a policy, or with a JSON null for one, keeps the
+	// policy the account has. An empty policy document is passed on as
+	// such: it is the request to remove the embedded policy.
 	var sp *policy.Policy
-	if len(updateReq.NewPolicy) > 0 {
+	if len(updateReq.NewPolicy) > 0 && !bytes.Equal(updateReq.NewPolicy, []byte("null")) {
 		sp, err = policy.ParseConfigStrict(bytes.NewReader(updateReq.NewPolicy))
 		if err != nil {
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
-		}
-		if sp.Version == "" && len(sp.Statements) == 0 {
-			sp = nil
 		}
 	}
 	opts := updateServiceAccountOpts{
