@@ -414,6 +414,46 @@ func testMigrationLifecycleExpiry(t *testing.T, kind string) {
 	})
 }
 
+// Physical expiry advances the walk; creating a delete marker does not remove
+// the addressed version and must not make a walk repeat without progress.
+func TestPoolsMigrationLifecycleRemovalProgress(t *testing.T) {
+	for _, versioned := range []bool{false, true} {
+		status := versioning.State("")
+		name, wantRemoved := "physical-delete", 1
+		if versioned {
+			status = versioning.Enabled
+			name, wantRemoved = "delete-marker-only", 0
+		}
+		t.Run(name, func(t *testing.T) {
+			m := newMigrationILM(t, status, false, migrationILMExpireCurrent())
+			oi := m.put("obj-01", "v1", ObjectOptions{Versioned: versioned, MTime: UTCNow().Add(-72 * time.Hour)})
+			_, updatedAt, err := globalBucketMetadataSys.GetLifecycleConfig(m.bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			version := FileInfo{Name: oi.Name, VersionID: oi.VersionID, ModTime: oi.ModTime}
+			removed, err := m.z.removeMovedVersions(t.Context(), m.bucket, oi.Name, 0, []FileInfo{version}, []migrationExpiredVersion{{
+				version:            version,
+				event:              lifecycle.Event{Action: lifecycle.DeleteAction},
+				lifecycleUpdatedAt: updatedAt,
+				source:             lcEventSrc_Decom,
+			}})
+			if err != nil || removed != wantRemoved {
+				t.Fatalf("removed %d versions, err %v; want %d, nil", removed, err, wantRemoved)
+			}
+			if versioned {
+				if body := migrationTestBody(t, m.z.GetObjectNInfo, m.bucket, oi.Name, oi.VersionID); body != "obj-01 v1" {
+					t.Fatalf("noncurrent version reads %q", body)
+				}
+			}
+			current, err := m.z.GetObjectInfo(t.Context(), m.bucket, oi.Name, ObjectOptions{})
+			if !isErrObjectNotFound(err) || current.DeleteMarker != versioned {
+				t.Fatalf("after expiry: delete marker %t, err %v", current.DeleteMarker, err)
+			}
+		})
+	}
+}
+
 // A lifecycle action found during the migration walk must not be applied
 // after the bucket's lifecycle configuration changes. The source copy stays
 // available for a fresh scan under the new policy.

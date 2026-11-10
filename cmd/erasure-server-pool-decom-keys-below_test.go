@@ -17,7 +17,10 @@
 
 package cmd
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // A key below another key ("k/b" under "k") is a directory inside the
 // directory of that key. The listing treats the directory of an object as a
@@ -62,5 +65,38 @@ func TestDecommissionMovesKeysBelowAKey(t *testing.T) {
 		if body := migrationTestBody(t, z.GetObjectNInfo, bucket, key, ""); body != key {
 			t.Errorf("%s reads %q", key, body)
 		}
+	}
+}
+
+// An ILM expiry can remove the parent key during a decommission walk. That
+// removal must count as progress, or the next key below the parent remains
+// hidden from the listing and the source pool is left non-empty.
+func TestDecommissionContinuesAfterLifecycleRemovesParent(t *testing.T) {
+	z, _ := migrationTestPools(t)
+	const bucket = "decommission-ilm-keys-below"
+	if err := z.MakeBucket(t.Context(), bucket, MakeBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := globalBucketMetadataSys.Get(bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.LifecycleConfigXML = []byte(`<LifecycleConfiguration><Rule><ID>expire-old</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`)
+	if err := meta.Save(t.Context(), z); err != nil {
+		t.Fatal(err)
+	}
+	globalBucketMetadataSys.Set(bucket, meta)
+
+	putConsistencyObject(t, z, bucket, "k", 0, "parent", ObjectOptions{MTime: UTCNow().Add(-72 * time.Hour)})
+	putConsistencyObject(t, z, bucket, "k/b", 0, "child", ObjectOptions{MTime: UTCNow()})
+
+	if info := keysBelowDecommission(t, z); !info.Complete || info.Failed {
+		t.Fatalf("decommission: complete %v, failed %v; want complete", info.Complete, info.Failed)
+	}
+	if _, err := z.serverPools[0].GetObjectInfo(t.Context(), bucket, "k/b", ObjectOptions{}); !isErrObjectNotFound(err) {
+		t.Fatalf("child still in source pool: %v", err)
+	}
+	if body := migrationTestBody(t, z.GetObjectNInfo, bucket, "k/b", ""); body != "child" {
+		t.Fatalf("child reads %q", body)
 	}
 }
