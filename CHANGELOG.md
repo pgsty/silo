@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- S3 `DeleteObjects` on a single pool stops at an entry whose name fails the
+  object name check: the entry returns `XMinioInvalidObjectName` and is not
+  locked or sent to a drive, as with a single-object DELETE and with more than
+  one pool. Until now such an entry still reached the drives of the node, where
+  a name with a `..` segment was joined to the request bucket. A caller allowed
+  to delete in one bucket could remove a version in another bucket, including
+  one under Object Lock retention, and from a versioned bucket could put a
+  delete marker on an object of another bucket or on stored system metadata
+  such as a bucket's configuration. The other entries of a request are deleted
+  as before.
+
 ## RELEASE.2026-11-09T00-00-00Z
 
 Package version: `20261109000000.0.0`. Publication status and artifacts are
