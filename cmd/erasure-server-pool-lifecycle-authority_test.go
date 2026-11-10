@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/google/uuid"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
@@ -627,6 +629,176 @@ func TestPoolsLifecycleLegacyHistory(t *testing.T) {
 			er := erasureObjects{getDisks: func() []StorageAPI { return disks }, defaultParityCount: 4}
 			if versions, err := er.objectVersions(t.Context(), "bucket", "key"); err != nil || len(versions) != 1 {
 				t.Fatalf("healthy legacy history: %d versions, err=%v", len(versions), err)
+			}
+		})
+	}
+}
+
+// authoritySignature2021 is the header signature of o, a version whose part
+// ETags are all empty, as the releases from RELEASE.2021-11-24 until
+// RELEASE.2022-01-25 computed it: with these ETags.
+func authoritySignature2021(o xlMetaV2Object) (sig [4]byte) {
+	o.ErasureIndex = 0
+	crc := hashDeterministicString(o.MetaUser) ^ hashDeterministicBytes(o.MetaSys)
+	o.MetaUser, o.MetaSys = nil, nil
+	bts, _ := o.MarshalMsg(nil)
+	crc ^= xxhash.Sum64(bts)
+	binary.LittleEndian.PutUint32(sig[:], uint32(crc^(crc>>32)))
+	return sig
+}
+
+// A drive holds the header that the release which wrote a version there
+// stored. Before RELEASE.2024-04-28 it has no erasure coding, and until
+// RELEASE.2022-01-25 its signature counted the empty part ETags of versions
+// written before RELEASE.2021-11-24. A heal writes the header of its own
+// release and leaves the other drives alone, so the drives of an old version
+// differ there for good once some were replaced. That is one revision, as
+// reads and heal take it, on however many of the drives.
+func TestPoolsLifecycleHeaderEras(t *testing.T) {
+	id := [16]byte{1}
+	current := func(drive int) xlMetaV2ShallowVersion { return authorityRevision(t, id, 1, drive+1, "") }
+	// stored returns the version as drive holds it after change, under the
+	// header that header derives from the one a current release writes.
+	stored := func(drive int, change func(*xlMetaV2Object), header func(xlMetaV2VersionHeader, xlMetaV2Object) xlMetaV2VersionHeader) xlMetaV2ShallowVersion {
+		ver := current(drive)
+		var v xlMetaV2Version
+		if _, err := v.UnmarshalMsg(ver.meta); err != nil {
+			t.Fatal(err)
+		}
+		change(v.ObjectV2)
+		meta, err := v.MarshalMsg(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return xlMetaV2ShallowVersion{header: header(ver.header, *v.ObjectV2), meta: meta}
+	}
+	eras := map[string]func(drive int) xlMetaV2ShallowVersion{
+		"no-erasure-coding": func(drive int) xlMetaV2ShallowVersion {
+			return stored(drive, func(*xlMetaV2Object) {}, func(h xlMetaV2VersionHeader, _ xlMetaV2Object) xlMetaV2VersionHeader {
+				h.EcN, h.EcM = 0, 0
+				return h
+			})
+		},
+		"empty-part-etags-signed": func(drive int) xlMetaV2ShallowVersion {
+			return stored(drive, func(o *xlMetaV2Object) { o.PartETags = []string{""} }, func(h xlMetaV2VersionHeader, o xlMetaV2Object) xlMetaV2VersionHeader {
+				h.EcN, h.EcM, h.Signature = 0, 0, authoritySignature2021(o)
+				return h
+			})
+		},
+	}
+	metaVs := slices.Repeat([]uint8{xlMetaVersion}, 16)
+	readQuorum := func(xlMetaV2ShallowVersion, uint8) int { return 12 }
+	for name, old := range eras {
+		t.Run(name, func(t *testing.T) {
+			if old(0).header == current(0).header {
+				t.Fatal("fixture: the old header is the current one")
+			}
+			if versionRevision(old(0), xlMetaVersion) != versionRevision(current(7), xlMetaVersion) {
+				t.Error("one version under the headers of two releases has two keys")
+			}
+			// The header of the key orders the merge: it is the current one.
+			if versionRevision(old(0), xlMetaVersion).header != current(0).header {
+				t.Error("the key does not carry the header of the current release")
+			}
+			for healed := range 17 {
+				metas := make([][]xlMetaV2ShallowVersion, 16)
+				for i := range metas {
+					if i < healed {
+						metas[i] = []xlMetaV2ShallowVersion{current(i)}
+					} else {
+						metas[i] = []xlMetaV2ShallowVersion{old(i)}
+					}
+				}
+				merged, err := authoritativeHistory(t.Context(), metas, metaVs, xlMetaVersion, 9, readQuorum)
+				if err != nil || len(merged) != 1 {
+					t.Errorf("%d healed drives: %d versions, err=%v", healed, len(merged), err)
+				}
+			}
+		})
+	}
+	// Control: the erasure coding still tells revisions apart, by the
+	// metadata. Another one under the same header is another revision.
+	other := stored(0, func(o *xlMetaV2Object) { o.ErasureM, o.ErasureN = 8, 8 }, func(h xlMetaV2VersionHeader, _ xlMetaV2Object) xlMetaV2VersionHeader { return h })
+	if versionRevision(other, xlMetaVersion) == versionRevision(current(0), xlMetaVersion) {
+		t.Error("another erasure coding under one header keeps the revision")
+	}
+}
+
+// The same on drives, through a heal: two versions with headers from before
+// RELEASE.2024-04-28 on a set where half of the drives were replaced. GET
+// reads them and heal has nothing left to do. Their expiry has to run as
+// well: of a noncurrent version with several pools, and of all versions of a
+// key with one pool too, which reads the history like the pools do. A
+// restore takes the drives for one generation, not for a failed status write.
+func TestPoolsLifecycleHealedOldHeaders(t *testing.T) {
+	for _, single := range []bool{false, true} {
+		name, key := "noncurrent-version", "ncv-old-headers"
+		if single {
+			name, key = "all-versions-one-pool", "eav-old-headers"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newSplitILM(t, versioning.Enabled, splitILMRules)
+			ctx := t.Context()
+			s.write(key, splitAt("old", 5, 0))
+			s.write(key, splitAt("new", 3, 0))
+			ids := []string{s.ids[key+" old"], s.ids[key+" new"]}
+			if single {
+				prior := s.z.serverPools
+				t.Cleanup(func() { s.z.serverPools = prior })
+				s.z.serverPools = s.z.serverPools[:1]
+			}
+			set := s.z.serverPools[0].getHashedSet(key)
+			disks := set.getDisks()
+			for _, disk := range disks {
+				rewriteTierTestMeta(t, disk, s.bucket, key, func(xl *xlMetaV2) {
+					for i := range xl.versions {
+						// Control: the key of a version this release wrote
+						// carries its header as stored.
+						if versionRevision(xl.versions[i], xl.metaV).header != xl.versions[i].header {
+							t.Fatal("the key of a current version carries another header")
+						}
+						xl.versions[i].header.EcN, xl.versions[i].header.EcM = 0, 0
+					}
+				})
+			}
+			replaced := len(disks) / 2
+			for _, disk := range disks[:replaced] {
+				if err := disk.Delete(ctx, s.bucket, key, DeleteOptions{Recursive: true, Immediate: true}); err != nil {
+					t.Fatal(err)
+				}
+				for _, id := range ids {
+					if _, err := s.z.HealObject(ctx, s.bucket, key, id, madmin.HealOpts{ScanMode: madmin.HealNormalScan}); err != nil {
+						t.Fatalf("heal %s: %v", id, err)
+					}
+				}
+			}
+			for i, disk := range disks {
+				if authorityHeader(t, disk, s.bucket, key, ids[0]).hasEC() != (i < replaced) {
+					t.Fatalf("fixture: drive %d of %d, %d replaced, holds the other header", i, len(disks), replaced)
+				}
+			}
+			authorityPresent(t, s, 0, key, ids[0])
+			res, err := s.z.HealObject(ctx, s.bucket, key, ids[0], madmin.HealOpts{DryRun: true, ScanMode: madmin.HealNormalScan})
+			if err != nil || slices.ContainsFunc(res.Before.Drives, func(d madmin.HealDriveInfo) bool { return d.State != madmin.DriveStateOk }) {
+				t.Fatalf("fixture: heal has work left: %v", err)
+			}
+
+			if gen, err := set.readRestoreGeneration(ctx, s.bucket, key, ids[0]); err != nil || gen.split {
+				t.Errorf("restore generation: split=%v, err=%v", gen.split, err)
+			}
+			if single {
+				_, err = s.z.DeleteObject(ctx, s.bucket, key, authorityDeleteAll)
+			} else {
+				err = authorityExpireVersion(t, s, key, ids[0])
+			}
+			if err != nil {
+				t.Fatalf("expiry: %v", err)
+			}
+			if _, err := s.z.GetObjectInfo(ctx, s.bucket, key, ObjectOptions{VersionID: ids[0]}); !isErrVersionNotFound(err) && !isErrObjectNotFound(err) {
+				t.Errorf("the expired version: %v", err)
+			}
+			if !single {
+				authorityPresent(t, s, 0, key, ids[1])
 			}
 		})
 	}
