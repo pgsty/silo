@@ -12,6 +12,23 @@
   delete marker on an object of another bucket or on stored system metadata
   such as a bucket's configuration. The other entries of a request are deleted
   as before.
+- An edit of a service account or access key that names no policy keeps its
+  inline policy. `mcli admin user svcacct disable`, `enable` and `edit` without
+  `--policy`, the same `idp ldap accesskey` commands, and any other
+  `update-service-account` request without `newPolicy` removed the inline
+  policy at the site that took the request and, for an account of another user
+  than root, at its replication peers, and the account then had all its parent
+  is allowed. The inline policy is removed
+  only on request, by an empty policy document such as `{"Statement":[]}`
+  (`mcli admin user svcacct edit --policy`); a client that left the policy out
+  to remove it must send that document. A JSON `null` policy counts as none.
+  In the Console, clearing the policy editor of an access key no longer removes
+  the policy; enter `{}` to remove it. The fix does not bring back a policy
+  that was removed, and a site of a replicated deployment that does not run the
+  fix still removes the policy when such an edit reaches it, so sites can
+  differ. Upgrade every site, then review on each site the accounts that
+  `svcacct info` reports with `Policy: implied`, and set the policy again on
+  those that were meant to be restricted.
 
 ## RELEASE.2026-11-09T00-00-00Z
 

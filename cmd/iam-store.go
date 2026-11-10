@@ -2930,11 +2930,12 @@ func updatedServiceAccountCredentials(ctx context.Context, accessKey string, cr 
 	// at this point.
 	m.Delete(sessionPolicyNameExtracted)
 
-	nosp := opts.sessionPolicy == nil || opts.sessionPolicy.Version == "" && len(opts.sessionPolicy.Statements) == 0
-
-	// sessionPolicy is nil and there is embedded policy attached we remove
-	// embedded policy at that point.
-	if _, ok := m.Lookup(policy.SessionPolicyName); ok && nosp {
+	// A nil sessionPolicy is an edit that does not concern the policy, and
+	// the embedded one stays. Only a policy that was given, and is empty,
+	// removes it: the account then has all its parent is allowed, which is
+	// usually more.
+	reset := opts.sessionPolicy != nil && opts.sessionPolicy.Version == "" && len(opts.sessionPolicy.Statements) == 0
+	if _, ok := m.Lookup(policy.SessionPolicyName); ok && reset {
 		m.Delete(policy.SessionPolicyName)
 		m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
 	}
