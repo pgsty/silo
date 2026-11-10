@@ -272,7 +272,7 @@ func (z *erasureServerPools) applyMigrationExpiry(ctx context.Context, bucket, o
 // owns replication state and tier cleanup, and it re-evaluates the current
 // lifecycle rule. A migration cleanup must never turn an asynchronous ILM
 // decision into an unconditional physical purge. It returns how many source
-// versions it deleted.
+// versions were removed, including versions deleted by ILM before cleanup.
 func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) (removed int, err error) {
 	if err := z.applyMigrationExpiry(ctx, bucket, object, source, expired); err != nil {
 		return 0, err
@@ -290,8 +290,14 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		if vid == "" {
 			vid = nullVersionID
 		}
+		expiredVersion := isExpiredVersion(expired, version)
 		copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{VersionID: vid, NoAuditLog: true})
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			// ILM can remove the parent key before cleanup. Count that as
+			// progress so the next walk discovers keys below it.
+			if expiredVersion {
+				removed++
+			}
 			continue
 		}
 		if err != nil {
@@ -307,12 +313,15 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 			}
 		}
 		if src == nil {
+			if expiredVersion {
+				removed++
+			}
 			continue
 		}
 		if !src.ModTime.Equal(version.ModTime) || src.DeleteMarker != version.Deleted {
 			return removed, PreConditionFailed{}
 		}
-		if isExpiredVersion(expired, version) {
+		if expiredVersion {
 			// The logical expiry path owns this version. Keeping the source is
 			// also the retry point if that path failed or the pool check races it.
 			continue
