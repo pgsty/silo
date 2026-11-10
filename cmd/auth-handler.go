@@ -425,6 +425,19 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 	return authorizeRequestWithExistingTags(ctx, r, action, "")
 }
 
+// authorizeBucketRequest authorizes a bucket action, such as s3:ListBucket,
+// on the bucket of a request made for one of its objects.
+func authorizeBucketRequest(ctx context.Context, r *http.Request, action policy.Action) APIErrorCode {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	objectName := reqInfo.ObjectName
+	reqInfo.ObjectName = ""
+	defer func() { reqInfo.ObjectName = objectName }()
+	return authorizeRequest(ctx, r, action)
+}
+
 func deleteObjectAction(versionID string) policy.Action {
 	if versionID != "" {
 		return policy.DeleteObjectVersionAction
