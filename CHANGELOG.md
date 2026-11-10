@@ -25,10 +25,30 @@
   In the Console, clearing the policy editor of an access key no longer removes
   the policy; enter `{}` to remove it. The fix does not bring back a policy
   that was removed, and a site of a replicated deployment that does not run the
-  fix still removes the policy when such an edit reaches it, so sites can
-  differ. Upgrade every site, then review on each site the accounts that
-  `svcacct info` reports with `Policy: implied`, and set the policy again on
-  those that were meant to be restricted.
+  fix still removes the policy on such an edit that it takes itself or receives
+  from another site that does not run it, so sites can differ. Upgrade every
+  site, then review on each site the accounts that `svcacct info` reports with
+  `Policy: implied`, and set the policy again on those that were meant to be
+  restricted.
+- Site replication sends a service account or access key as the record its
+  site has stored, whole: for a create, for every edit, at the first sync of a
+  new site and when healing. IAM export writes that record too. Until now an
+  edit was sent as the fields it changed. A peer that an earlier edit had not
+  reached, or reached late, kept the old secret key, status or inline policy
+  under the revision of the later edit, and healing took the sites for equal:
+  a key that was rotated, disabled or restricted on one site stayed as it was
+  on the other. Sync, heal and export took the claims and the inline policy, and
+  heal the secret key and status as well, from the cache of the server that ran
+  them, which can predate an edit made through another server of the site, and
+  sent them under the revision of the stored record. A service account created
+  for a user that had been deleted and created again did not reach the peers
+  before healing. Peers on 20261109 and 20261026 apply the new items as they
+  apply a healed account, and an edit that names no policy no longer removes the
+  inline policy on such a peer; a site that is not upgraded still sends its own
+  edits the old way. An edit now gives every site the whole account of the site
+  that took it, so accounts that already differ between sites are not repaired
+  by the upgrade, but by the next edit: after upgrading every site, review such
+  accounts and edit each one at a site that has it right.
 
 ## RELEASE.2026-11-09T00-00-00Z
 
