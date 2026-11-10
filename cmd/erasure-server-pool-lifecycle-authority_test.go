@@ -1666,7 +1666,7 @@ func TestPoolsMigrationLifecycleRefusedExpiryKeepsSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	version := FileInfo{Name: key, VersionID: id, ModTime: source.ModTime}
-	err = s.z.removeMovedVersions(ctx, s.bucket, key, 0, []FileInfo{version}, []migrationExpiredVersion{{
+	_, err = s.z.removeMovedVersions(ctx, s.bucket, key, 0, []FileInfo{version}, []migrationExpiredVersion{{
 		version:            version,
 		event:              lifecycle.Event{Action: lifecycle.DeleteAction},
 		lifecycleUpdatedAt: updatedAt,

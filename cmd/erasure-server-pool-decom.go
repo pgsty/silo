@@ -28,6 +28,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -752,7 +753,25 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 	return err
 }
 
+// decommissionPool moves bucket bi out of pool idx. A key below another key
+// ("k/b" under "k") is a directory inside the directory of that key, and the
+// listing does not descend into the directory of an object: a walk sees "k/b"
+// only once "k" has left the pool. The walk is repeated while it removes
+// source versions, so each pass moves the keys that the previous one
+// uncovered. Each repeat needs a version removed from the pool, which takes
+// no new writes, so the repeats end.
 func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) error {
+	for {
+		removed, err := z.decommissionPoolWalk(ctx, idx, pool, bi)
+		if err != nil || removed == 0 || contextCanceled(ctx) {
+			return err
+		}
+	}
+}
+
+// decommissionPoolWalk walks bucket bi of pool idx once and returns the number
+// of keys whose source versions it removed.
+func (z *erasureServerPools) decommissionPoolWalk(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) (int64, error) {
 	ctx = logger.SetReqInfo(ctx, &logger.ReqInfo{})
 
 	const envDecomWorkers = "_MINIO_DECOMMISSION_WORKERS"
@@ -766,9 +785,11 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 	// add that many extra workers.
 	workerSize += len(pool.sets)
 
+	var removed atomic.Int64
+
 	wk, err := workers.New(workerSize)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	var vc *versioning.Versioning
@@ -779,24 +800,24 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 	if bi.Name != minioMetaBucket {
 		vc, err = globalBucketVersioningSys.Get(bi.Name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		// Check if the current bucket has a configured lifecycle policy
 		lc, lifecycleUpdatedAt, err = globalBucketMetadataSys.GetLifecycleConfig(bi.Name)
 		if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bi.Name}) {
-			return err
+			return 0, err
 		}
 
 		// Check if bucket is object locked.
 		lr, err = globalBucketObjectLockSys.Get(bi.Name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		rcfg, err = getReplicationConfig(ctx, bi.Name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 	}
 
@@ -1019,7 +1040,10 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// if all versions were decommissioned, then we can delete the object versions.
 			if decommissioned == len(fivs.Versions) {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionRemoveObject, idx, bi.Name, entry.name)
-				err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions, expired)
+				n, err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions, expired)
+				if n > 0 {
+					removed.Add(1)
+				}
 				if err == nil {
 					err = z.removeFreeVersions(ctx, bi.Name, entry.name, idx, fivs.FreeVersions)
 				}
@@ -1062,7 +1086,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 		}(setIdx)
 	}
 	wk.Wait()
-	return nil
+	return removed.Load(), nil
 }
 
 //msgp:ignore decomMetrics

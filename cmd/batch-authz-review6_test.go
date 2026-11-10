@@ -330,7 +330,7 @@ func TestBatchReviewRotationKeepsMigrationCleanup(t *testing.T) {
 				t.Errorf("rotation changed a draining source after its version was copied (rotation error: %v)", rotationErr)
 			}
 			snapshot := []FileInfo{{VersionID: before.VersionID, ModTime: beforeInfo.ModTime}}
-			if err := z.removeMovedVersions(t.Context(), bucket, object, 0, snapshot, nil); err != nil {
+			if _, err := z.removeMovedVersions(t.Context(), bucket, object, 0, snapshot, nil); err != nil {
 				t.Fatalf("rotation prevented migration cleanup: %v", err)
 			}
 			if _, err := z.serverPools[0].GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: before.VersionID}); !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
