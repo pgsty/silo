@@ -1,6 +1,6 @@
 {
-  "updated": "2026-11-09T05:40:48+00:00",
-  "revision": "5a9fa30f649c092131610b8ba7d1bbcc79dffc59",
+  "updated": "2026-11-10T01:20:00+00:00",
+  "revision": "7caf268729c321ef512df54d7a797a94664f55c6",
   "repositories": [
     "pgsty/silo",
     "pgsty/silo-console",
@@ -132,7 +132,7 @@
       "handle": "botdeniska",
       "group": "code",
       "featured": true,
-      "what": "Contributed multi-pool migration, deletion and lifecycle safety, conditional multipart checks, native restore reports and verification, LDAP login and storage cleanup fixes, replication checksum repairs, and faster policy evaluation",
+      "what": "Contributed multi-pool migration, deletion and lifecycle safety, conditional multipart checks, native restore reports and verification, LDAP login and storage cleanup fixes, replication checksum repairs, faster policy evaluation, and private security disclosures",
       "firstContribution": "2026-10-17"
     },
     {
@@ -300,7 +300,7 @@
       "handle": "haf",
       "group": "reports",
       "featured": true,
-      "what": "Reported audit webhook delivery stopping on peer nodes after configuration reload",
+      "what": "Reported audit and logger webhook delivery stopping on peer nodes after configuration reload",
       "firstContribution": "2026-10-26"
     },
     {
@@ -308,6 +308,41 @@
       "group": "reports",
       "featured": true,
       "what": "Privately reported a security issue in SILO",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "SimeonPoot",
+      "group": "reports",
+      "featured": true,
+      "what": "Discovered the session-policy privilege escalation in service accounts and STS (CVE-2025-62506)",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "KoreaSecurity",
+      "group": "reports",
+      "featured": true,
+      "what": "Discovered the OIDC JWT algorithm confusion vulnerability (CVE-2026-33322)",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "XlabAITeam",
+      "group": "reports",
+      "featured": true,
+      "what": "Discovered the S3 Select oversized record memory exhaustion vulnerability (CVE-2026-39414)",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "ddd",
+      "group": "reports",
+      "featured": true,
+      "what": "Discovered the Snowball auto-extract and unsigned-trailer query authentication bypasses (CVE-2026-40344, CVE-2026-41145)",
+      "firstContribution": "9999-12-31"
+    },
+    {
+      "handle": "adrian-doyensec",
+      "group": "reports",
+      "featured": true,
+      "what": "Reported the internode ReadMultiple msgpack path traversal (CVE-2026-42600)",
       "firstContribution": "9999-12-31"
     },
     {
