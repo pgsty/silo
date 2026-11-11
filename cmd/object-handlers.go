@@ -1847,12 +1847,27 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 	srcInfo.PutObjReader = pReader
 
-	// Object Lock state as stored on disk, captured before the metadata
-	// directive rebuilds the map. A replica update is applied only when its
-	// source timestamp is newer than the stored one, and a stale update must
-	// leave the stored state in place instead of erasing it.
-	storedLock := storedObjectLockState(srcInfo.UserDefined)
-	storedTagTimestamp := srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]
+	// Reconcile against the addressed destination version under its write
+	// lock. The source can be a different object or version, including when
+	// the destination version has never been written.
+	getObjectInfo := func(_ context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+		opts.NoLock = true
+		return objectAPI.GetObjectInfo(lockCtx, bucket, object, opts)
+	}
+	var storedInfo ObjectInfo
+	if replicaTrusted && !remoteCallRequired {
+		storedInfo, err = replicaStoredObjectInfo(lockCtx, getObjectInfo, dstBucket, dstObject, dstOpts.VersionID)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+	}
+	storedLock := storedObjectLockState(storedInfo.UserDefined)
+	storedTagTimestamp := storedInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]
+	localTagTimestamp := ""
+	if cpSrcDstSame {
+		localTagTimestamp = srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]
+	}
 
 	srcInfo.UserDefined, err = getCpObjMetadataFromHeader(ctx, r, srcInfo.UserDefined, allowReplicationMetadata)
 	if err != nil {
@@ -1877,9 +1892,9 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			// the captured state even if metadata REPLACE rebuilt the map.
 			srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
 			srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
-			reconcileStoredObjectTags(srcInfo.UserDefined, srcInfo.UserTags, storedTagTimestamp)
+			reconcileStoredObjectTags(srcInfo.UserDefined, storedInfo.UserTags, storedTagTimestamp)
 		} else {
-			srcInfo.UserDefined[xhttp.AmzObjectTagging] = srcInfo.UserTags
+			srcInfo.UserDefined[xhttp.AmzObjectTagging] = storedInfo.UserTags
 			if storedTagTimestamp != "" {
 				srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = storedTagTimestamp
 			} else {
@@ -1888,7 +1903,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		}
 	} else {
 		srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
-		srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = UTCNow().Format(time.RFC3339Nano)
+		srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = monotonicMetadataTimestamp(UTCNow().Format(time.RFC3339Nano), localTagTimestamp)
 	}
 	// SSE-C rotation snapshots reserved metadata before the tag decision. Its
 	// later merge must not put the old timestamp back over the accepted state.
@@ -1896,14 +1911,12 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 	srcInfo.UserDefined = filterReplicationStatusMetadata(srcInfo.UserDefined)
 	srcInfo.UserDefined = objectlock.FilterObjectLockMetadata(srcInfo.UserDefined, true, true)
+	// COPY may have preserved the source's reserved timestamps. Only the
+	// addressed destination and the incoming update may order a replica.
+	delete(srcInfo.UserDefined, ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp)
+	delete(srcInfo.UserDefined, ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp)
 	retPerms := isPutActionAllowed(ctx, getRequestAuthType(r), dstBucket, dstObject, r, policy.PutObjectRetentionAction)
 	holdPerms := isPutActionAllowed(ctx, getRequestAuthType(r), dstBucket, dstObject, r, policy.PutObjectLegalHoldAction)
-	// The destination is locked above: look it up without its lock, in the
-	// locks' context.
-	getObjectInfo := func(_ context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
-		opts.NoLock = true
-		return objectAPI.GetObjectInfo(lockCtx, bucket, object, opts)
-	}
 
 	// apply default bucket configuration/governance headers for dest side.
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, dstBucket, dstObject, getObjectInfo, retPerms, holdPerms, replicaTrusted)
@@ -3158,6 +3171,22 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		}
 	}
 
+	// Check before delOpts reads bucket versioning: unavailable bucket metadata
+	// must fail the request before a force-delete can reach the object layer.
+	if forceDelete, _ := strconv.ParseBool(r.Header.Get(xhttp.MinIOForceDelete)); forceDelete {
+		rcfg, err := globalBucketObjectLockSys.Get(bucket)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		if rcfg.LockEnabled {
+			apiErr := toAPIError(ctx, errInvalidArgument)
+			apiErr.Description = "force-delete is forbidden on Object Locking enabled buckets"
+			writeErrorResponse(ctx, w, apiErr, r.URL)
+			return
+		}
+	}
+
 	opts, err := delOpts(ctx, r, bucket, object)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -3176,14 +3205,6 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		opts.CheckPrecondFn = func(oi ObjectInfo) bool {
 			return deleteIfMatchPreconditionFailed(r.Header, ifMatch, oi)
 		}
-	}
-
-	rcfg, _ := globalBucketObjectLockSys.Get(bucket)
-	if rcfg.LockEnabled && opts.DeletePrefix {
-		apiErr := toAPIError(ctx, errInvalidArgument)
-		apiErr.Description = "force-delete is forbidden on Object Locking enabled buckets"
-		writeErrorResponse(ctx, w, apiErr, r.URL)
-		return
 	}
 
 	os := newObjSweeper(bucket, object).WithVersion(opts.VersionID).WithVersioning(opts.Versioned, opts.VersionSuspended)
@@ -3384,7 +3405,7 @@ func (api objectAPIHandlers) PutObjectLegalHoldHandler(w http.ResponseWriter, r 
 		VersionID: opts.VersionID,
 		EvalMetadataFn: func(oi *ObjectInfo, gerr error) (ReplicateDecision, error) {
 			oi.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = strings.ToUpper(string(legalHold.Status))
-			oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = UTCNow().Format(time.RFC3339Nano)
+			oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = monotonicMetadataTimestamp(UTCNow().Format(time.RFC3339Nano), oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp])
 
 			dsc := mustReplicate(ctx, bucket, object, oi.getMustReplicateOptions(replication.MetadataReplicationType, opts))
 			if dsc.ReplicateAny() {
@@ -3561,7 +3582,7 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 				oi.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = ""
 				oi.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = ""
 			}
-			oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = UTCNow().Format(time.RFC3339Nano)
+			oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = monotonicMetadataTimestamp(UTCNow().Format(time.RFC3339Nano), oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp])
 			dsc = mustReplicate(ctx, bucket, object, oi.getMustReplicateOptions(replication.MetadataReplicationType, opts))
 			if dsc.ReplicateAny() {
 				oi.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)

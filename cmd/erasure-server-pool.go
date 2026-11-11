@@ -1723,6 +1723,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		stored := mergedPoolObjectInfo(copies)
 		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(stored.UserDefined))
 		reconcileStoredObjectTags(srcInfo.UserDefined, stored.UserTags, stored.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
+		dstOpts.replicaObjectInfo = z.replicaObjectInfo
 		idx := copies[0].Index
 		oi, err := z.serverPools[idx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 		if err == nil {
@@ -3373,7 +3374,7 @@ func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object s
 	// revision beyond all copies, so the returned value and every pool agree.
 	if stamp := opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; stamp != "" {
 		for _, copy := range copies {
-			stamp = monotonicTaggingTimestamp(stamp, copy.ObjInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
+			stamp = monotonicMetadataTimestamp(stamp, copy.ObjInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
 		}
 		opts.UserDefined = cloneMSS(opts.UserDefined)
 		opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = stamp

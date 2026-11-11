@@ -133,8 +133,25 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	}
 
 	if dstOpts.ReplicaLockReconcile {
-		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(fi.Metadata))
-		reconcileStoredObjectTags(srcInfo.UserDefined, fi.Metadata[xhttp.AmzObjectTagging], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
+		stored := fi.ToObjectInfo(dstBucket, dstObject, dstOpts.Versioned || dstOpts.VersionSuspended)
+		if srcInfo.versionOnly || dstOpts.replicaObjectInfo != nil {
+			// fi describes the source of the new reference, not the version
+			// being replaced. A pooled lookup also preserves protection merged
+			// from another copy, even when this set holds a newer weak revision.
+			getInfo := er.getObjectInfo
+			if dstOpts.replicaObjectInfo != nil {
+				getInfo = dstOpts.replicaObjectInfo
+			}
+			stored, err = replicaStoredObjectInfo(ctx, func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+				opts.NoLock = true
+				return getInfo(ctx, bucket, object, opts)
+			}, dstBucket, dstObject, dstOpts.VersionID)
+			if err != nil {
+				return oi, err
+			}
+		}
+		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(stored.UserDefined))
+		reconcileStoredObjectTags(srcInfo.UserDefined, stored.UserTags, stored.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
 	}
 
 	filterOnlineDisksInplace(fi, metaArr, onlineDisks)
@@ -2574,7 +2591,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 
 	fi.Metadata[xhttp.AmzObjectTagging] = tags
 	fi.ReplicationState = opts.PutReplicationState()
-	stamp := monotonicTaggingTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
+	stamp := monotonicMetadataTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
 	maps.Copy(fi.Metadata, opts.UserDefined)
 	if stamp != "" {
 		fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp] = stamp

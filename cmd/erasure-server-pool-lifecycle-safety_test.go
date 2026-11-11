@@ -70,6 +70,8 @@ func TestPoolsLifecycleDuplicateLockMetadata(t *testing.T) {
 		{name: "independent-fields", copies: [2]map[string]string{poolLockMetadata("GOVERNANCE", "OFF", recent, old), poolLockMetadata("", "ON", old, recent)}, mode: "GOVERNANCE", hold: "ON"},
 		{name: "hold-released", copies: [2]map[string]string{poolLockMetadata("", "ON", old, old), poolLockMetadata("", "OFF", old, recent)}, hold: "OFF", delete: true},
 		{name: "retention-released", copies: [2]map[string]string{poolLockMetadata("GOVERNANCE", "OFF", old, old), poolLockMetadata("", "OFF", recent, old)}, hold: "OFF", delete: true},
+		{name: "compliance-before-removal", copies: [2]map[string]string{poolLockMetadata("COMPLIANCE", "OFF", old, old), poolLockMetadata("", "OFF", recent, old)}, mode: "COMPLIANCE", hold: "OFF"},
+		{name: "compliance-after-removal", copies: [2]map[string]string{poolLockMetadata("", "OFF", recent, old), poolLockMetadata("COMPLIANCE", "OFF", old, old)}, mode: "COMPLIANCE", hold: "OFF"},
 	} {
 		for _, batch := range []bool{false, true} {
 			path := "single"

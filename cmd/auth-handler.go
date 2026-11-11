@@ -795,11 +795,12 @@ func isPutActionAllowedWithRequestTags(ctx context.Context, atype authType, buck
 
 func isPutActionAllowedWithCred(bucketName, objectName string, r *http.Request, action policy.Action, requestTags *string, cred auth.Credentials, owner bool) APIErrorCode {
 	// Do not check for PutObjectRetentionAction permission,
-	// if mode and retain until date are not set.
+	// if neither retention values nor a replica retention revision are set.
 	// Can happen when bucket has default lock config set
 	if action == policy.PutObjectRetentionAction &&
 		r.Header.Get(xhttp.AmzObjectLockMode) == "" &&
-		r.Header.Get(xhttp.AmzObjectLockRetainUntilDate) == "" {
+		r.Header.Get(xhttp.AmzObjectLockRetainUntilDate) == "" &&
+		r.Header.Get(xhttp.MinIOSourceObjectRetentionTimestamp) == "" {
 		return ErrNone
 	}
 

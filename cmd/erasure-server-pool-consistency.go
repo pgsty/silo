@@ -383,19 +383,7 @@ func (z *erasureServerPools) healObjectInPool(ctx context.Context, er *erasureOb
 // mergePoolLockState resolves each independently ordered field. An ordered
 // removal is a value in its own right; an absent unordered field is not one.
 func mergePoolLockState(copies []PoolObjInfo) objectLockState {
-	state := storedObjectLockState(copies[0].ObjInfo.UserDefined)
-	for _, copy := range copies[1:] {
-		next := storedObjectLockState(copy.ObjInfo.UserDefined)
-		retentionTime, _ := time.Parse(time.RFC3339Nano, next.retentionTimestamp)
-		if state.retentionIsOlderThan(retentionTime) || (state.retentionTimestamp == "" && state.mode == "" && next.mode != "") {
-			state.mode, state.retainUntil, state.retentionTimestamp = next.mode, next.retainUntil, next.retentionTimestamp
-		}
-		holdTime, _ := time.Parse(time.RFC3339Nano, next.legalHoldTimestamp)
-		if state.legalHoldIsOlderThan(holdTime) || (state.legalHoldTimestamp == "" && state.legalHold == "" && next.legalHold != "") {
-			state.legalHold, state.legalHoldTimestamp = next.legalHold, next.legalHoldTimestamp
-		}
-	}
-	return state
+	return reducePoolLockState(copies, storedObjectLockState)
 }
 
 func replaceObjectLockMetadata(metadata map[string]string, state objectLockState) {
@@ -547,10 +535,10 @@ func reconcileStoredObjectTags(metadata map[string]string, storedTags, storedTim
 	}
 }
 
-// Local tagging mutations must advance the revision they overwrite, even when
+// Local metadata mutations must advance the revision they overwrite, even when
 // a request's clock or lock acquisition order is behind the stored revision.
 // Replica writes use reconcileStoredObjectTags instead of minting a revision.
-func monotonicTaggingTimestamp(incoming, stored string) string {
+func monotonicMetadataTimestamp(incoming, stored string) string {
 	requested, err := time.Parse(time.RFC3339Nano, incoming)
 	if err != nil {
 		return incoming

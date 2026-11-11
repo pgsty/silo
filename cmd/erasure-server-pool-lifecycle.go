@@ -587,20 +587,10 @@ func setLifecycleLockState(metadata map[string]string, state objectLockState) {
 	set(ReservedMetadataPrefix+ObjectLockLegalHoldTimestamp, state.legalHoldTimestamp)
 }
 
-// newestLockState returns the newest hold and the newest retention of the
-// copies of a version, which lockRevisionsOrdered found equal or ordered.
+// newestLockState orders independently revised fields without weakening a
+// COMPLIANCE retention that any copy still protects.
 func newestLockState(copies []PoolObjInfo) objectLockState {
-	state := lifecycleLockState(copies[0].ObjInfo.UserDefined)
-	for _, copy := range copies[1:] {
-		next := lifecycleLockState(copy.ObjInfo.UserDefined)
-		if lockRevisionNewer(next.legalHoldTimestamp, state.legalHoldTimestamp) {
-			state.legalHold, state.legalHoldTimestamp = next.legalHold, next.legalHoldTimestamp
-		}
-		if lockRevisionNewer(next.retentionTimestamp, state.retentionTimestamp) {
-			state.mode, state.retainUntil, state.retentionTimestamp = next.mode, next.retainUntil, next.retentionTimestamp
-		}
-	}
-	return state
+	return reducePoolLockState(copies, lifecycleLockState)
 }
 
 // checkedExpiryRefused reports whether a set must keep a version whose ILM
@@ -623,7 +613,7 @@ func checkedExpiryRefused(lc lifecycle.Lifecycle, lr objectlock.Retention, rcfg 
 	if lockRevisionNewer(approved.legalHoldTimestamp, local.legalHoldTimestamp) {
 		obj.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = approved.legalHold
 	}
-	if lockRevisionNewer(approved.retentionTimestamp, local.retentionTimestamp) {
+	if lockRevisionNewer(approved.retentionTimestamp, local.retentionTimestamp) && !local.complianceWouldWeaken(approved) {
 		obj.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = approved.mode
 		obj.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = approved.retainUntil
 	}

@@ -1260,6 +1260,7 @@ func TestPoolsLifecycleCheckedExpirySafeguard(t *testing.T) {
 		{"hold-equal-stamps", poolLockMetadata("", "ON", old, recent), objectLockState{legalHold: "OFF", legalHoldTimestamp: recent}, false},
 		{"hold-missing-approved-stamp", poolLockMetadata("", "ON", old, old), objectLockState{legalHold: "OFF"}, false},
 		{"retention-newer-locally", poolLockMetadata("GOVERNANCE", "OFF", recent, old), objectLockState{retentionTimestamp: old, legalHold: "OFF", legalHoldTimestamp: old}, false},
+		{"compliance-cannot-release", poolLockMetadata("COMPLIANCE", "OFF", old, old), objectLockState{retentionTimestamp: recent, legalHold: "OFF", legalHoldTimestamp: old}, false},
 		// Controls: the approval strictly supersedes the local protection.
 		{"hold-released", poolLockMetadata("", "ON", old, old), objectLockState{legalHold: "OFF", legalHoldTimestamp: recent}, true},
 		{"retention-released", poolLockMetadata("GOVERNANCE", "OFF", old, old), objectLockState{retentionTimestamp: recent, legalHold: "OFF", legalHoldTimestamp: old}, true},
