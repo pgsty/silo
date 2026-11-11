@@ -689,7 +689,15 @@ func setAuthMiddleware(h http.Handler) http.Handler {
 
 		aType := getRequestAuthType(r)
 		switch aType {
-		case authTypeSigned, authTypeSignedV2, authTypeStreamingSigned, authTypeStreamingSignedTrailer:
+		case authTypeSigned, authTypeSignedV2, authTypeStreamingSigned, authTypeStreamingSignedTrailer, authTypeStreamingUnsignedTrailer:
+			// STREAMING-UNSIGNED-PAYLOAD-TRAILER is valid for a genuinely
+			// anonymous request. Once Authorization is present, it is a
+			// signed REST-HEADER request and must obey the same date/skew
+			// bound as the other SigV4 streaming forms.
+			if aType == authTypeStreamingUnsignedTrailer && r.Header.Get(xhttp.Authorization) == "" {
+				h.ServeHTTP(w, r)
+				return
+			}
 			// Verify if date headers are set, if not reject the request
 			amzDate, errCode := parseAmzDateHeader(r)
 			if errCode != ErrNone {

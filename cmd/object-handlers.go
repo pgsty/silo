@@ -3754,6 +3754,18 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 	writeSuccessResponseXML(w, encodeResponse(otags))
 }
 
+func isRemoteTaggingNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch miniogo.ToErrorResponse(err).Code {
+	case "NoSuchKey", "NoSuchVersion":
+		return true
+	default:
+		return false
+	}
+}
+
 // PutObjectTaggingHandler - PUT object tagging
 func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutObjectTagging")
@@ -3773,6 +3785,13 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		return
 	}
 
+	logger.GetReqInfo(ctx).BucketName = bucket
+	logger.GetReqInfo(ctx).ObjectName = object
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectTaggingAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
 	// Tags XML will not be bigger than 1MiB in size, fail if its bigger.
 	tags, err := tags.ParseObjectXML(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -3780,13 +3799,6 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		return
 	}
 	tagsStr := tags.String()
-
-	logger.GetReqInfo(ctx).BucketName = bucket
-	logger.GetReqInfo(ctx).ObjectName = object
-	if s3Error := authenticateRequest(ctx, r, policy.PutObjectTaggingAction); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
 
 	// Set this such that authorization policies can be applied on the object
 	// tags. This is derived from the request body, so it must be injected only
@@ -3801,16 +3813,6 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 	}
 
 	objInfo, err := objAPI.GetObjectInfo(ctx, bucket, object, opts)
-	var s3Error APIErrorCode
-	if err != nil {
-		s3Error = authorizeRequestWithUnreadTags(ctx, r, policy.PutObjectTaggingAction, err)
-	} else {
-		s3Error = authorizeRequestWithExistingTags(ctx, r, policy.PutObjectTaggingAction, objInfo.UserTags)
-	}
-	if s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
 	if err != nil {
 		// if object is not found locally, but exists on peer site - proxy
 		// the tagging request to peer site. The response to client will
@@ -3818,6 +3820,23 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
+				// The local miss does not authorize a remote mutation. Read
+				// the addressed remote version first, then evaluate the
+				// caller against its actual ExistingObjectTag values.
+				remoteTags, readProxy := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
+				existingTags := ""
+				if remoteTags != nil {
+					existingTags = remoteTags.String()
+				}
+				if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.PutObjectTaggingAction, existingTags); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
+				if readProxy.Err != nil && !isRemoteTaggingNotFound(readProxy.Err) {
+					globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, true)
+					writeErrorResponse(ctx, w, toAPIError(ctx, readProxy.Err), r.URL)
+					return
+				}
 				globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, false)
 				// proxy to replication target if site replication is in place.
 				perr := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts)
@@ -3841,7 +3860,24 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 				return
 			}
 		}
+		// A local read failure must never be turned into a write grant. A
+		// server error may still be disclosed to an otherwise authorized
+		// caller for retry, while a missing object is evaluated as untagged.
+		var s3Error APIErrorCode
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			s3Error = authorizeRequestWithExistingTags(ctx, r, policy.PutObjectTaggingAction, "")
+		} else {
+			s3Error = authorizeRequestWithUnreadTags(ctx, r, policy.PutObjectTaggingAction, err)
+		}
+		if s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return
+		}
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.PutObjectTaggingAction, objInfo.UserTags); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
@@ -3900,6 +3936,13 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		return
 	}
 
+	logger.GetReqInfo(ctx).BucketName = bucket
+	logger.GetReqInfo(ctx).ObjectName = object
+	if s3Error := authenticateRequest(ctx, r, policy.DeleteObjectTaggingAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
 	opts, err := getOpts(ctx, r, bucket, object)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -3914,6 +3957,22 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
+				// Authenticate above and authorize against the remote version's
+				// tags before sending a destructive proxy request.
+				remoteTags, readProxy := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
+				existingTags := ""
+				if remoteTags != nil {
+					existingTags = remoteTags.String()
+				}
+				if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, existingTags); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
+				if readProxy.Err != nil && !isRemoteTaggingNotFound(readProxy.Err) {
+					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
+					writeErrorResponse(ctx, w, toAPIError(ctx, readProxy.Err), r.URL)
+					return
+				}
 				globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, false)
 				// proxy to replication target if active-active replication is in place.
 				perr := proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts)
@@ -3938,12 +3997,16 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 				return
 			}
 		}
+		if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, ""); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return
+		}
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
 	// Allow deleteObjectTagging if policy action is set
-	if s3Error := checkRequestAuthTypeWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, bucket, object, oi.UserTags); s3Error != ErrNone {
+	if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, oi.UserTags); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}

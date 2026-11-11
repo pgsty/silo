@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/minio/minio/internal/auth"
 	xhttp "github.com/minio/minio/internal/http"
@@ -35,7 +36,7 @@ func TestAPIStreamingAuthenticationBoundaries(t *testing.T) {
 		t: t, endpoints: []string{"PutObject"},
 		objAPITest: func(obj ObjectLayer, backend, bucket string, router http.Handler, cred auth.Credentials, t *testing.T) {
 			data := []byte("authenticated streaming payload")
-			for _, mode := range []string{"valid", "missing-algorithm", "wrong-algorithm", "wrong-signature"} {
+			for _, mode := range []string{"valid", "missing-algorithm", "wrong-algorithm", "wrong-signature", "invalid-credential"} {
 				req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPutObjectURL("", bucket, mode), data, UTCNow())
 				if err != nil {
 					t.Fatal(err)
@@ -55,6 +56,8 @@ func TestAPIStreamingAuthenticationBoundaries(t *testing.T) {
 						t.Fatal("signed request has no signature")
 					}
 					authorization = prefix + "Signature=" + strings.Repeat("0", 64)
+				case "invalid-credential":
+					authorization = strings.Replace(authorization, cred.AccessKey, strings.Repeat("A", len(cred.AccessKey)), 1)
 				}
 				req.Header.Set(xhttp.Authorization, authorization)
 				rec := httptest.NewRecorder()
@@ -111,4 +114,87 @@ func TestAPIStreamingAuthenticationBoundaries(t *testing.T) {
 			}
 		},
 	})
+}
+
+func TestStreamingTrailerConditionValues(t *testing.T) {
+	tests := []struct {
+		name, payload, authorization string
+		wantVersion, wantAuthType    string
+	}{
+		{
+			name:          "signed trailer",
+			payload:       streamingContentSHA256Trailer,
+			authorization: "AWS4-HMAC-SHA256 Credential=test",
+			wantVersion:   signV4Algorithm,
+			wantAuthType:  "REST-HEADER",
+		},
+		{
+			name:          "authenticated unsigned trailer",
+			payload:       unsignedPayloadTrailer,
+			authorization: "AWS4-HMAC-SHA256 Credential=test",
+			wantVersion:   signV4Algorithm,
+			wantAuthType:  "REST-HEADER",
+		},
+		{
+			name:         "anonymous unsigned trailer",
+			payload:      unsignedPayloadTrailer,
+			wantVersion:  "",
+			wantAuthType: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPut, "http://minio.local/bucket/object", nil)
+			r.Header.Set(xhttp.AmzContentSha256, tc.payload)
+			if tc.authorization != "" {
+				r.Header.Set(xhttp.Authorization, tc.authorization)
+			}
+			values := getConditionValues(r, "", auth.Credentials{})
+			if got := strings.Join(values["signatureversion"], ""); got != tc.wantVersion {
+				t.Fatalf("signatureversion = %q, want %q", got, tc.wantVersion)
+			}
+			if got := strings.Join(values["authType"], ""); got != tc.wantAuthType {
+				t.Fatalf("authType = %q, want %q", got, tc.wantAuthType)
+			}
+		})
+	}
+}
+
+func TestStreamingUnsignedTrailerDateGate(t *testing.T) {
+	tests := []struct {
+		name       string
+		date       string
+		authorized bool
+		wantCall   bool
+	}{
+		{name: "anonymous without date", authorized: false, wantCall: true},
+		{name: "authenticated current", date: UTCNow().Format(iso8601Format), authorized: true, wantCall: true},
+		{name: "authenticated missing", authorized: true, wantCall: false},
+		{name: "authenticated malformed", date: "not-a-date", authorized: true, wantCall: false},
+		{name: "authenticated old", date: UTCNow().Add(-globalMaxSkewTime - time.Second).Format(iso8601Format), authorized: true, wantCall: false},
+		{name: "authenticated future", date: UTCNow().Add(globalMaxSkewTime + time.Second).Format(iso8601Format), authorized: true, wantCall: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPut, "http://minio.local/bucket/object", nil)
+			r.Header.Set(xhttp.AmzContentSha256, unsignedPayloadTrailer)
+			if tc.authorized {
+				r.Header.Set(xhttp.Authorization, "AWS4-HMAC-SHA256 Credential=test")
+			}
+			if tc.date != "" {
+				r.Header.Set(xhttp.AmzDate, tc.date)
+			}
+
+			called := false
+			h := setAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			if called != tc.wantCall {
+				t.Fatalf("handler called = %v, want %v; status=%d body=%q", called, tc.wantCall, rec.Code, rec.Body.String())
+			}
+		})
+	}
 }

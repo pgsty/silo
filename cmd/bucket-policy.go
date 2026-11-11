@@ -213,16 +213,27 @@ func getConditionValuesWithTags(r *http.Request, lc string, cred auth.Credential
 	switch authType {
 	case authTypeSignedV2, authTypePresignedV2:
 		signatureVersion = signV2Algorithm
-	case authTypeSigned, authTypePresigned, authTypeStreamingSigned, authTypePostPolicy:
+	case authTypeSigned, authTypePresigned, authTypeStreamingSigned,
+		authTypeStreamingSignedTrailer, authTypePostPolicy:
 		signatureVersion = signV4Algorithm
+	case authTypeStreamingUnsignedTrailer:
+		// This form is also valid for a genuinely anonymous request. Only
+		// expose SigV4 condition values when header authentication is present.
+		if r.Header.Get(xhttp.Authorization) != "" {
+			signatureVersion = signV4Algorithm
+		}
 	}
 
 	var authtype string
 	switch authType {
 	case authTypePresignedV2, authTypePresigned:
 		authtype = "REST-QUERY-STRING"
-	case authTypeSignedV2, authTypeSigned, authTypeStreamingSigned:
+	case authTypeSignedV2, authTypeSigned, authTypeStreamingSigned, authTypeStreamingSignedTrailer:
 		authtype = "REST-HEADER"
+	case authTypeStreamingUnsignedTrailer:
+		if r.Header.Get(xhttp.Authorization) != "" {
+			authtype = "REST-HEADER"
+		}
 	case authTypePostPolicy:
 		authtype = "POST"
 	}

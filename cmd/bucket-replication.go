@@ -2852,6 +2852,7 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 	var wg sync.WaitGroup
 	errs := make([]error, len(proxyTargets.Targets))
 	tagSlc := make([]map[string]string, len(proxyTargets.Targets))
+	contacted := 0
 	for idx, t := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2861,37 +2862,50 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		if tgt.disableProxy {
 			continue
 		}
+		contacted++
 		idx := idx
 		wg.Add(1)
 		go func(idx int, tgt *TargetClient) {
 			defer wg.Done()
-			var err error
 			gopts := minio.GetObjectTaggingOptions{
 				VersionID: opts.VersionID,
 				Internal: minio.AdvancedObjectTaggingOptions{
 					ReplicationProxyRequest: "true",
 				},
 			}
-			tgs, err = tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
+			remoteTags, err := tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
 			if err != nil {
 				errs[idx] = err
-			} else {
-				tagSlc[idx] = tgs.ToMap()
+			} else if remoteTags != nil {
+				tagSlc[idx] = remoteTags.ToMap()
 			}
 		}(idx, tgt)
 	}
 	wg.Wait()
+	if contacted == 0 {
+		return nil, proxyResult{Err: RemoteTargetConnectionErr{
+			Bucket: bucket,
+			Err:    errors.New("no available remote replication target"),
+		}}
+	}
+	var firstNotFound error
 	for idx, err := range errs {
 		errCode := minio.ToErrorResponse(err).Code
-		if err != nil && errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
-			return nil, proxyResult{Err: err}
+		if err != nil {
+			if errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
+				return nil, proxyResult{Err: err}
+			}
+			if firstNotFound == nil {
+				firstNotFound = err
+			}
+			continue
 		}
-		if err == nil {
+		if tagSlc[idx] != nil && tgs == nil {
 			tgs, _ = tags.MapToObjectTags(tagSlc[idx])
 		}
 	}
-	if len(errs) == 1 {
-		proxy.Err = errs[0]
+	if tgs == nil {
+		proxy.Err = firstNotFound
 	}
 	return tgs, proxy
 }
