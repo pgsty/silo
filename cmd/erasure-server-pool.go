@@ -1689,6 +1689,48 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	return dobjects, derrs
 }
 
+// copyObjectPlan fixes placement before a caller prepares encrypted or compressed
+// bytes. A reference can only be made in the pool holding the source version.
+type copyObjectPlan struct {
+	poolIdx int
+	rewrite bool
+}
+
+// prepareCopyObject requires the same source/destination locks as CopyObject.
+// In-place changes address the exact version; new versions retain the normal
+// write placement and rewrite the data when it lives in a different pool.
+func (z *erasureServerPools) prepareCopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (copyObjectPlan, error) {
+	if err := checkCopyObjArgs(ctx, dstBucket, dstObject); err != nil {
+		return copyObjectPlan{}, err
+	}
+	srcObject, dstObject = encodeDirObject(srcObject), encodeDirObject(dstObject)
+	sameObject := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
+	reference := sameObject && !copyRewritesObjectData(srcInfo.metadataOnly && !srcInfo.Legacy, srcOpts, dstOpts)
+	inPlace := reference && (dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID || !dstOpts.Versioned && srcOpts.VersionID == "")
+	if inPlace {
+		idx, err := z.getPoolIdxExistingWithOpts(ctx, dstBucket, dstObject, ObjectOptions{
+			VersionID: dstOpts.VersionID, MetadataChg: true, NoLock: true,
+			Transition: dstOpts.Transition, SkipDecommissioned: true, SkipRebalancing: true,
+		})
+		return copyObjectPlan{poolIdx: idx}, err
+	}
+	idx, err := z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
+	if err != nil {
+		return copyObjectPlan{}, err
+	}
+	plan := copyObjectPlan{poolIdx: idx}
+	if reference && !z.SinglePool() {
+		sourceOpts := srcOpts
+		sourceOpts.NoLock = true
+		_, sourcePool, err := z.getLatestObjectInfoWithIdx(ctx, srcBucket, srcObject, sourceOpts)
+		if err != nil {
+			return copyObjectPlan{}, err
+		}
+		plan.rewrite = sourcePool != idx
+	}
+	return plan, nil
+}
+
 func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (objInfo ObjectInfo, err error) {
 	if err := checkCopyObjArgs(ctx, srcBucket, srcObject); err != nil {
 		return ObjectInfo{}, err
@@ -1715,6 +1757,15 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		dstOpts.NoLock = true
 	}
 
+	if dstOpts.copyPlan == nil {
+		plan, err := z.prepareCopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		dstOpts.copyPlan = &plan
+	}
+	poolIdx := dstOpts.copyPlan.poolIdx
+
 	if !z.SinglePool() && cpSrcDstSame && srcInfo.metadataOnly && dstOpts.ReplicaLockReconcile && srcOpts.VersionID == dstOpts.VersionID {
 		copies, err := z.metadataPoolInfos(ctx, dstBucket, dstObject, dstOpts)
 		if err != nil {
@@ -1724,31 +1775,12 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(stored.UserDefined))
 		reconcileStoredObjectTags(srcInfo.UserDefined, stored.UserTags, stored.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
 		dstOpts.replicaObjectInfo = z.replicaObjectInfo
-		idx := copies[0].Index
+		idx := poolIdx
 		oi, err := z.serverPools[idx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 		if err == nil {
 			err = z.retireReplicaCopies(ctx, dstBucket, dstObject, idx, oi)
 		}
 		return oi, err
-	}
-
-	var poolIdx int
-	if dstOpts.MetadataChg && cpSrcDstSame && srcInfo.metadataOnly && srcOpts.VersionID == dstOpts.VersionID {
-		// Restore status updates address an existing version. Keep ordinary
-		// copy/write allocation unchanged, including its latest-version lookup.
-		poolIdx, err = z.getPoolIdxExistingWithOpts(ctx, dstBucket, dstObject, ObjectOptions{
-			VersionID:          dstOpts.VersionID,
-			MetadataChg:        true,
-			NoLock:             true,
-			Transition:         dstOpts.Transition,
-			SkipDecommissioned: true,
-			SkipRebalancing:    true,
-		})
-	} else {
-		poolIdx, err = z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
-	}
-	if err != nil {
-		return objInfo, err
 	}
 
 	if !z.SinglePool() {
@@ -1765,9 +1797,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		}
 	}
 
-	// CopyObjectHandler predicts the outcome of this decision in
-	// copyRewritesObjectData(); keep the two in sync.
-	if cpSrcDstSame && srcInfo.metadataOnly {
+	if cpSrcDstSame && !copyRewritesObjectData(srcInfo.metadataOnly && !srcInfo.Legacy, srcOpts, dstOpts) {
 		// Version ID is set for the destination and source == destination version ID.
 		if dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID {
 			return z.serverPools[poolIdx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)

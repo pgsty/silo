@@ -1317,13 +1317,11 @@ func isRemoteCallRequired(ctx context.Context, bucket string, objAPI ObjectLayer
 
 // copyRewritesObjectData reports whether the object layer stores new object data
 // for this copy instead of updating metadata in place or adding a
-// self-referential version. It mirrors the metadata-only decision taken by
-// erasureServerPools.CopyObject and erasureSets.CopyObject. CopyObjectHandler
-// has to predict that decision because the compression metadata it records must
-// describe whichever bytes are finally stored. metadataOnly already excludes
-// legacy sources, which the object layer always rewrites.
+// self-referential version. The selected pool must contain the source data to
+// add a reference. metadataOnly already excludes legacy sources, which the
+// object layer always rewrites.
 func copyRewritesObjectData(metadataOnly bool, srcOpts, dstOpts ObjectOptions) bool {
-	if !metadataOnly {
+	if !metadataOnly || dstOpts.copyPlan != nil && dstOpts.copyPlan.rewrite {
 		return true
 	}
 	switch {
@@ -1681,6 +1679,14 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	copySrcOpts := srcOpts
 	if dstOpts.Versioned && copySrcOpts.VersionID == "" {
 		copySrcOpts.VersionID = srcInfo.VersionID
+	}
+	if !remoteCallRequired {
+		plan, err := objectAPI.prepareCopyObject(lockCtx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, copySrcOpts, dstOpts)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		dstOpts.copyPlan = &plan
 	}
 
 	// A key rotation rewraps the object key held in metadata; it never

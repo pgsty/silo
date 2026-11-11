@@ -124,6 +124,8 @@ type ObjectOptions struct {
 	replicaObjectInfo GetObjectInfoFn
 	// Verifies protected content in every pool before a replica commits.
 	replicaContentGuard replicaContentGuardFn
+	// Selected under the object locks, before copy encryption/compression.
+	copyPlan *copyObjectPlan
 
 	// RefuseLockedOverwrite refuses, under the destination's write lock, a
 	// write that would replace a stored version Object Lock protects: the
@@ -299,6 +301,7 @@ type ObjectLayer interface {
 	NewObjectNSLock(bucket, object string) RWLocker
 	// lockObjects locks several objects together, see erasureServerPools.
 	lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error)
+	prepareCopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (copyObjectPlan, error)
 
 	// Storage operations.
 	Shutdown(context.Context) error
