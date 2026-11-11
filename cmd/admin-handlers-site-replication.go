@@ -165,10 +165,10 @@ func (a adminAPIHandlers) SRPeerReplicateIAMItem(w http.ResponseWriter, r *http.
 	default:
 		err = errSRInvalidRequest(errInvalidArgument)
 	case madmin.SRIAMItemPolicy:
-		if item.Policy == nil {
+		if item.Policy == nil || bytes.Equal(bytes.TrimSpace(item.Policy), []byte("null")) {
 			err = globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, nil, item.UpdatedAt)
 		} else {
-			policy, perr := policy.ParseConfig(bytes.NewReader(item.Policy))
+			policy, perr := parsePolicySnapshotBytes(item.Policy)
 			if perr != nil {
 				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, perr), r.URL)
 				return
@@ -222,10 +222,10 @@ func (a adminAPIHandlers) SRPeerReplicateBucketItem(w http.ResponseWriter, r *ht
 	default:
 		err = globalSiteReplicationSys.PeerBucketMetadataUpdateHandler(ctx, item)
 	case madmin.SRBucketMetaTypePolicy:
-		if item.Policy == nil {
+		if item.Policy == nil || bytes.Equal(bytes.TrimSpace(item.Policy), []byte("null")) {
 			err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, nil, item.UpdatedAt)
 		} else {
-			bktPolicy, berr := policy.ParseBucketPolicyConfig(bytes.NewReader(item.Policy), item.Bucket)
+			bktPolicy, berr := parseBucketPolicyStrictBytes(item.Policy, item.Bucket)
 			if berr != nil {
 				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, berr), r.URL)
 				return

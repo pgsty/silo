@@ -303,13 +303,18 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 		}
 	}
 
+	vc, _, err := checkBucketDeleteMetadata(bucket)
+	if err != nil {
+		return opts, err
+	}
+
 	opts.DeletePrefix = deletePrefix
-	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(bucket, object)
+	opts.Versioned = vc.PrefixEnabled(object)
 	// Objects matching prefixes should not leave delete markers,
 	// dramatically reduces namespace pollution while keeping the
 	// benefits of replication, make sure to apply version suspension
 	// only at bucket level instead.
-	opts.VersionSuspended = globalBucketVersioningSys.Suspended(bucket)
+	opts.VersionSuspended = vc.Suspended()
 	// For directory objects, delete `null` version permanently.
 	if isDirObject(object) && opts.VersionID == "" {
 		opts.VersionID = nullVersionID

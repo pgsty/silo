@@ -2673,6 +2673,7 @@ func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRa
 			},
 			PartNumber: opts.PartNumber,
 		}
+		gopts.Set(xhttp.AmzTagDirective, accessDirective)
 		if rs != nil {
 			h, err := rs.ToHeader()
 			if err != nil {

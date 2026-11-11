@@ -622,6 +622,23 @@ func TestLocalBucketMetadataCommittedEvents(t *testing.T) {
 				t.Fatalf("zero quota event: %+v", last)
 			}
 
+			// Replicated buckets must reject prefix exclusions without changing
+			// the stored versioning document or announcing a successful update.
+			beforeRejected := len(events())
+			rec = corsAdminRequest(t, cred, http.MethodPut, "/import-bucket-metadata", corsZip(t, map[string][]byte{
+				bucket + "/" + bucketVersioningConfig: []byte(`<VersioningConfiguration><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders></VersioningConfiguration>`),
+			}))
+			if report := corsImportReport(t, rec).Buckets[bucket]; report.Versioning.Err == "" {
+				t.Fatal("replicated bucket accepted excluded prefixes")
+			}
+			afterRejected, err := loadBucketMetadata(ctx, obj, bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(afterRejected.VersioningConfigXML, meta.VersioningConfigXML) || !afterRejected.VersioningConfigUpdatedAt.Equal(meta.VersioningConfigUpdatedAt) || len(events()) != beforeRejected {
+				t.Fatal("rejected versioning import changed metadata or emitted an event")
+			}
+
 			injectedAt := UTCNow().Add(2 * time.Hour)
 			interleaving := &importInterleavingObjectLayer{ObjectLayer: obj, write: func() {
 				data := []byte(`{"quota":2048,"quotatype":"hard"}`)
@@ -638,10 +655,10 @@ func TestLocalBucketMetadataCommittedEvents(t *testing.T) {
 				bucket + "/quota.json":                []byte(`{}`),
 				bucket + "/" + bucketTaggingConfig:    []byte(`<Tagging><TagSet><Tag><Key>imported</Key><Value>yes</Value></Tag></TagSet></Tagging>`),
 				bucket + "/" + objectLockConfig:       enabledBucketObjectLockConfig,
-				bucket + "/" + bucketVersioningConfig: []byte(`<VersioningConfiguration><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders></VersioningConfiguration>`),
+				bucket + "/" + bucketVersioningConfig: enabledBucketVersioningConfig,
 			}))
 			report := corsImportReport(t, rec).Buckets[bucket]
-			if report.Err != "" || report.Policy.Err != "" || report.Quota.Err != "" || report.Tagging.Err != "" {
+			if report.Err != "" || report.Policy.Err != "" || report.Quota.Err != "" || report.Tagging.Err != "" || report.Versioning.Err != "" {
 				t.Fatalf("import: %+v", report)
 			}
 			meta, err = loadBucketMetadata(ctx, obj, bucket)

@@ -492,7 +492,14 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	deleteResults := make([]deleteResult, len(deleteObjectsReq.Objects))
 	duplicateOf := make(map[int]int)
 
-	vc, _ := globalBucketVersioningSys.Get(bucket)
+	vc, rcfg, metaErr := checkBucketDeleteMetadata(bucket)
+	if metaErr != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, metaErr), r.URL)
+		return
+	}
+	lockedNullDelete := func(obj ObjectToDelete) bool {
+		return obj.VersionID == "" && rcfg.LockEnabled && !vc.PrefixEnabled(obj.ObjectName)
+	}
 	oss := make([]*objSweeper, len(deleteObjectsReq.Objects))
 	for index, object := range deleteObjectsReq.Objects {
 		reqInfo.ObjectName = object.ObjectName
@@ -536,7 +543,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		// Every physical version delete checks the version's own protection
 		// under its mutation lock. Bucket metadata may be stale or unavailable
 		// and cannot establish that a stored version is unprotected.
-		if object.VersionID != "" {
+		if object.VersionID != "" || lockedNullDelete(object) {
 			if first, ok := objectsToDelete[object]; ok {
 				duplicateOf[index] = first
 			} else {
@@ -601,23 +608,32 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	bulk := make([]ObjectToDelete, 0, len(deleteList))
 	bulkIndex := make([]int, 0, len(deleteList))
 	for i, object := range deleteList {
-		if object.VersionID == "" {
+		if object.VersionID == "" && !lockedNullDelete(object) {
 			bulk = append(bulk, object)
 			bulkIndex = append(bulkIndex, i)
 			continue
 		}
 		reqInfo.ObjectName, reqInfo.VersionID = object.ObjectName, object.VersionID
 		opts := ObjectOptions{
-			VersionID:        object.VersionID,
-			Versioned:        vc.PrefixEnabled(object.ObjectName),
-			VersionSuspended: vc.Suspended(),
+			VersionID:             object.VersionID,
+			Versioned:             vc.PrefixEnabled(object.ObjectName),
+			VersionSuspended:      vc.Suspended(),
+			RefuseLockedOverwrite: lockedNullDelete(object),
 		}
 		index := objectsToDelete[object]
 		if !globalTierConfigMgr.Empty() {
-			oss[index] = newObjSweeper(bucket, object.ObjectName).WithVersion(object.VersionID).WithVersioning(opts.Versioned, opts.VersionSuspended)
+			sweepVID := object.VersionID
+			if sweepVID == "" && opts.VersionSuspended {
+				sweepVID = nullVersionID
+			}
+			oss[index] = newObjSweeper(bucket, object.ObjectName).WithVersion(sweepVID).WithVersioning(opts.Versioned, opts.VersionSuspended)
 		}
 		opts.SetEvalRetentionBypassFn(func(oi ObjectInfo, err error) error {
-			return enforceRetentionBypassForDelete(ctx, r, bucket, object, oi, err)
+			checkObj := object
+			if checkObj.VersionID == "" {
+				checkObj.VersionID = nullVersionID
+			}
+			return enforceRetentionBypassForDelete(ctx, r, bucket, checkObj, oi, err)
 		})
 		opts.SetEvalMetadataFn(func(oi *ObjectInfo, err error) (ReplicateDecision, error) {
 			if err == nil && oss[index] != nil {
@@ -631,11 +647,17 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		// DeleteObject merges protection across pools before evaluating these
 		// callbacks and holds the same lock as retention and legal-hold writes.
 		oi, err := objectAPI.DeleteObject(ctx, bucket, object.ObjectName, opts)
-		dObjects[i] = DeletedObject{
+		delObj := DeletedObject{
 			ObjectName:       object.ObjectName,
 			VersionID:        object.VersionID,
 			ReplicationState: oi.ReplicationState(),
 		}
+		if object.VersionID == "" && oi.DeleteMarker {
+			delObj.DeleteMarker = true
+			delObj.DeleteMarkerVersionID = oi.VersionID
+			delObj.DeleteMarkerMTime = DeleteMarkerMTime{oi.ModTime}
+		}
+		dObjects[i] = delObj
 		errs[i] = err
 	}
 	if len(bulk) > 0 {
@@ -659,7 +681,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		// under the mutation lock, and a missing version has no stored identity.
 		dindex := objectsToDelete[deleteList[i]]
 		if errs[i] == nil || isErrObjectNotFound(errs[i]) || isErrVersionNotFound(errs[i]) {
-			if replicateDeletes && deleteList[i].VersionID == "" {
+			if replicateDeletes && deleteList[i].VersionID == "" && !lockedNullDelete(deleteList[i]) {
 				dObjects[i].ReplicationState = deleteList[i].ReplicationState()
 			}
 			deleteResults[dindex].delInfo = dObjects[i]

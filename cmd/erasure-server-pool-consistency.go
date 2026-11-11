@@ -646,6 +646,26 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 		case opts.VersionID != "":
 			// An addressed version already resolved every copy above.
 			logical = mergedPoolObjectInfo(copies)
+		case !opts.Versioned && !opts.DeleteMarker:
+			// An unqualified delete when versioning is not active for this key
+			// removes or replaces the null version in every pool that holds one,
+			// even if a newer non-null version is current for reads.
+			nullOpts := opts
+			nullOpts.VersionID = nullVersionID
+			nullCopies, err := z.objectPoolInfos(ctx, bucket, object, nullOpts)
+			switch {
+			case err == nil:
+				if nullCopies[0].ObjInfo.DeleteMarker {
+					gerr = toObjectErr(errFileNotFound, bucket, object)
+					logical = nullCopies[0].ObjInfo
+				} else {
+					logical = mergedPoolObjectInfo(nullCopies)
+				}
+			case isErrObjectNotFound(err) || isErrVersionNotFound(err):
+				gerr = toObjectErr(errFileNotFound, bucket, object)
+			default:
+				return ObjectInfo{}, err
+			}
 		default:
 			versions, err := z.metadataPoolInfos(ctx, bucket, object, opts)
 			if err != nil {
@@ -661,6 +681,14 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 				return ObjectInfo{}, err
 			}
 			opts.EvalRetentionBypassFn = nil
+			if !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+				opts.RefuseLockedOverwrite = false
+			}
+		} else if opts.RefuseLockedOverwrite && !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+			if err := refuseLockedMarkerOverwrite(ctx, bucket, object, nullVersionID, logical, gerr); err != nil {
+				return ObjectInfo{}, err
+			}
+			opts.RefuseLockedOverwrite = false
 		}
 		if opts.EvalMetadataFn != nil {
 			decision, err := opts.EvalMetadataFn(&logical, gerr)

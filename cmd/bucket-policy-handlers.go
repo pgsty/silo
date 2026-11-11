@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 
@@ -83,7 +82,7 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	bucketPolicy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyBytes), bucket)
+	bucketPolicy, err := parseBucketPolicyStrictBytes(bucketPolicyBytes, bucket)
 	if err != nil {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "MalformedPolicy",

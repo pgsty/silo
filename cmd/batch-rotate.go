@@ -34,6 +34,8 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/etag"
+	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/pgsty/silo-pkg/v3/env"
@@ -228,11 +230,11 @@ func (r *BatchJobKeyRotateV1) rotateAuthzRequests(oi ObjectInfo) []batchAuthzReq
 	if versionID == "" {
 		versionID = nullVersionID
 	}
-	// The encryption the rewrite leaves: rotation keeps the kind of the
-	// version (rotateKey), and SSE-KMS takes the requested key.
+	// The encryption the rewrite leaves: SSE-KMS takes the requested key,
+	// including when migrating an SSE-S3 version to SSE-KMS.
 	values := map[string][]string{}
 	switch {
-	case crypto.S3KMS.IsEncrypted(oi.UserDefined):
+	case crypto.S3KMS.IsEncrypted(oi.UserDefined) || r.Encryption.Type == ssekms:
 		values[strings.ToLower(xhttp.AmzServerSideEncryption)] = []string{xhttp.AmzEncryptionKMS}
 		if r.Encryption.Type == ssekms && r.Encryption.Key != "" {
 			values[strings.ToLower(xhttp.AmzServerSideEncryptionKmsID)] = []string{r.Encryption.Key}
@@ -310,31 +312,113 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	}
 	oi := obj.Clone()
 	var (
-		newKeyID      string
-		newKeyContext kms.Context
+		newKeyID       string
+		newKeyContext  kms.Context
+		replaceContext bool
+		targetKind     crypto.Type = crypto.S3
 	)
-	encMetadata := make(map[string]string)
-	for k, v := range oi.UserDefined {
-		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
-			encMetadata[k] = v
-		}
+	if sseKMS || r.Encryption.Type == ssekms {
+		targetKind = crypto.S3KMS
 	}
-
 	if (sseKMS || sseS3) && r.Encryption.Type == ssekms {
 		newKeyContext, err = r.Encryption.validate()
 		if err != nil {
 			return err
 		}
 		newKeyID = strings.TrimPrefix(r.Encryption.Key, crypto.ARNPrefix)
-	}
-	if err = rotateKey(ctx, []byte{}, newKeyID, []byte{}, r.Bucket, oi.Name, encMetadata, newKeyContext); err != nil {
-		return err
+		replaceContext = r.Encryption.Context != ""
 	}
 
-	// Since we are rotating the keys, make sure to update the metadata.
-	oi.metadataOnly = true
-	oi.keyRotation = true
-	maps.Copy(oi.UserDefined, encMetadata)
+	srcOpts := ObjectOptions{VersionID: oi.VersionID}
+	dstOpts := ObjectOptions{
+		VersionID:        oi.VersionID,
+		Versioned:        versioned,
+		VersionSuspended: versionSuspended,
+		NoLock:           true,
+	}
+
+	if oi.Legacy {
+		if targetKind == crypto.S3KMS && !replaceContext && len(newKeyContext) == 0 && sseKMS {
+			_, _, _, newKeyContext, err = crypto.S3KMS.ParseMetadata(oi.UserDefined)
+			if err != nil {
+				return err
+			}
+		}
+		readOpts := ObjectOptions{
+			VersionID:        oi.VersionID,
+			Versioned:        versioned,
+			VersionSuspended: versionSuspended,
+			NoLock:           true,
+			NoAuditLog:       true,
+		}
+		var gr *GetObjectReader
+		if z, ok := api.(*erasureServerPools); ok && pool >= 0 {
+			gr, err = z.serverPools[pool].GetObjectNInfo(ctx, r.Bucket, encodeDirObject(oi.Name), nil, http.Header{}, readOpts)
+		} else {
+			gr, err = api.GetObjectNInfo(ctx, r.Bucket, oi.Name, nil, http.Header{}, readOpts)
+		}
+		if err != nil {
+			return err
+		}
+		defer gr.Close()
+
+		actualSize, err := gr.ObjInfo.GetActualSize()
+		if err != nil {
+			return err
+		}
+		rawReader, err := hash.NewReader(ctx, gr, actualSize, "", "", actualSize)
+		if err != nil {
+			return err
+		}
+		pReader := NewPutObjReader(rawReader)
+		encMetadata := make(map[string]string)
+		encReader, objEncKey, err := newEncryptReader(ctx, rawReader, targetKind, newKeyID, nil, r.Bucket, oi.Name, encMetadata, newKeyContext)
+		if err != nil {
+			return err
+		}
+		crypto.RemoveInternalEntries(oi.UserDefined)
+		delete(oi.UserDefined, crypto.MetaContext)
+		delete(oi.UserDefined, ReservedMetadataPrefix+"compression")
+		delete(oi.UserDefined, ReservedMetadataPrefix+"actual-size")
+		maps.Copy(oi.UserDefined, encMetadata)
+
+		targetSize := (&ObjectInfo{Size: actualSize}).EncryptedSize()
+		wrapped := etag.Wrap(encReader, rawReader)
+		hReader, err := hash.NewReader(ctx, wrapped, targetSize, "", "", actualSize)
+		if err != nil {
+			return err
+		}
+		pReader, err = pReader.WithEncryption(hReader, &objEncKey)
+		if err != nil {
+			return err
+		}
+		oi.PutObjReader = pReader
+		oi.metadataOnly = false
+		oi.keyRotation = true
+		dstOpts.EncryptFn = metadataEncrypter(objEncKey)
+		if dstOpts.VersionID == "" && (versioned || versionSuspended) {
+			dstOpts.VersionID = nullVersionID
+		}
+	} else {
+		encMetadata := make(map[string]string)
+		for k, v := range oi.UserDefined {
+			if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
+				encMetadata[k] = v
+			}
+		}
+		if err = rotateKeyWithTarget(ctx, []byte{}, targetKind, newKeyID, []byte{}, r.Bucket, oi.Name, encMetadata, newKeyContext, replaceContext); err != nil {
+			return err
+		}
+		// Since we are rotating the keys, make sure to update the metadata.
+		oi.metadataOnly = true
+		oi.keyRotation = true
+		delete(oi.UserDefined, crypto.MetaSealedKeyS3)
+		delete(oi.UserDefined, crypto.MetaSealedKeyKMS)
+		delete(oi.UserDefined, crypto.MetaKeyID)
+		delete(oi.UserDefined, crypto.MetaDataEncryptionKey)
+		delete(oi.UserDefined, crypto.MetaContext)
+		maps.Copy(oi.UserDefined, encMetadata)
+	}
 	// The rewrite replaces the stored metadata with UserDefined, which a
 	// read returns without the tags and the expiry: keep them.
 	if oi.UserTags != "" {
@@ -343,8 +427,6 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	if !oi.Expires.IsZero() {
 		oi.UserDefined["expires"] = oi.ExpiresStr()
 	}
-	srcOpts := ObjectOptions{VersionID: oi.VersionID}
-	dstOpts := ObjectOptions{VersionID: oi.VersionID, NoLock: true}
 	if z, ok := api.(*erasureServerPools); ok && pool >= 0 {
 		// Rewrite the copy that was read and authorized. The pools layer
 		// would route the rewrite by the latest version of the key, which

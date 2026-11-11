@@ -1087,15 +1087,24 @@ func (sys *IAMSys) notifyForServiceAccount(ctx context.Context, accessKey string
 }
 
 type newServiceAccountOpts struct {
-	sessionPolicy              *policy.Policy
-	accessKey                  string
-	secretKey                  string
-	status                     string // Used by replication snapshots; local creates default to enabled.
-	name, description          string
-	expiration                 *time.Time
-	allowSiteReplicatorAccount bool // allow creating internal service account for site-replication.
+	sessionPolicy               *policy.Policy
+	accessKey                   string
+	secretKey                   string
+	status                      string // Used by replication snapshots; local creates default to enabled.
+	name, description           string
+	expiration                  *time.Time
+	allowSiteReplicatorAccount  bool // allow creating internal service account for site-replication.
+	preserveEmptyEmbeddedPolicy bool // preserve historical deny-all empty embedded policies on snapshot import/replication.
 
 	claims map[string]any
+}
+
+func svcAcctClaimsHaveEmbeddedPolicy(claims map[string]any) bool {
+	if claims == nil {
+		return false
+	}
+	pt, _ := claims[iamPolicyClaimNameSA()].(string)
+	return pt == embeddedPolicyType
 }
 
 // marshalServiceAccountPolicy validates a supplied policy and normalizes its
@@ -1157,10 +1166,32 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	m := make(map[string]any)
 	m[parentClaim] = parentUser
 
-	if len(policyBuf) > 0 {
+	switch {
+	case len(policyBuf) > 0:
 		m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf)
 		m[iamPolicyClaimNameSA()] = embeddedPolicyType
-	} else {
+	case opts.preserveEmptyEmbeddedPolicy:
+		switch {
+		case opts.sessionPolicy != nil:
+			p := *opts.sessionPolicy
+			if p.Version == "" {
+				p.Version = policy.DefaultVersion
+			}
+			buf, merr := json.Marshal(p)
+			if merr != nil {
+				return auth.Credentials{}, time.Time{}, merr
+			}
+			m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(buf)
+			m[iamPolicyClaimNameSA()] = embeddedPolicyType
+		default:
+			if raw, ok := opts.claims[policy.SessionPolicyName].(string); ok && raw != "" {
+				m[policy.SessionPolicyName] = raw
+				m[iamPolicyClaimNameSA()] = embeddedPolicyType
+			} else {
+				m[iamPolicyClaimNameSA()] = inheritedPolicyType
+			}
+		}
+	default:
 		m[iamPolicyClaimNameSA()] = inheritedPolicyType
 	}
 

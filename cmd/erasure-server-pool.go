@@ -1320,7 +1320,9 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	approvedExpiry := opts.Expiration.Expire && opts.Expiration.CheckedAllPools && !opts.Transition.ExpireRestored
 	reconcileVersion := opts.VersionID != "" && !opts.DataMovement &&
 		(!opts.ReplicationRequest || opts.isVersionPurge()) && (!opts.Expiration.Expire || approvedExpiry) && !opts.InclFreeVersions
-	if !z.SinglePool() && (opts.CheckPrecondFn != nil || reconcileVersion) {
+	reconcileUnaddressedLock := opts.VersionID == "" && !opts.Versioned && !opts.DeleteMarker &&
+		opts.RefuseLockedOverwrite && !opts.DataMovement && !opts.ReplicationRequest && !opts.Expiration.Expire && !opts.InclFreeVersions
+	if !z.SinglePool() && (opts.CheckPrecondFn != nil || reconcileVersion || reconcileUnaddressedLock) {
 		return z.deleteObjectReconciled(ctx, bucket, object, opts)
 	}
 
@@ -1822,6 +1824,10 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		}
 	}
 
+	if srcInfo.PutObjReader == nil {
+		return ObjectInfo{}, errInvalidArgument
+	}
+
 	putOpts := ObjectOptions{
 		ServerSideEncryption:       dstOpts.ServerSideEncryption,
 		UserDefined:                srcInfo.UserDefined,
@@ -1834,6 +1840,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		IndexCB:                    dstOpts.IndexCB,
 		WantChecksum:               dstOpts.WantChecksum,
 		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
+		PreserveETag:               dstOpts.PreserveETag,
 		ReplicationRequest:         dstOpts.ReplicationRequest,
 		ReplicaLockReconcile:       dstOpts.ReplicaLockReconcile,
 		DataMovement:               dstOpts.DataMovement,
@@ -2499,21 +2506,21 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		}
 	}()
 
-	// Several pools take the object lock first, then the upload lock below.
-	// A single pool takes the upload lock here and the set takes the object
-	// lock, in the object's own erasure set, only right before it commits.
-	if !z.SinglePool() {
-		if !opts.NoLock {
-			lk := z.NewObjectNSLock(bucket, encodeDirObject(object))
-			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-			if err != nil {
-				return objInfo, err
-			}
-			ctx = lkctx.Context()
-			defer lk.Unlock(lkctx)
+	// Take the object lock before the upload lock for every pool count.
+	// UploadPartCopy holds its source read lock while it reads upload
+	// metadata, including when the source and destination are the same key.
+	if !opts.NoLock {
+		lk := z.NewObjectNSLock(bucket, encodeDirObject(object))
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return objInfo, err
 		}
-		opts.NoLock = true
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+	opts.NoLock = true
 
+	if !z.SinglePool() {
 		// A conditional completion must be evaluated against the logical
 		// latest object across pools, under the object write lock held for
 		// this operation. The pool hosting the upload may only hold a stale

@@ -217,8 +217,12 @@ func (cr *s3UnsignedChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\r' {
+			if valueBuffer.Len() >= maxTrailerSize {
+				return errMalformedEncoding
+			}
 			valueBuffer.WriteByte(v)
 			continue
 		}
@@ -229,6 +233,7 @@ func (cr *s3UnsignedChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if !bytes.Equal(tmp[:], []byte{'\n', '\r', '\n'}) {
 			if cr.debug {

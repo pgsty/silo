@@ -1,37 +1,74 @@
 # Changelog
 
-## Unreleased
+## RELEASE.2026-11-12T00-00-00Z
 
-These changes follow Server 20261109 and have no assigned release version yet.
-Console and mcli policy-editing repairs require matching component releases;
-the current Server dependency pins still select Console v2.7.0 and mcli 20261109.
-See the [server compatibility notes](https://silo.pgsty.com/compatibility/server/)
-for the candidate behavior and upgrade boundaries.
+Package version: `20261112000000.0.0`. Publication status and artifacts are
+listed in [GitHub Releases](https://github.com/pgsty/silo/releases). This
+section covers the changes after the published 20261109 source `d998292387cc`,
+adopting Go `1.27.4`, `silo-pkg v3.16.1`, embedded Console `v2.7.1`, and
+bundled `mcli 20261112`. See the
+[server compatibility notes](https://silo.pgsty.com/compatibility/server/)
+for behavior and upgrade boundaries.
 
+- Release checks verify the selected pkg and embedded Console versions and
+  match the bundled mcli release to its source module, independently of local
+  workspaces, before building release artifacts. Deploy SILO and mcli
+  `RELEASE.2026-11-12T00-00-00Z` by default from Helm chart `7.0.5`.
 - Replica writes and copies use the destination version's retention, legal
-  hold and tags under its mutation lock. Cross-pool reconciliation preserves
-  COMPLIANCE protection regardless of pool order, while authorized changes to
-  GOVERNANCE retention and legal hold remain possible. Local lock revisions
-  advance past stored revisions, and forced prefix deletion refuses an
-  unavailable Object Lock configuration ([#336](https://github.com/pgsty/silo/issues/336)).
+  hold and tags under its mutation lock, verify staged replica content and
+  SSE-C/compressed metadata against stored locked versions before committing,
+  and prevent newer peer timestamps from weakening unexpired COMPLIANCE
+  retention. Cross-pool reconciliation preserves COMPLIANCE protection
+  regardless of pool order, while authorized changes to GOVERNANCE retention
+  and legal hold remain possible. Local lock revisions advance past stored
+  revisions, unaddressed deletes under versioning suspension or excluded
+  prefixes enforce Object Lock across single-pool and multi-pool deployments
+  and fail closed when versioning or Object Lock metadata cannot be read,
+  bucket metadata imports require versioning across prefix exclusions as well
+  as suspension, and peer replication-trust headers must be signed with
+  header-based SigV4 ([#336](https://github.com/pgsty/silo/issues/336)).
 - Tagging proxies (`GET`, `PUT` and `DELETE`) authenticate and authorize every
   present replica, including its stored tags, fail closed on unreadable targets,
   and skip missing replicas caused by replication lag unless all targets are
-  absent. Authenticated unsigned-trailer uploads enforce the request time
-  window; anonymous uploads allowed by bucket policy remain supported
+  absent; active-active `GET` and `HEAD` proxies enforce `s3:ExistingObjectTag`
+  and `s3:versionid` before returning peer responses and forward
+  `X-Amz-Tagging-Directive: ACCESS` on `HEAD`. Authenticated unsigned-trailer
+  uploads enforce the request time window and header signatures, SigV4 header,
+  presigned, streaming and POST policy verifiers bind the credential-scope date
+  to the signed request timestamp, streaming trailer readers bound trailer memory
+  and surface non-EOF stream errors without hanging on negative
+  `X-Amz-Decoded-Content-Length`, and bucket metadata cache loads no longer
+  overwrite fresher concurrent updates
   ([#337](https://github.com/pgsty/silo/issues/337),
   [#338](https://github.com/pgsty/silo/issues/338)).
-- `GetObjectAttributes` evaluates both Attributes and GetObject permissions
-  against the addressed version's stored tags, using version actions for an
-  explicit version. ZIP GET, HEAD and member listings also authorize the ZIP
-  object's stored tags; listing members requires both `s3:ListBucket` and
-  `s3:GetObject`. These reads no longer write an archive index back to the
-  object. Missing-object masking still uses `s3:ListBucket`, and authorized
-  storage failures retain their server error ([#342](https://github.com/pgsty/silo/issues/342)).
+- Object tag and version authorization now applies consistently across read,
+  copy, list and archive endpoints: `GetObject`, `HeadObject` and
+  `SelectObjectContent` evaluate `s3:ExistingObjectTag` and `s3:versionid`
+  (preserving retryable `5xx` server errors for callers authorized by tag
+  conditions when storage is unreadable, resolving the 20261109 limitation in
+  [PR #294](https://github.com/pgsty/silo/pull/294)); `CopyObject` and
+  `UploadPartCopy` authorize source `s3:ExistingObjectTag` and `s3:versionid`
+  as well as destination `s3:RequestObjectTag` on copied tags; `X-Amz-Tagging`
+  is returned on `GET`/`HEAD` (`X-Amz-Tagging-Directive: ACCESS`) only when
+  `s3:GetObjectTagging` / `s3:GetObjectVersionTagging` (or `s3:ReplicateTags`)
+  permits; `ListObjectsV2` / `ListObjectVersions` with `metadata=true` evaluate
+  current-object and per-version metadata permissions respectively, using stored tags; and `GetObjectAttributes`,
+  tagging handlers (`GET`/`PUT`/`DELETE`) and ZIP `GET`/`HEAD`/member listings
+  authorize stored tags and version actions without mutating unindexed archives
+  ([#342](https://github.com/pgsty/silo/issues/342)).
+- Policy parsing rejects unknown JSON fields, trailing tokens and malformed
+  principals across admin IAM policy/user/service-account endpoints, STS
+  session policies, IAM imports/replication, bucket policies and bucket metadata
+  imports instead of silently accepting empty or wildcard fallbacks. Validate
+  the complete imported policy file before applying entries; retain supported
+  historical snapshot semantics and explicit null bucket-policy replication
+  tombstones. New session policies retain strict resource validation.
 - Every explicit version removal in S3 `DeleteObjects`, including in buckets
   without Object Lock, now uses the sequential single-object path to check
   metadata, retention and replication under the mutation lock. Large version
-  purges can take longer; entries without a version ID retain the bulk path.
+  purges can take longer. Unaddressed deletes that can replace a locked null
+  version also use the single-object path; other unaddressed deletes retain
+  bulk execution.
 - Decommission rescans keys hidden below another key only while source
   versions are actually removed, resolving the 20261109 limitation recorded
   in [#293](https://github.com/pgsty/silo/issues/293). Decommission and rebalance
@@ -52,52 +89,47 @@ for the candidate behavior and upgrade boundaries.
   disabled service accounts and groups, reports group failures, and excludes
   derived session-policy claims from exported and replicated credentials
   ([#345](https://github.com/pgsty/silo/issues/345)).
-- Historical-version self-copy plans its destination pool and data rewrite
+- Lifecycle history revision counting treats old and healed `xl.meta` headers
+  for the same version as one revision ([#332](https://github.com/pgsty/silo/issues/332)),
+  and restore expiry no longer turns a time-derived data-directory flag into a
+  different version revision; mixed healed headers can reach quorum and expired
+  local restore data can be cleaned up ([#344](https://github.com/pgsty/silo/issues/344)).
+  Historical-version self-copy plans its destination pool and data rewrite
   before encryption or compression, preserving multi-block compression seek
   indexes so a source version in another pool creates a readable new version.
   In-place metadata updates locate the exact requested version and preserve
   authoritative content on moving pools, while copies that require encryption
   or checksum recomputation select an active pool
-  ([#343](https://github.com/pgsty/silo/issues/343)). Restore expiry no longer
-  turns a time-derived data-directory flag into a different version revision;
-  mixed healed headers can reach quorum and expired local restore data can be
-  cleaned up ([#344](https://github.com/pgsty/silo/issues/344)).
-- Batch KMS rotation decodes the configured encryption context on execution
-  and after reload or retry, rejecting invalid UTF-8 before changing an object
-  key and without adding validation-probe fields to object metadata
+  ([#343](https://github.com/pgsty/silo/issues/343)).
+- Batch KMS rotation decodes and validates the configured encryption context
+  (and incoming HTTP SSE-KMS context headers) as strict UTF-8 JSON before
+  changing an object key and without adding validation-probe fields to object
+  metadata, supports `SSE-S3` to `SSE-KMS` key migration and multipart metadata
+  preservation, and rewrites legacy `XLV1` objects onto `XLv2` streams instead
+  of failing in-place metadata updates
   ([#346](https://github.com/pgsty/silo/issues/346)). Batch variable
   preflight follows the pinned policy evaluator's literal and substitution
   rules, including BinaryEquals, while retaining refusal of unavailable
   request context. This does not add AWS special-variable escape semantics
   ([#347](https://github.com/pgsty/silo/issues/347)).
-- Service-account create and edit normalize a missing policy Version to the
-  default. Edit distinguishes an omitted or null policy (preserve) from an
-  explicit empty document (return to inheritance). Matching Console changes
-  preserve inherited policy on metadata edits; matching mcli changes accept
-  explicit empty policies only on edit, keeping create and named-policy
-  validation strict ([#339](https://github.com/pgsty/silo/issues/339),
+- Service-account and access-key create/edit normalize a missing policy Version
+  to `2012-10-17`, reject malformed or unknown policy fields, and distinguish an
+  omitted or `null` policy (preserve existing inline policy) from an explicit
+  empty policy document such as `{}` or `{"Statement":[]}` (reset to parent
+  inheritance), while keeping historical deny-all accounts carrying an empty
+  embedded policy restricted until explicitly reset
+  ([#339](https://github.com/pgsty/silo/issues/339),
   [Console #89](https://github.com/pgsty/silo-console/issues/89),
-  [mcli #78](https://github.com/pgsty/mc/issues/78)).
-
-- An edit of a service account or access key that names no policy keeps its
-  inline policy. `mcli admin user svcacct disable`, `enable` and `edit` without
-  `--policy`, the same `idp ldap accesskey` commands, and any other
-  `update-service-account` request without `newPolicy` removed the inline
-  policy at the site that took the request and, for an account of another user
-  than root, at its replication peers, and the account then had all its parent
-  is allowed. The inline policy is removed
-  only on request, by an empty policy document such as `{"Statement":[]}`
-  (`mcli admin user svcacct edit --policy`); a client that left the policy out
-  to remove it must send that document. A JSON `null` policy counts as none.
-  In the matching Console, turn off **Restrict beyond user policy** or enter
-  `{}` to remove an inline policy. Clearing the editor while restriction is
-  enabled prevents saving. The fix does not bring back a policy
-  that was removed, and a site of a replicated deployment that does not run the
-  fix still removes the policy on such an edit that it takes itself or receives
-  from another site that does not run it, so sites can differ. Upgrade every
-  site, then review on each site the accounts that `svcacct info` reports with
-  `Policy: implied`, and set the policy again on those that were meant to be
-  restricted.
+  [mcli #78](https://github.com/pgsty/mc/issues/78)). Previously,
+  `mcli admin user svcacct disable`, `enable` and `edit` without `--policy`,
+  the matching `admin accesskey` and `idp ldap/openid accesskey` commands, and
+  any other `update-service-account` request without `newPolicy` removed the
+  inline policy on the receiving site and on site-replication peers for
+  non-root parent users. In the matching Console, turn off **Restrict beyond
+  user policy** or enter `{}` to remove an inline policy; clearing the editor
+  while restriction is enabled prevents saving. Upgrade every site, then review
+  accounts that `svcacct info` reports with `Policy: implied` and re-apply
+  restrictions where needed.
 
 - S3 `DeleteObjects` on a single pool stops at an entry whose name fails the
   object name check: the entry returns `XMinioInvalidObjectName` and is not
@@ -300,7 +332,7 @@ Known issues: `ListMultipartUploads` prefix and paging
 ([#217](https://github.com/pgsty/silo/issues/217)), replayed bucket creation
 under site replication ([PR #241](https://github.com/pgsty/silo/pull/241)), and
 `403` instead of the server error for reads allowed only by object tags while
-the object is unreadable ([#293](https://github.com/pgsty/silo/issues/293)).
+the object is unreadable ([PR #294](https://github.com/pgsty/silo/pull/294)).
 
 ## RELEASE.2026-10-26T00-00-00Z
 

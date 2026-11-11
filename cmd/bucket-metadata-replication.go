@@ -182,8 +182,13 @@ func bucketConfigPayload(bucket, file string, data []byte, lockEnabled bool) ([]
 	key := data
 	switch file {
 	case bucketPolicyConfig:
+		// Replication uses explicit null as a tombstone; ordinary policy PUTs
+		// validate their JSON before entering this metadata path.
+		if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+			return nil, nil, nil
+		}
 		var cfg *policy.BucketPolicy
-		cfg, err = policy.ParseBucketPolicyConfig(bytes.NewReader(data), bucket)
+		cfg, err = parseBucketPolicyStrictBytes(data, bucket)
 		if err == nil {
 			if cfg.IsEmpty() {
 				return nil, nil, nil

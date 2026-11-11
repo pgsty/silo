@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
@@ -120,7 +119,7 @@ func (c stsClaims) populateSessionPolicy(form url.Values) error {
 		return nil
 	}
 
-	sessionPolicy, err := policy.ParseConfig(bytes.NewReader([]byte(sessionPolicyStr)))
+	sessionPolicy, err := parseSessionPolicyStrictBytes([]byte(sessionPolicyStr))
 	if err != nil {
 		return err
 	}

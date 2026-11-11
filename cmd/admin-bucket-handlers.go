@@ -817,17 +817,17 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 				bucketMap[bucket] = &v
 			}
 
-			if globalSiteReplicationSys.isEnabled() && v.Suspended() {
-				rpt.SetStatus(bucket, fileName, fmt.Errorf("Cluster replication is enabled for this site, so the versioning state cannot be suspended."))
+			if globalSiteReplicationSys.isEnabled() && (v.Suspended() || v.PrefixesExcluded()) {
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("Cluster replication is enabled for this site, so the versioning state cannot be suspended or exclude prefixes."))
 				continue
 			}
 
-			if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled && v.Suspended() {
-				rpt.SetStatus(bucket, fileName, fmt.Errorf("An Object Lock configuration is present on this bucket, so the versioning state cannot be suspended."))
+			if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled && (v.Suspended() || v.PrefixesExcluded()) {
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("An Object Lock configuration is present on this bucket, so the versioning state cannot be suspended or exclude prefixes."))
 				continue
 			}
-			if rcfg, _ := getReplicationConfig(ctx, bucket); rcfg != nil && v.Suspended() {
-				rpt.SetStatus(bucket, fileName, fmt.Errorf("A replication configuration is present on this bucket, so the versioning state cannot be suspended."))
+			if rcfg, _ := getReplicationConfig(ctx, bucket); rcfg != nil && (v.Suspended() || v.PrefixesExcluded()) {
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("A replication configuration is present on this bucket, so the versioning state cannot be suspended or exclude prefixes."))
 				continue
 			}
 
@@ -907,7 +907,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 				continue
 			}
 
-			bucketPolicy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyBytes), bucket)
+			bucketPolicy, err := parseBucketPolicyStrictBytes(bucketPolicyBytes, bucket)
 			if err != nil {
 				rpt.SetStatus(bucket, fileName, err)
 				continue

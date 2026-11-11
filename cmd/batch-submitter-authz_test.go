@@ -33,6 +33,9 @@ func newBatchAuthzFixture(t *testing.T) *batchAuthzFixture {
 	t.Helper()
 	ctx, sys := iamAdminFixture(t)
 	obj := newObjectLayerFn()
+	// Match storage-class parity to this fixture's single drive, even after
+	// an API test has loaded the configuration of a larger erasure set.
+	mustIAM(t, newTestConfig(globalMinioDefaultRegion, obj))
 	batchTestJobPool(ctx, t, obj)
 	f := &batchAuthzFixture{ctx: ctx, sys: sys, obj: obj, bucket: "batch-authz"}
 	mustIAM(t, obj.MakeBucket(ctx, f.bucket, MakeBucketOptions{VersioningEnabled: true}))

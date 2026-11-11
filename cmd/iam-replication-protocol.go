@@ -4,7 +4,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -302,7 +301,7 @@ func applyIAMReplicationItem(ctx context.Context, item iamReplicationItem) error
 		if len(item.Policy) == 0 {
 			return globalSiteReplicationSys.PeerAddPolicyHandler(ctx, item.Name, nil, item.UpdatedAt)
 		}
-		p, err := policy.ParseConfig(bytes.NewReader(item.Policy))
+		p, err := parsePolicySnapshotBytes(item.Policy)
 		if err != nil {
 			return err
 		}

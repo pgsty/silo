@@ -28,10 +28,26 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/auth"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/versioning"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
+
+// checkBucketDeleteMetadata loads bucket versioning and Object Lock configs
+// fail-closed so delete handlers never fall back to unversioned/unlocked
+// defaults when bucket metadata cannot be read.
+func checkBucketDeleteMetadata(bucketName string) (*versioning.Versioning, objectlock.Retention, error) {
+	vc, err := globalBucketVersioningSys.Get(bucketName)
+	if err != nil {
+		return nil, objectlock.Retention{}, err
+	}
+	rcfg, err := globalBucketObjectLockSys.Get(bucketName)
+	if err != nil {
+		return nil, objectlock.Retention{}, err
+	}
+	return vc, rcfg, nil
+}
 
 // BucketObjectLockSys - map of bucket and retention configuration.
 type BucketObjectLockSys struct{}

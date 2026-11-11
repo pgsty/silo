@@ -35,6 +35,349 @@ import (
 	"github.com/puzpuzpuz/xsync/v3"
 )
 
+func withScopedReqObject(ctx context.Context, bucket, object, versionID string, fn func() APIErrorCode) APIErrorCode {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	prevBucket, prevObject, prevVID := reqInfo.BucketName, reqInfo.ObjectName, reqInfo.VersionID
+	reqInfo.BucketName = bucket
+	reqInfo.ObjectName = object
+	reqInfo.VersionID = versionID
+	defer func() {
+		reqInfo.BucketName = prevBucket
+		reqInfo.ObjectName = prevObject
+		reqInfo.VersionID = prevVID
+	}()
+	return fn()
+}
+
+func objectVersionAction(base policy.Action, versionID string) (policy.Action, bool) {
+	if versionID == "" {
+		return base, false
+	}
+	switch base {
+	case policy.GetObjectAction:
+		return policy.GetObjectVersionAction, true
+	case policy.GetObjectTaggingAction:
+		return policy.GetObjectVersionTaggingAction, true
+	case policy.PutObjectTaggingAction:
+		return policy.PutObjectVersionTaggingAction, true
+	case policy.DeleteObjectTaggingAction:
+		return policy.DeleteObjectVersionTaggingAction, true
+	default:
+		return base, false
+	}
+}
+
+func (sys *IAMSys) policySetsForExplicitDeny(cred auth.Credentials) [][]policy.Policy {
+	derived := cred.IsTemp() || cred.IsServiceAccount()
+	name := cred.AccessKey
+	if derived {
+		name = cred.ParentUser
+	}
+	cache := sys.store.rlock()
+	var names []string
+	roleARN := (policy.Args{Claims: cred.Claims}).GetRoleArn()
+	switch {
+	case name == globalActiveCred.AccessKey:
+	case derived && roleARN != "":
+		parsed, err := arn.Parse(roleARN)
+		if err != nil {
+			sys.store.runlock()
+			return nil
+		}
+		names = newMappedPolicy(sys.rolesMap[parsed]).toSlice()
+	default:
+		var err error
+		names, _, err = cache.policyDBGet(sys.store, name, false, false)
+		if err != nil && err != errNoSuchPolicy {
+			sys.store.runlock()
+			return nil
+		}
+		groups, gerr := cache.policyDBGetGroups(sys.store, len(names) > 0, cred.Groups...)
+		if gerr != nil && gerr != errNoSuchPolicy {
+			sys.store.runlock()
+			return nil
+		}
+		names = append(names, groups...)
+		if derived && len(names) == 0 {
+			claims, _ := policy.GetPoliciesFromClaims(cred.Claims, iamPolicyClaimNameOpenID())
+			names = claims.ToSlice()
+		}
+	}
+	sys.store.runlock()
+
+	sets := [][]policy.Policy{nil}
+	slices.Sort(names)
+	compactNames := slices.Compact(names)
+	if len(compactNames) > 0 {
+		if avail, merged, err := sys.store.MergePolicies(strings.Join(compactNames, ",")); err == nil && avail != "" {
+			sets[0] = append(sets[0], merged)
+		}
+	}
+	if derived && (cred.IsTemp() || cred.Claims[iamPolicyClaimNameSA()] != inheritedPolicyType) {
+		if sp, ok := cred.Claims[sessionPolicyNameExtracted].(string); ok {
+			if p, err := policy.ParseConfig(strings.NewReader(sp)); err == nil {
+				sets = append(sets, []policy.Policy{*p})
+			}
+		}
+	}
+	return sets
+}
+
+func isActionExplicitlyDenied(ctx context.Context, r *http.Request, action policy.Action, existingTags string, requestTags *string) bool {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return true
+	}
+	if reqInfo.Owner {
+		return false
+	}
+	cred := reqInfo.Cred
+	bucket := reqInfo.BucketName
+	object := reqInfo.ObjectName
+	versionID := reqInfo.VersionID
+	buildValues := func(loc string, c auth.Credentials) map[string][]string {
+		values := getConditionValuesWithTags(r, loc, c, existingTags, requestTags)
+		if actionUsesObjectVersion(action) {
+			if versionID == "" {
+				delete(values, "versionid")
+			} else {
+				values["versionid"] = []string{versionID}
+			}
+		}
+		return values
+	}
+
+	if cred.AccessKey == "" {
+		p, err := globalPolicySys.Get(bucket)
+		if err != nil {
+			return false
+		}
+		bArgs := policy.BucketPolicyArgs{
+			Action:          action,
+			BucketName:      bucket,
+			ObjectName:      object,
+			ConditionValues: buildValues(reqInfo.Region, auth.AnonymousCredentials),
+			IsOwner:         false,
+		}
+		for _, st := range p.Statements {
+			if st.Effect != policy.Deny {
+				continue
+			}
+			probe := st
+			probe.Effect = policy.Allow
+			if probe.IsAllowed(bArgs) {
+				return true
+			}
+		}
+		return false
+	}
+
+	values := buildValues("", cred)
+	if newGlobalAuthZPluginFn() != nil {
+		return !globalIAMSys.IsAllowed(policy.Args{
+			AccountName:     cred.AccessKey,
+			Groups:          cred.Groups,
+			Action:          action,
+			BucketName:      bucket,
+			ObjectName:      object,
+			ConditionValues: values,
+			IsOwner:         false,
+			Claims:          cred.Claims,
+			DenyOnly:        true,
+		})
+	}
+	if !globalIAMSys.Initialized() {
+		return false
+	}
+	args := policy.Args{
+		AccountName:     cred.AccessKey,
+		Groups:          cred.Groups,
+		Action:          action,
+		BucketName:      bucket,
+		ObjectName:      object,
+		ConditionValues: values,
+		IsOwner:         false,
+		Claims:          cred.Claims,
+		DenyOnly:        true,
+	}
+	for _, policies := range globalIAMSys.policySetsForExplicitDeny(cred) {
+		if len(policies) == 0 {
+			continue
+		}
+		merged := policy.MergePolicies(policies...)
+		if !merged.IsAllowed(args) {
+			return true
+		}
+	}
+	return false
+}
+
+func authorizeVersionedRequestWithTags(ctx context.Context, r *http.Request, baseAction policy.Action, versionID, existingTags string, requestTags *string) APIErrorCode {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	prevVID := reqInfo.VersionID
+	reqInfo.VersionID = versionID
+	defer func() { reqInfo.VersionID = prevVID }()
+
+	if verAction, ok := objectVersionAction(baseAction, versionID); ok {
+		if authorizeRequestWithTags(ctx, r, verAction, existingTags, requestTags) == ErrNone {
+			return ErrNone
+		}
+		if isActionExplicitlyDenied(ctx, r, verAction, existingTags, requestTags) {
+			return ErrAccessDenied
+		}
+	}
+	return authorizeRequestWithTags(ctx, r, baseAction, existingTags, requestTags)
+}
+
+func authorizeVersionedRequestWithExistingTags(ctx context.Context, r *http.Request, baseAction policy.Action, versionID, existingTags string) APIErrorCode {
+	return authorizeVersionedRequestWithTags(ctx, r, baseAction, versionID, existingTags, nil)
+}
+
+func authorizeVersionedRequestWithUnreadTags(ctx context.Context, r *http.Request, baseAction policy.Action, versionID string, readErr error) APIErrorCode {
+	s3Err := authorizeVersionedRequestWithExistingTags(ctx, r, baseAction, versionID, "")
+	if s3Err == ErrNone || toAPIError(ctx, readErr).HTTPStatusCode < http.StatusInternalServerError {
+		return s3Err
+	}
+	return authorizeVersionedRequestWithTagCandidates(ctx, r, baseAction, versionID, s3Err)
+}
+
+func authorizeVersionedRequestWithPotentialTags(ctx context.Context, r *http.Request, baseAction policy.Action, versionID string) APIErrorCode {
+	s3Err := authorizeVersionedRequestWithExistingTags(ctx, r, baseAction, versionID, "")
+	if s3Err == ErrNone {
+		return ErrNone
+	}
+	return authorizeVersionedRequestWithTagCandidates(ctx, r, baseAction, versionID, s3Err)
+}
+
+func authorizeVersionedRequestWithTagCandidates(ctx context.Context, r *http.Request, baseAction policy.Action, versionID string, s3Err APIErrorCode) APIErrorCode {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	prevVID := reqInfo.VersionID
+	reqInfo.VersionID = versionID
+	defer func() { reqInfo.VersionID = prevVID }()
+
+	candidates := policyExistingObjectTags(ctx, r, baseAction)
+	if verAction, ok := objectVersionAction(baseAction, versionID); ok {
+		candidates = append(candidates, policyExistingObjectTags(ctx, r, verAction)...)
+	}
+	for _, existingTags := range slices.Compact(candidates) {
+		if authorizeVersionedRequestWithExistingTags(ctx, r, baseAction, versionID, existingTags) == ErrNone {
+			return ErrNone
+		}
+	}
+	return s3Err
+}
+
+// canPotentiallyAllowAction reports whether the authenticated caller has any
+// grant capable of allowing action on bucket/object once condition values
+// (such as copied source tags on CopyObject) are resolved.
+func canPotentiallyAllowAction(ctx context.Context, r *http.Request, action policy.Action, bucket, object string) bool {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return false
+	}
+	emptyTags := ""
+	if withScopedReqObject(ctx, bucket, object, "", func() APIErrorCode {
+		return authorizeRequestWithTags(ctx, r, action, "", &emptyTags)
+	}) == ErrNone {
+		return true
+	}
+	if reqInfo.Owner {
+		return true
+	}
+	cred := reqInfo.Cred
+	if cred.AccessKey == "" {
+		p, err := globalPolicySys.Get(bucket)
+		if err != nil {
+			return false
+		}
+		values := getConditionValues(r, reqInfo.Region, auth.AnonymousCredentials)
+		for _, st := range p.Statements {
+			if st.Effect != policy.Allow {
+				continue
+			}
+			probe := st
+			probe.Conditions = nil
+			if probe.IsAllowed(policy.BucketPolicyArgs{Action: action, BucketName: bucket, ObjectName: object, ConditionValues: values}) {
+				return true
+			}
+		}
+		return false
+	}
+	if newGlobalAuthZPluginFn() != nil || !globalIAMSys.Initialized() {
+		return true
+	}
+	values := getConditionValues(r, "", cred)
+	for _, policies := range globalIAMSys.policySetsForExplicitDeny(cred) {
+		setAllows := false
+		for _, p := range policies {
+			for _, st := range p.Statements {
+				if st.Effect != policy.Allow {
+					continue
+				}
+				probe := st
+				probe.Conditions = nil
+				if probe.IsAllowed(policy.Args{
+					AccountName:     cred.AccessKey,
+					Groups:          cred.Groups,
+					Action:          action,
+					BucketName:      bucket,
+					ObjectName:      object,
+					ConditionValues: values,
+					Claims:          cred.Claims,
+				}) {
+					setAllows = true
+					break
+				}
+			}
+			if setAllows {
+				break
+			}
+		}
+		if len(policies) > 0 && !setAllows {
+			return false
+		}
+		if len(policies) == 0 && cred.ParentUser != globalActiveCred.AccessKey && cred.AccessKey != globalActiveCred.AccessKey {
+			return false
+		}
+	}
+	return true
+}
+
+func canReturnObjectTagsHeader(ctx context.Context, r *http.Request, versionID, existingTags string) bool {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return false
+	}
+	prevVID := reqInfo.VersionID
+	reqInfo.VersionID = versionID
+	defer func() { reqInfo.VersionID = prevVID }()
+
+	if isActionExplicitlyDenied(ctx, r, policy.GetObjectTaggingAction, existingTags, nil) {
+		return false
+	}
+	if verAction, ok := objectVersionAction(policy.GetObjectTaggingAction, versionID); ok {
+		if isActionExplicitlyDenied(ctx, r, verAction, existingTags, nil) {
+			return false
+		}
+	}
+	if authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectTaggingAction, versionID, existingTags) == ErrNone {
+		return true
+	}
+	return reqInfo.Cred.AccessKey != "" &&
+		isRequestSignatureV4(r) &&
+		!isRequestPresignedSignatureV4(r) &&
+		authorizeRequestWithExistingTags(ctx, r, policy.ReplicateTagsAction, existingTags) == ErrNone
+}
+
 // authorizeRequestWithUnreadTags decides whether to disclose readErr for an
 // object whose stored tags could not be read. It must not grant object access.
 //
@@ -49,20 +392,6 @@ func authorizeRequestWithUnreadTags(ctx context.Context, r *http.Request, action
 	s3Err := authorizeRequest(ctx, r, action)
 	if s3Err == ErrNone || toAPIError(ctx, readErr).HTTPStatusCode < http.StatusInternalServerError {
 		return s3Err
-	}
-	return authorizeRequestWithTagCandidates(ctx, r, action, s3Err)
-}
-
-// authorizeRequestWithPotentialTags performs the authorization needed before
-// a remote replica can be read. An empty tag set is enough to reject a caller
-// with no possible access, but a caller whose Allow depends on existing tags
-// must be admitted so the remote copy can supply the authoritative tags.
-// The returned decision is only a gate; the actual tags must be authorized
-// again after they are read.
-func authorizeRequestWithPotentialTags(ctx context.Context, r *http.Request, action policy.Action) APIErrorCode {
-	s3Err := authorizeRequest(ctx, r, action)
-	if s3Err == ErrNone {
-		return ErrNone
 	}
 	return authorizeRequestWithTagCandidates(ctx, r, action, s3Err)
 }

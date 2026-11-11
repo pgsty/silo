@@ -35,7 +35,8 @@ jobs:
       - name: Check gofmt
         run: |
           mapfile -t unformatted < <(gofmt -l main.go cmd internal \
-            buildscripts/rebrand-guard buildscripts/helm-migration-guard)
+            buildscripts/rebrand-guard buildscripts/helm-migration-guard \
+            buildscripts/release-dependency-guard)
           if [ "${#unformatted[@]}" -ne 0 ]; then
             echo "The following files are not gofmt-formatted:"
             printf '%s\n' "${unformatted[@]}"

@@ -963,10 +963,13 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	// to the disks; this value is not accurate because we do
 	// not know the storage class of the object yet
 	minDisks := 0
-	if p := globalStorageClass.GetParityForSC(""); p > -1 {
+	if p := globalStorageClass.GetParityForSC(""); p > -1 && p < er.setDriveCount {
 		minDisks = er.setDriveCount - p
 	} else {
 		minDisks = er.setDriveCount - er.defaultParityCount
+	}
+	if minDisks < 1 {
+		minDisks = 1
 	}
 
 	if minDisks == er.setDriveCount/2 {
@@ -2217,7 +2220,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 			// A restored-copy expiry needs fresh metadata to confirm its target
 			// and deadline, a checked expiry to guard its protection; ordinary
 			// unversioned DELETE may still try a blind delete.
-			if opts.Transition.ExpireRestored || checkedExpiry || opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
+			if opts.Transition.ExpireRestored || checkedExpiry || opts.Versioned || opts.VersionSuspended || opts.RefuseLockedOverwrite || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
 				// Add an MRF heal for next time.
 				er.addPartial(bucket, object, opts.VersionID)
 				return objInfo, InsufficientWriteQuorum{}
@@ -2268,8 +2271,28 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	// When versioning is disabled or suspended for this key, an unaddressed
+	// delete overwrites or removes the null version even if a newer non-null
+	// version is returned as latest by getObjectInfoAndQuorum above.
+	retOI, retErr := goi, gerr
+	if !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" && (opts.EvalRetentionBypassFn != nil || opts.RefuseLockedOverwrite) {
+		if gerr == nil && goi.VersionID != "" && goi.VersionID != nullVersionID {
+			nullOpts := opts
+			nullOpts.VersionID = nullVersionID
+			retOI, _, retErr = er.getObjectInfoAndQuorum(ctx, bucket, object, nullOpts)
+			if _, ok := retErr.(InsufficientReadQuorum); ok && opts.RefuseLockedOverwrite {
+				er.addPartial(bucket, object, nullVersionID)
+				return objInfo, InsufficientWriteQuorum{}
+			}
+		}
+	}
+
 	if opts.EvalRetentionBypassFn != nil {
-		if err := opts.EvalRetentionBypassFn(goi, gerr); err != nil {
+		if err := opts.EvalRetentionBypassFn(retOI, retErr); err != nil {
+			return ObjectInfo{}, err
+		}
+	} else if opts.RefuseLockedOverwrite && !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+		if err := refuseLockedMarkerOverwrite(ctx, bucket, object, nullVersionID, retOI, retErr); err != nil {
 			return ObjectInfo{}, err
 		}
 	}

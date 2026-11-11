@@ -14,7 +14,7 @@ RUN mkdir -p /prep/data && chmod 0777 /prep/data
 # Debian's bundle in distroless still trusts the roots the classic image
 # blocklists. Build the same bundle as Dockerfile.goreleaser so both variants
 # trust the same roots; it is architecture-neutral, so build it natively.
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/ubi:latest@sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3 AS certs
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/ubi:latest@sha256:8b212f75a0e5a156ac28b1c5c030d2e8a07715254e19d522286118279399af81 AS certs
 # Native root blocklist mitigation: https://access.redhat.com/security/vulnerabilities/RHSB-2026-012
 RUN dnf -y install ca-certificates && \
     if [ -d /etc/pki/ca-trust/source/blocklist ]; then \

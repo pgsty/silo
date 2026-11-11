@@ -189,6 +189,16 @@ func doesPolicySignatureV4Match(formValues http.Header) (auth.Credentials, APIEr
 		return cred, s3Err
 	}
 
+	if dateStr := formValues.Get(xhttp.AmzDate); dateStr != "" {
+		t, err := time.Parse(iso8601Format, dateStr)
+		if err != nil {
+			return cred, ErrMalformedDate
+		}
+		if credHeader.scope.date.Format(yyyymmdd) != t.UTC().Format(yyyymmdd) {
+			return cred, ErrSignatureDoesNotMatch
+		}
+	}
+
 	// Get signing key.
 	signingKey := getSigningKey(cred.SecretKey, credHeader.scope.date, credHeader.scope.region, serviceS3)
 
@@ -248,6 +258,9 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 
 	// Save the date and expires.
 	t := pSignValues.Date
+	if pSignValues.Credential.scope.date.Format(yyyymmdd) != t.UTC().Format(yyyymmdd) {
+		return ErrSignatureDoesNotMatch
+	}
 	expireSeconds := int(pSignValues.Expires / time.Second)
 
 	// Construct new query.
@@ -387,6 +400,9 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string, st
 	t, e := time.Parse(iso8601Format, date)
 	if e != nil {
 		return ErrMalformedDate
+	}
+	if signV4Values.Credential.scope.date.Format(yyyymmdd) != t.UTC().Format(yyyymmdd) {
+		return ErrSignatureDoesNotMatch
 	}
 
 	// Query string.

@@ -102,7 +102,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
-		if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.GetObjectAction, oi.UserTags); s3Error != ErrNone {
+		if s3Error := authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, opts.VersionID, oi.UserTags); s3Error != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 			return true
 		}
@@ -116,7 +116,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
 	if err != nil {
-		err = archiveReadError(ctx, r, bucket, zipPath, err)
+		err = archiveReadError(ctx, r, bucket, zipPath, opts.VersionID, err)
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -181,6 +181,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	defer rc.Close()
 
+	opts.Tagging = false
 	if err = setObjectHeaders(ctx, w, fileObjInfo, nil, opts); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -224,7 +225,7 @@ func listObjectsV2InArchive(ctx context.Context, objectAPI ObjectLayer, bucket, 
 	opts := ObjectOptions{}
 	zipObjInfo, err := objectAPI.GetObjectInfo(ctx, bucket, zipPath, opts)
 	if err != nil {
-		if s3Error := authorizeRequestWithUnreadTags(ctx, r, policy.GetObjectAction, err); s3Error != ErrNone {
+		if s3Error := authorizeVersionedRequestWithUnreadTags(ctx, r, policy.GetObjectAction, "", err); s3Error != ErrNone {
 			return ListObjectsV2Info{}, PrefixAccessDenied{Bucket: bucket, Object: zipPath}
 		}
 		if isErrObjectNotFound(err) {
@@ -232,12 +233,12 @@ func listObjectsV2InArchive(ctx context.Context, objectAPI ObjectLayer, bucket, 
 		}
 		return ListObjectsV2Info{}, err
 	}
-	if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.GetObjectAction, zipObjInfo.UserTags); s3Error != ErrNone {
+	if s3Error := authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, "", zipObjInfo.UserTags); s3Error != ErrNone {
 		return ListObjectsV2Info{}, PrefixAccessDenied{Bucket: bucket, Object: zipPath}
 	}
 	var denied bool
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
-		denied = authorizeRequestWithExistingTags(ctx, r, policy.GetObjectAction, oi.UserTags) != ErrNone
+		denied = authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, "", oi.UserTags) != ErrNone
 		return denied
 	}
 	zipInfo := zipObjInfo.ArchiveInfo(r.Header)
@@ -387,7 +388,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
-		if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.GetObjectAction, oi.UserTags); s3Error != ErrNone {
+		if s3Error := authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, opts.VersionID, oi.UserTags); s3Error != ErrNone {
 			writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
 			return true
 		}
@@ -407,7 +408,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
 	if err != nil {
-		err = archiveReadError(ctx, r, bucket, zipPath, err)
+		err = archiveReadError(ctx, r, bucket, zipPath, opts.VersionID, err)
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		return
 	}
@@ -444,6 +445,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 		ModTime: zipObjInfo.ModTime,
 	}
 
+	opts.Tagging = false
 	// Set standard object headers.
 	if err = setObjectHeaders(ctx, w, objInfo, nil, opts); err != nil {
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
@@ -462,12 +464,12 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 // archiveReadError preserves the anonymous ListBucket missing-object response.
 // All other failures are disclosed only to callers authorized to read the ZIP.
-func archiveReadError(ctx context.Context, r *http.Request, bucket, object string, err error) error {
+func archiveReadError(ctx context.Context, r *http.Request, bucket, object, versionID string, err error) error {
 	if getRequestAuthType(r) == authTypeAnonymous && isErrObjectNotFound(err) &&
 		authorizeBucketRequest(ctx, r, policy.ListBucketAction) == ErrNone {
 		return err
 	}
-	if authorizeRequestWithUnreadTags(ctx, r, policy.GetObjectAction, err) != ErrNone {
+	if authorizeVersionedRequestWithUnreadTags(ctx, r, policy.GetObjectAction, versionID, err) != ErrNone {
 		return PrefixAccessDenied{Bucket: bucket, Object: object}
 	}
 	return err

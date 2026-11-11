@@ -427,7 +427,9 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		}
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, srcBucket, srcObject); s3Error != ErrNone {
+	if s3Error := withScopedReqObject(ctx, srcBucket, srcObject, vid, func() APIErrorCode {
+		return authorizeVersionedRequestWithPotentialTags(ctx, r, policy.GetObjectAction, vid)
+	}); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -491,7 +493,15 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		}
 	}
 
+	var storedSrcTags *string
 	checkCopyPartPrecondFn := func(o ObjectInfo) bool {
+		storedSrcTags = &o.UserTags
+		if s3Error := withScopedReqObject(ctx, srcBucket, srcObject, vid, func() APIErrorCode {
+			return authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, vid, o.UserTags)
+		}); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return true
+		}
 		if _, err := DecryptObjectInfo(&o, r); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return true
@@ -513,6 +523,20 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		if isErrPreconditionFailed(err) {
 			return
 		}
+		var s3Error APIErrorCode
+		if storedSrcTags != nil {
+			s3Error = withScopedReqObject(ctx, srcBucket, srcObject, vid, func() APIErrorCode {
+				return authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, vid, *storedSrcTags)
+			})
+		} else {
+			s3Error = withScopedReqObject(ctx, srcBucket, srcObject, vid, func() APIErrorCode {
+				return authorizeVersionedRequestWithUnreadTags(ctx, r, policy.GetObjectAction, vid, err)
+			})
+		}
+		if s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return
+		}
 		if globalBucketVersioningSys.PrefixEnabled(srcBucket, srcObject) && gr != nil {
 			// Versioning enabled quite possibly object is deleted might be delete-marker
 			// if present set the headers, no idea why AWS S3 sets these headers.
@@ -521,11 +545,22 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 				w.Header()[xhttp.AmzDeleteMarker] = []string{strconv.FormatBool(gr.ObjInfo.DeleteMarker)}
 			}
 		}
+		reqInfo := logger.GetReqInfo(ctx)
+		reqInfo.BucketName = srcBucket
+		reqInfo.ObjectName = srcObject
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 	defer gr.Close()
 	srcInfo := gr.ObjInfo
+	if storedSrcTags == nil {
+		if s3Error := withScopedReqObject(ctx, srcBucket, srcObject, vid, func() APIErrorCode {
+			return authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, vid, srcInfo.UserTags)
+		}); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return
+		}
+	}
 
 	actualPartSize, err := srcInfo.GetActualSize()
 	if err != nil {
@@ -788,10 +823,14 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
 			}
+			if size < 0 {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidArgument), r.URL)
+				return
+			}
 		}
 	}
 
-	if size == -1 {
+	if size < 0 {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentLength), r.URL)
 		return
 	}

@@ -1411,9 +1411,12 @@ func (c *SiteReplicationSys) PeerSvcAccChangeHandler(ctx context.Context, change
 		var sp *policy.Policy
 		var err error
 		if len(change.Create.SessionPolicy) > 0 {
-			sp, err = policy.ParseConfig(bytes.NewReader(change.Create.SessionPolicy))
-			if err != nil {
-				return iamReplicationError(err)
+			trimmedSP := bytes.TrimSpace(change.Create.SessionPolicy)
+			if len(trimmedSP) > 0 && !bytes.Equal(trimmedSP, []byte("null")) {
+				sp, err = parsePolicySnapshotBytes(trimmedSP)
+				if err != nil {
+					return iamReplicationError(err)
+				}
 			}
 		}
 		// skip overwrite of local update if peer sent stale info
@@ -1423,14 +1426,15 @@ func (c *SiteReplicationSys) PeerSvcAccChangeHandler(ctx context.Context, change
 			}
 		}
 		opts := newServiceAccountOpts{
-			accessKey:     change.Create.AccessKey,
-			secretKey:     change.Create.SecretKey,
-			status:        change.Create.Status,
-			sessionPolicy: sp,
-			claims:        change.Create.Claims,
-			name:          change.Create.Name,
-			description:   change.Create.Description,
-			expiration:    change.Create.Expiration,
+			accessKey:                   change.Create.AccessKey,
+			secretKey:                   change.Create.SecretKey,
+			status:                      change.Create.Status,
+			sessionPolicy:               sp,
+			claims:                      change.Create.Claims,
+			name:                        change.Create.Name,
+			description:                 change.Create.Description,
+			expiration:                  change.Create.Expiration,
+			preserveEmptyEmbeddedPolicy: svcAcctClaimsHaveEmbeddedPolicy(change.Create.Claims),
 		}
 		_, _, err = globalIAMSys.NewServiceAccount(ctx, change.Create.Parent, change.Create.Groups, opts)
 		if err != nil {
@@ -1441,9 +1445,12 @@ func (c *SiteReplicationSys) PeerSvcAccChangeHandler(ctx context.Context, change
 		var sp *policy.Policy
 		var err error
 		if len(change.Update.SessionPolicy) > 0 {
-			sp, err = policy.ParseConfig(bytes.NewReader(change.Update.SessionPolicy))
-			if err != nil {
-				return iamReplicationError(err)
+			trimmedSP := bytes.TrimSpace(change.Update.SessionPolicy)
+			if len(trimmedSP) > 0 && !bytes.Equal(trimmedSP, []byte("null")) {
+				sp, err = parsePolicySnapshotBytes(trimmedSP)
+				if err != nil {
+					return iamReplicationError(err)
+				}
 			}
 		}
 		// skip overwrite of local update if peer sent stale info

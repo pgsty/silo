@@ -438,7 +438,12 @@ func deleteObjectAction(versionID string) policy.Action {
 func actionUsesObjectVersion(action policy.Action) bool {
 	switch action {
 	case policy.DeleteObjectAction, policy.DeleteObjectVersionAction,
-		policy.ReplicateDeleteAction, policy.BypassGovernanceRetentionAction:
+		policy.ReplicateDeleteAction, policy.BypassGovernanceRetentionAction,
+		policy.GetObjectAction, policy.GetObjectVersionAction,
+		policy.GetObjectAttributesAction, policy.GetObjectVersionAttributesAction,
+		policy.GetObjectTaggingAction, policy.GetObjectVersionTaggingAction,
+		policy.PutObjectTaggingAction, policy.PutObjectVersionTaggingAction,
+		policy.DeleteObjectTaggingAction, policy.DeleteObjectVersionTaggingAction:
 		return true
 	default:
 		return false

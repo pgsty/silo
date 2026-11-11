@@ -844,7 +844,7 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 	// Check if this request is only metadata update.
 	// CopyObjectHandler predicts the outcome of this decision in
 	// copyRewritesObjectData(); keep the two in sync.
-	if cpSrcDstSame && srcInfo.metadataOnly {
+	if cpSrcDstSame && srcInfo.metadataOnly && !srcInfo.Legacy {
 		// Version ID is set for the destination and source == destination version ID.
 		// perform an in-place update.
 		if dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID {
@@ -868,6 +868,10 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 		}
 	}
 
+	if srcInfo.PutObjReader == nil {
+		return ObjectInfo{}, errInvalidArgument
+	}
+
 	putOpts := ObjectOptions{
 		ServerSideEncryption:       dstOpts.ServerSideEncryption,
 		UserDefined:                srcInfo.UserDefined,
@@ -879,10 +883,12 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 		EncryptFn:                  dstOpts.EncryptFn,
 		WantChecksum:               dstOpts.WantChecksum,
 		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
+		PreserveETag:               dstOpts.PreserveETag,
 		ReplicationRequest:         dstOpts.ReplicationRequest,
 		ReplicaLockReconcile:       dstOpts.ReplicaLockReconcile,
 		DataMovement:               dstOpts.DataMovement,
 		replicaObjectInfo:          dstOpts.replicaObjectInfo,
+		replicaContentGuard:        dstOpts.replicaContentGuard,
 	}
 
 	return dstSet.putObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)

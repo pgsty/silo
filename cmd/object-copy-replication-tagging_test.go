@@ -35,22 +35,15 @@ import (
 // the single-disk and 16-disk fixtures are single-pool backends.
 func TestAPICopyObjectReplicaTaggingTimestampUnderKMS(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testAPICopyObjectReplicaTaggingTimestampUnderKMS})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t: t, objAPITest: testAPICopyObjectReplicaTaggingTimestampUnderKMS,
+		// Ignore host free-space percentage while retaining real disk I/O.
+		// Install once before IAM starts and keep the disks until shutdown.
+		wrapDisk: func(disk StorageAPI) StorageAPI { return tagTestCapacityDisk{StorageAPI: disk} },
+	})
 }
 
 func testAPICopyObjectReplicaTaggingTimestampUnderKMS(obj ObjectLayer, instance, bucket string, router http.Handler, creds auth.Credentials, t *testing.T) {
-	// Ignore the host free-space percentage while retaining real disk I/O.
-	for _, pool := range obj.(*erasureServerPools).serverPools {
-		for _, set := range pool.sets {
-			original := set.getDisks
-			disks := append([]StorageAPI(nil), original()...)
-			for i := range disks {
-				disks[i] = tagTestCapacityDisk{StorageAPI: disks[i]}
-			}
-			set.getDisks = func() []StorageAPI { return disks }
-			defer func() { set.getDisks = original }()
-		}
-	}
 	oldKMS, oldAuto := GlobalKMS, globalAutoEncryption
 	GlobalKMS = kms.NewStub("replica-tags-key")
 	globalAutoEncryption = false
