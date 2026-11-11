@@ -54,7 +54,7 @@ func TestGetObjectAttributesReadQuorumLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	const object, missing = "object", "missing"
-	if _, err := z.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("data")), 4, "", ""), ObjectOptions{}); err != nil {
+	if _, err := z.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("data")), 4, "", ""), ObjectOptions{UserDefined: map[string]string{xhttp.AmzObjectTagging: "tier=restricted"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -62,6 +62,9 @@ func TestGetObjectAttributesReadQuorumLost(t *testing.T) {
 	withoutList := newDeleteAuthzPolicyUser(t, "", bucket, "["+read+"]")
 	withList := newDeleteAuthzPolicyUser(t, "", bucket, "["+read+
 		`, {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::`+bucket+`"]}]`)
+
+	tagged := newDeleteAuthzPolicyUser(t, "", bucket, `[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":["arn:aws:s3:::`+bucket+`/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/tier":"restricted"}}}]`)
+	unauthorized := newDeleteAuthzPolicyUser(t, "", bucket, `[{"Effect":"Allow","Action":["s3:GetObjectAttributes"],"Resource":["arn:aws:s3:::`+bucket+`/*"]}]`)
 
 	check := func(stage, user string, creds auth.Credentials, key string, want int) {
 		t.Helper()
@@ -85,7 +88,13 @@ func TestGetObjectAttributesReadQuorumLost(t *testing.T) {
 	check("healthy", "withoutList", withoutList, missing, http.StatusForbidden)
 	check("healthy", "withList", withList, missing, http.StatusNotFound)
 
+	check("healthy", "tagged", tagged, object, http.StatusOK)
+	check("healthy", "unauthorized", unauthorized, object, http.StatusForbidden)
+
 	defer objectReadFault(z, bucket, object, 10)()
 	check("read quorum lost", "withoutList", withoutList, object, http.StatusServiceUnavailable)
 	check("read quorum lost", "withList", withList, object, http.StatusServiceUnavailable)
+	check("read quorum lost", "tagged", tagged, object, http.StatusServiceUnavailable)
+	check("read quorum lost", "unauthorized", unauthorized, object, http.StatusForbidden)
+
 }

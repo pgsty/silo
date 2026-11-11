@@ -605,20 +605,13 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 		return
 	}
 
-	var s3Error APIErrorCode
+	actions := [2]policy.Action{policy.GetObjectAttributesAction, policy.GetObjectAction}
 	if opts.VersionID != "" {
-		s3Error = checkRequestAuthType(ctx, r, policy.GetObjectVersionAttributesAction, bucket, object)
-		if s3Error == ErrNone {
-			s3Error = checkRequestAuthType(ctx, r, policy.GetObjectVersionAction, bucket, object)
-		}
-	} else {
-		s3Error = checkRequestAuthType(ctx, r, policy.GetObjectAttributesAction, bucket, object)
-		if s3Error == ErrNone {
-			s3Error = checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, object)
-		}
+		actions = [2]policy.Action{policy.GetObjectVersionAttributesAction, policy.GetObjectVersionAction}
 	}
-
-	if s3Error != ErrNone {
+	logger.GetReqInfo(ctx).BucketName = bucket
+	logger.GetReqInfo(ctx).ObjectName = object
+	if s3Error := authenticateRequest(ctx, r, actions[0]); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -630,6 +623,20 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	}
 
 	objInfo, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
+	// Both actions must be authorized with the stored tags. Authorizing first
+	// with empty tags would reject conditional Allows and miss conditional Denies.
+	for _, action := range actions {
+		var s3Error APIErrorCode
+		if err != nil {
+			s3Error = authorizeRequestWithUnreadTags(ctx, r, action, err)
+		} else {
+			s3Error = authorizeRequestWithExistingTags(ctx, r, action, objInfo.UserTags)
+		}
+		if s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return
+		}
+	}
 	if err != nil {
 		// As with S3, a caller without s3:ListBucket on the bucket gets
 		// AccessDenied in place of NoSuchKey. A server error, such as lost
