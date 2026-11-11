@@ -320,11 +320,8 @@ func (er erasureObjects) stageRestore(ctx context.Context, bucket, object string
 
 // fileInfoRevisions are the revisions the entry that writing fi creates can
 // have, as readRestoreGeneration and the convergence identify the entries
-// they read. The header flag that tells whether a transitioned version uses
-// its data directory follows whether its restored copy has expired at the
-// moment a drive writes the entry, so a restore whose copy expires while it
-// publishes can find either value: both are this entry. Every other field of
-// the header and the full metadata digest still have to match.
+// they read. versionRevision normalizes the time-derived UsesDataDir flag;
+// the stored data directory and restore metadata still have to match.
 func fileInfoRevisions(fi FileInfo) ([]revisionKey, error) {
 	var x xlMetaV2
 	if err := x.AddVersion(fi); err != nil {
@@ -342,9 +339,7 @@ func fileInfoRevisions(fi FileInfo) ([]revisionKey, error) {
 		return nil, errFileCorrupt
 	}
 	ver := y.versions[0]
-	other := ver
-	other.header.Flags ^= xlFlagUsesDataDir
-	return []revisionKey{versionRevision(ver, y.metaV), versionRevision(other, y.metaV)}, nil
+	return []revisionKey{versionRevision(ver, y.metaV)}, nil
 }
 
 // restorePublication remembers, for a commit that published the staged copy

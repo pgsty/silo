@@ -696,8 +696,10 @@ func TestPoolsLifecycleHeaderEras(t *testing.T) {
 			if versionRevision(old(0), xlMetaVersion) != versionRevision(current(7), xlMetaVersion) {
 				t.Error("one version under the headers of two releases has two keys")
 			}
-			// The header of the key orders the merge: it is the current one.
-			if versionRevision(old(0), xlMetaVersion).header != current(0).header {
+			// The normalized current header orders the merge.
+			wantHeader := current(0).header
+			wantHeader.Flags &^= xlFlagUsesDataDir
+			if versionRevision(old(0), xlMetaVersion).header != wantHeader {
 				t.Error("the key does not carry the header of the current release")
 			}
 			for healed := range 17 {
@@ -753,8 +755,10 @@ func TestPoolsLifecycleHealedOldHeaders(t *testing.T) {
 				rewriteTierTestMeta(t, disk, s.bucket, key, func(xl *xlMetaV2) {
 					for i := range xl.versions {
 						// Control: the key of a version this release wrote
-						// carries its header as stored.
-						if versionRevision(xl.versions[i], xl.metaV).header != xl.versions[i].header {
+						// carries its header with only the time-derived flag removed.
+						wantHeader := xl.versions[i].header
+						wantHeader.Flags &^= xlFlagUsesDataDir
+						if versionRevision(xl.versions[i], xl.metaV).header != wantHeader {
 							t.Fatal("the key of a current version carries another header")
 						}
 						xl.versions[i].header.EcN, xl.versions[i].header.EcM = 0, 0

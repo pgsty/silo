@@ -195,8 +195,9 @@ type revisionKey struct {
 // empty part ETags until RELEASE.2022-01-25. Reads and heal take such drives
 // for one version (matchesNotStrict), and nothing rewrites them. The key has
 // both as the current release computes them from the metadata, so that the
-// header of a version it wrote stays as stored: the signature also orders
-// versions of one time in the merge. The signature of a legacy version is
+// header of a version it wrote stays as stored, except UsesDataDir, which can
+// change solely because a restored copy expired before healing. The signature
+// also orders versions of one time in the merge. The signature of a legacy version is
 // over its per-shard checksums; the key has one from the digest.
 func versionRevision(ver xlMetaV2ShallowVersion, metaV uint8) revisionKey {
 	h := sha256.New()
@@ -281,6 +282,7 @@ func versionRevision(ver xlMetaV2ShallowVersion, metaV uint8) revisionKey {
 			case ObjectType:
 				key.header.Signature = v.ObjectV2.Signature()
 				key.header.EcN, key.header.EcM = uint8(v.ObjectV2.ErasureN), uint8(v.ObjectV2.ErasureM)
+				key.header.Flags &^= xlFlagUsesDataDir
 			}
 			return key
 		}

@@ -731,7 +731,7 @@ func TestRestorePublishedRevisionAcrossExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored := func() revisionKey {
+	stored := func() (xlMetaV2VersionHeader, revisionKey) {
 		var x xlMetaV2
 		if err := x.AddVersion(published); err != nil {
 			t.Fatal(err)
@@ -744,16 +744,19 @@ func TestRestorePublishedRevisionAcrossExpiry(t *testing.T) {
 		if err := y.Load(buf); err != nil {
 			t.Fatal(err)
 		}
-		return versionRevision(y.versions[0], y.metaV)
+		return y.versions[0].header, versionRevision(y.versions[0], y.metaV)
 	}
-	before := stored()
+	beforeHeader, before := stored()
 	time.Sleep(time.Until(expiry) + 100*time.Millisecond)
-	after := stored()
-	if before == after {
+	afterHeader, after := stored()
+	if beforeHeader.Flags == afterHeader.Flags {
 		t.Fatal("fixture: the stored flag did not change at the expiry")
 	}
+	if before != after {
+		t.Fatal("expiry changed the identity of the published revision")
+	}
 	for _, got := range []revisionKey{before, after} {
-		if got != keys[0] && got != keys[1] {
+		if got != keys[0] {
 			t.Errorf("a publication's own entry is not recognized: %v not in %v", got, keys)
 		}
 	}
