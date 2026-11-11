@@ -50,6 +50,24 @@ func authorizeRequestWithUnreadTags(ctx context.Context, r *http.Request, action
 	if s3Err == ErrNone || toAPIError(ctx, readErr).HTTPStatusCode < http.StatusInternalServerError {
 		return s3Err
 	}
+	return authorizeRequestWithTagCandidates(ctx, r, action, s3Err)
+}
+
+// authorizeRequestWithPotentialTags performs the authorization needed before
+// a remote replica can be read. An empty tag set is enough to reject a caller
+// with no possible access, but a caller whose Allow depends on existing tags
+// must be admitted so the remote copy can supply the authoritative tags.
+// The returned decision is only a gate; the actual tags must be authorized
+// again after they are read.
+func authorizeRequestWithPotentialTags(ctx context.Context, r *http.Request, action policy.Action) APIErrorCode {
+	s3Err := authorizeRequest(ctx, r, action)
+	if s3Err == ErrNone {
+		return ErrNone
+	}
+	return authorizeRequestWithTagCandidates(ctx, r, action, s3Err)
+}
+
+func authorizeRequestWithTagCandidates(ctx context.Context, r *http.Request, action policy.Action, s3Err APIErrorCode) APIErrorCode {
 	for _, existingTags := range policyExistingObjectTags(ctx, r, action) {
 		if authorizeRequestWithExistingTags(ctx, r, action, existingTags) == ErrNone {
 			return ErrNone

@@ -33,11 +33,18 @@ import (
 func TestAPITaggingProxyAuthorization(t *testing.T) {
 	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: func(obj ObjectLayer, backend, bucket string, router http.Handler, root auth.Credentials, t *testing.T) {
 		conditional := newDeleteAuthzPolicyUser(t, backend, bucket, fmt.Sprintf(`[
-			{"Effect":"Allow","Action":["s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::%s/*"]},
-			{"Effect":"Deny","Action":["s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::%s/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/secret":"true"}}}
+			{"Effect":"Allow","Action":["s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::%s/*"]},
+			{"Effect":"Deny","Action":["s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::%s/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/secret":"true"}}}
 		]`, bucket, bucket))
+		tagAllow := newDeleteAuthzPolicyUser(t, backend, bucket, fmt.Sprintf(`[
+			{"Effect":"Allow","Action":["s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::%s/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/secret":"false"}}}
+		]`, bucket))
+		denied := newDeleteAuthzPolicyUser(t, backend, bucket, fmt.Sprintf(`[
+			{"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::%s/*"]}
+		]`, bucket))
+		zero := iamAdminUser(t.Context(), t, globalIAMSys, "tagging-no-policy-"+mustGetUUID(), "")
 		versionID := mustGetUUID()
-		for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 			for _, tc := range []struct {
 				name                                string
 				tags                                []string
@@ -45,17 +52,32 @@ func TestAPITaggingProxyAuthorization(t *testing.T) {
 				readStatus, writeStatus, wantStatus int
 				wantWrites                          int32
 				disabledFirst                       bool
+				firstReadStatus                     int
+				noReads                             bool
 			}{
 				{name: "deny-second-target", tags: []string{"false", "true"}, cred: conditional, wantStatus: http.StatusForbidden},
 				{name: "deny-first-target", tags: []string{"true", "false"}, cred: conditional, wantStatus: http.StatusForbidden},
 				{name: "all-authorized", tags: []string{"false", "false"}, cred: conditional, wantWrites: 2},
-				{name: "anonymous", tags: []string{"false"}, wantStatus: http.StatusForbidden},
-				{name: "invalid-credentials", tags: []string{"false"}, cred: auth.Credentials{AccessKey: root.AccessKey, SecretKey: "wrong-secret-key"}, wantStatus: http.StatusForbidden},
+				{name: "anonymous", tags: []string{"false"}, wantStatus: http.StatusForbidden, noReads: true},
+				{name: "invalid-credentials", tags: []string{"false"}, cred: auth.Credentials{AccessKey: root.AccessKey, SecretKey: "wrong-secret-key"}, wantStatus: http.StatusForbidden, noReads: true},
+				{name: "zero-permissions", tags: []string{"false"}, cred: zero, wantStatus: http.StatusForbidden, noReads: true},
+				{name: "zero-permissions-missing", tags: []string{"false"}, cred: zero, readStatus: http.StatusNotFound, wantStatus: http.StatusForbidden, noReads: true},
+				{name: "unconditional-deny", tags: []string{"false"}, cred: denied, wantStatus: http.StatusForbidden, noReads: true},
 				{name: "unreadable", tags: []string{"false"}, cred: root, readStatus: http.StatusServiceUnavailable, wantStatus: http.StatusServiceUnavailable},
-				{name: "missing-version", tags: []string{"false"}, cred: root, readStatus: http.StatusNotFound, writeStatus: http.StatusNotFound, wantStatus: http.StatusNotFound, wantWrites: 1},
+				{name: "missing-version", tags: []string{"false", "false"}, cred: root, readStatus: http.StatusNotFound, wantStatus: http.StatusNotFound},
+				{name: "tag-allow-missing-version", tags: []string{"false"}, cred: tagAllow, readStatus: http.StatusNotFound, wantStatus: http.StatusForbidden},
+				{name: "tag-allow-lagging-first", tags: []string{"false", "false"}, cred: tagAllow, firstReadStatus: http.StatusNotFound, wantWrites: 1},
+				{name: "tag-allow-lagging-second", tags: []string{"false", "false"}, cred: tagAllow, firstReadStatus: http.StatusOK, readStatus: http.StatusNotFound, wantWrites: 1},
+				{name: "tag-allow-present-untagged", tags: []string{"false", ""}, cred: tagAllow, wantStatus: http.StatusForbidden},
+				{name: "tag-allow-unreadable-first", tags: []string{"false", "false"}, cred: tagAllow, firstReadStatus: http.StatusServiceUnavailable, wantStatus: http.StatusServiceUnavailable},
+				{name: "tag-allow-unreadable-second", tags: []string{"false", "false"}, cred: tagAllow, firstReadStatus: http.StatusOK, readStatus: http.StatusServiceUnavailable, wantStatus: http.StatusServiceUnavailable},
 				{name: "disabled-target", tags: []string{"true", "false"}, cred: conditional, disabledFirst: true, wantWrites: 1},
+				{name: "no-available-target", tags: []string{"false"}, cred: tagAllow, disabledFirst: true, wantStatus: http.StatusServiceUnavailable, noReads: true},
 				{name: "skipped-target-cannot-mask-failure", tags: []string{"false", "false"}, cred: root, disabledFirst: true, writeStatus: http.StatusServiceUnavailable, wantStatus: http.StatusServiceUnavailable, wantWrites: 1},
 			} {
+				if method == http.MethodGet && tc.writeStatus != 0 {
+					continue // This case only exercises a remote mutation failure.
+				}
 				t.Run(backend+"/"+method+"/"+tc.name, func(t *testing.T) {
 					var reads, writes atomic.Int32
 					globalBucketTargetSys.Lock()
@@ -63,6 +85,10 @@ func TestAPITaggingProxyAuthorization(t *testing.T) {
 					globalBucketTargetSys.Unlock()
 					cfg := replication.Config{}
 					for i, value := range tc.tags {
+						readStatus := tc.readStatus
+						if i == 0 && tc.firstReadStatus != 0 {
+							readStatus = tc.firstReadStatus
+						}
 						target := newILMTestTarget(t)
 						registerILMTestTarget(t, obj, bucket, target, func(w http.ResponseWriter, r *http.Request) {
 							if r.URL.Query().Get("versionId") != versionID || !r.URL.Query().Has("tagging") || r.Header.Get(xhttp.MinIOSourceProxyRequest) != "true" {
@@ -71,12 +97,15 @@ func TestAPITaggingProxyAuthorization(t *testing.T) {
 							status := tc.writeStatus
 							if r.Method == http.MethodGet {
 								reads.Add(1)
-								status = tc.readStatus
+								status = readStatus
 							} else {
 								writes.Add(1)
+								if readStatus == http.StatusNotFound {
+									t.Error("tagging write reached a missing replica")
+								}
 							}
 							w.Header().Set("Content-Type", "application/xml")
-							if status != 0 {
+							if status != 0 && status != http.StatusOK {
 								w.WriteHeader(status)
 								code := "ServiceUnavailable"
 								if status == http.StatusNotFound {
@@ -87,7 +116,11 @@ func TestAPITaggingProxyAuthorization(t *testing.T) {
 							}
 							switch r.Method {
 							case http.MethodGet:
-								fmt.Fprintf(w, "<Tagging><TagSet><Tag><Key>secret</Key><Value>%s</Value></Tag></TagSet></Tagging>", value)
+								if value == "" {
+									fmt.Fprint(w, "<Tagging><TagSet></TagSet></Tagging>")
+								} else {
+									fmt.Fprintf(w, "<Tagging><TagSet><Tag><Key>secret</Key><Value>%s</Value></Tag></TagSet></Tagging>", value)
+								}
 							case http.MethodDelete:
 								w.WriteHeader(http.StatusNoContent)
 							}
@@ -130,11 +163,15 @@ func TestAPITaggingProxyAuthorization(t *testing.T) {
 							wantStatus = http.StatusNoContent
 						}
 					}
-					if rec.Code != wantStatus || writes.Load() != tc.wantWrites {
-						t.Errorf("status=%d writes=%d, want status=%d writes=%d: %s", rec.Code, writes.Load(), wantStatus, tc.wantWrites, rec.Body.String())
+					wantWrites := tc.wantWrites
+					if method == http.MethodGet {
+						wantWrites = 0
 					}
-					if tc.name == "invalid-credentials" && reads.Load() != 0 {
-						t.Errorf("invalid credentials reached %d remote reads", reads.Load())
+					if rec.Code != wantStatus || writes.Load() != wantWrites {
+						t.Errorf("status=%d writes=%d, want status=%d writes=%d: %s", rec.Code, writes.Load(), wantStatus, wantWrites, rec.Body.String())
+					}
+					if tc.noReads && reads.Load() != 0 {
+						t.Errorf("unauthorized request reached %d remote reads", reads.Load())
 					}
 				})
 			}

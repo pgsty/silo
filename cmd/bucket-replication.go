@@ -2773,67 +2773,107 @@ func scheduleReplication(ctx context.Context, oi ObjectInfo, o ObjectLayer, dsc 
 	}
 }
 
-// proxyTaggingToRepTarget proxies tagging requests to remote targets for
-// active-active replicated setups
-func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *tags.Tags, opts ObjectOptions, proxyTargets *madmin.BucketTargets, authorize func(string, error) APIErrorCode) (proxy proxyResult, authErr APIErrorCode) {
-	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) {
-		return proxy, ErrNone
-	}
-	// Keep the exact clients whose addressed versions we read. A second
-	// discovery could include a newly available, unauthorized destination.
-	var targets []*TargetClient
+// taggingProxyTarget keeps the exact client and tags that were authorized.
+// A second discovery must not introduce an unauthorized destination.
+type taggingProxyTarget struct {
+	client *TargetClient
+	tags   *tags.Tags
+}
+
+// readTaggingProxyTargets authorizes all present replicas before returning any
+// tags or allowing any mutation. Missing replicas may simply lag replication;
+// unreadable replicas must still fail closed.
+func readTaggingProxyTargets(ctx context.Context, bucket, object string, opts ObjectOptions, proxyTargets *madmin.BucketTargets, authorize func(string, error) APIErrorCode) ([]taggingProxyTarget, proxyResult, APIErrorCode) {
+	var targets []taggingProxyTarget
 	for _, target := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, target.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) || tgt.disableProxy {
 			continue
 		}
-		targets = append(targets, tgt)
+		targets = append(targets, taggingProxyTarget{client: tgt})
 	}
 	if len(targets) == 0 {
 		err := RemoteTargetConnectionErr{Bucket: bucket, Err: errors.New("no available remote replication target")}
-		return proxyResult{Err: err}, authorize("", err)
+		return nil, proxyResult{Err: err}, authorize("", err)
 	}
 
 	var wg sync.WaitGroup
 	errs := make([]error, len(targets))
-	existingTags := make([]string, len(targets))
-	for i, tgt := range targets {
+	for i := range targets {
 		wg.Go(func() {
-			remoteTags, err := tgt.GetObjectTagging(ctx, tgt.Bucket, object, minio.GetObjectTaggingOptions{
+			tgt := &targets[i]
+			tgt.tags, errs[i] = tgt.client.GetObjectTagging(ctx, tgt.client.Bucket, object, minio.GetObjectTaggingOptions{
 				VersionID: opts.VersionID,
 				Internal:  minio.AdvancedObjectTaggingOptions{ReplicationProxyRequest: "true"},
 			})
-			errs[i] = err
-			if remoteTags != nil {
-				existingTags[i] = remoteTags.String()
-			}
 		})
 	}
 	wg.Wait()
-	// Authorize every contacted target before any mutation. A tag-based deny
-	// on one copy must not be hidden by a more permissive copy on another.
-	var readErr error
-	for i, err := range errs {
-		if code := authorize(existingTags[i], err); code != ErrNone {
-			return proxy, code
+
+	var firstNotFound, readErr error
+	for _, err := range errs {
+		switch {
+		case err == nil:
+		case isRemoteTaggingNotFound(err):
+			if firstNotFound == nil {
+				firstNotFound = err
+			}
+		default:
+			if code := authorize("", err); code != ErrNone {
+				return nil, proxyResult{}, code
+			}
+			if readErr == nil {
+				readErr = err
+			}
 		}
-		if err != nil && !isRemoteTaggingNotFound(err) && readErr == nil {
-			readErr = err
+	}
+	present := make([]taggingProxyTarget, 0, len(targets))
+	for i, tgt := range targets {
+		if errs[i] != nil {
+			continue
 		}
+		if tgt.tags == nil {
+			tgt.tags, _ = tags.MapToObjectTags(nil)
+		}
+		if code := authorize(tgt.tags.String(), nil); code != ErrNone {
+			return nil, proxyResult{}, code
+		}
+		present = append(present, tgt)
 	}
 	if readErr != nil {
-		return proxyResult{Err: readErr}, ErrNone
+		return nil, proxyResult{Err: readErr}, ErrNone
+	}
+	if len(present) == 0 {
+		// With no object anywhere, authorize the empty tag set once before
+		// disclosing its absence. No write RPC can help a missing replica.
+		return nil, proxyResult{Err: firstNotFound}, authorize("", firstNotFound)
+	}
+	return present, proxyResult{}, ErrNone
+}
+
+// proxyTaggingToRepTarget proxies tagging requests to remote targets for
+// active-active replicated setups.
+func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *tags.Tags, opts ObjectOptions, proxyTargets *madmin.BucketTargets, authorize func(string, error) APIErrorCode) (proxy proxyResult, authErr APIErrorCode) {
+	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) {
+		return proxy, ErrNone
+	}
+	targets, proxy, authErr := readTaggingProxyTargets(ctx, bucket, object, opts, proxyTargets, authorize)
+	if authErr != ErrNone || proxy.Err != nil {
+		return proxy, authErr
 	}
 
-	for i, tgt := range targets {
+	var wg sync.WaitGroup
+	writeErrs := make([]error, len(targets))
+	for i, target := range targets {
 		wg.Go(func() {
+			tgt := target.client
 			if tags != nil {
-				errs[i] = tgt.PutObjectTagging(ctx, tgt.Bucket, object, tags, minio.PutObjectTaggingOptions{
+				writeErrs[i] = tgt.PutObjectTagging(ctx, tgt.Bucket, object, tags, minio.PutObjectTaggingOptions{
 					VersionID: opts.VersionID,
 					Internal:  minio.AdvancedObjectTaggingOptions{ReplicationProxyRequest: "true"},
 				})
 			} else {
-				errs[i] = tgt.RemoveObjectTagging(ctx, tgt.Bucket, object, minio.RemoveObjectTaggingOptions{
+				writeErrs[i] = tgt.RemoveObjectTagging(ctx, tgt.Bucket, object, minio.RemoveObjectTaggingOptions{
 					VersionID: opts.VersionID,
 					Internal:  minio.AdvancedObjectTaggingOptions{ReplicationProxyRequest: "true"},
 				})
@@ -2841,9 +2881,8 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 		})
 	}
 	wg.Wait()
-	// Preserve partial success, counting only targets actually contacted.
 	var lastErr error
-	for _, err := range errs {
+	for _, err := range writeErrs {
 		if err == nil {
 			return proxy, ErrNone
 		}
@@ -2853,72 +2892,16 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 }
 
 // proxyGetTaggingToRepTarget proxies get tagging requests to remote targets for
-// active-active replicated setups
-func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (tgs *tags.Tags, proxy proxyResult) {
-	// this option is set when active-active replication is in place between site A -> B,
-	// and request hits site B that does not have the object yet.
-	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
-		return nil, proxy
+// active-active replicated setups.
+func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts ObjectOptions, proxyTargets *madmin.BucketTargets, authorize func(string, error) APIErrorCode) (tgs *tags.Tags, proxy proxyResult, authErr APIErrorCode) {
+	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) {
+		return nil, proxy, ErrNone
 	}
-	var wg sync.WaitGroup
-	errs := make([]error, len(proxyTargets.Targets))
-	tagSlc := make([]map[string]string, len(proxyTargets.Targets))
-	contacted := 0
-	for idx, t := range proxyTargets.Targets {
-		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
-		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
-			continue
-		}
-		// if proxying explicitly disabled on remote target
-		if tgt.disableProxy {
-			continue
-		}
-		contacted++
-		idx := idx
-		wg.Add(1)
-		go func(idx int, tgt *TargetClient) {
-			defer wg.Done()
-			gopts := minio.GetObjectTaggingOptions{
-				VersionID: opts.VersionID,
-				Internal: minio.AdvancedObjectTaggingOptions{
-					ReplicationProxyRequest: "true",
-				},
-			}
-			remoteTags, err := tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
-			if err != nil {
-				errs[idx] = err
-			} else if remoteTags != nil {
-				tagSlc[idx] = remoteTags.ToMap()
-			}
-		}(idx, tgt)
+	targets, proxy, authErr := readTaggingProxyTargets(ctx, bucket, object, opts, proxyTargets, authorize)
+	if authErr != ErrNone || proxy.Err != nil {
+		return nil, proxy, authErr
 	}
-	wg.Wait()
-	if contacted == 0 {
-		return nil, proxyResult{Err: RemoteTargetConnectionErr{
-			Bucket: bucket,
-			Err:    errors.New("no available remote replication target"),
-		}}
-	}
-	var firstNotFound error
-	for idx, err := range errs {
-		errCode := minio.ToErrorResponse(err).Code
-		if err != nil {
-			if errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
-				return nil, proxyResult{Err: err}
-			}
-			if firstNotFound == nil {
-				firstNotFound = err
-			}
-			continue
-		}
-		if tagSlc[idx] != nil && tgs == nil {
-			tgs, _ = tags.MapToObjectTags(tagSlc[idx])
-		}
-	}
-	if tgs == nil {
-		proxy.Err = firstNotFound
-	}
-	return tgs, proxy
+	return targets[0].tags, proxy, ErrNone
 }
 
 func scheduleReplicationDelete(ctx context.Context, dv DeletedObjectReplicationInfo, o ObjectLayer) {

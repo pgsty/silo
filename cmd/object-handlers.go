@@ -3726,9 +3726,22 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
+				if s3Error := authorizeRequestWithPotentialTags(ctx, r, policy.GetObjectTaggingAction); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
 				globalReplicationStats.Load().incProxy(bucket, getObjectTaggingAPI, false)
 				// proxy to replication target if site replication is in place.
-				tags, gerr := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
+				tags, gerr, s3Error := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts, func(existingTags string, readErr error) APIErrorCode {
+					if readErr != nil && !isRemoteTaggingNotFound(readErr) {
+						return authorizeRequestWithUnreadTags(ctx, r, policy.GetObjectTaggingAction, readErr)
+					}
+					return authorizeRequestWithExistingTags(ctx, r, policy.GetObjectTaggingAction, existingTags)
+				})
+				if s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
 				if gerr.Err != nil || tags == nil {
 					globalReplicationStats.Load().incProxy(bucket, getObjectTaggingAPI, true)
 					writeErrorResponse(ctx, w, toAPIError(ctx, gerr.Err), r.URL)
@@ -3737,10 +3750,18 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 				ot = tags
 				w.Header()[xhttp.MinIOTaggingProxied] = []string{"true"} // indicate that the request was proxied.
 			} else {
+				if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.GetObjectTaggingAction, ""); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
 			}
 		} else {
+			if s3Error := authorizeRequestWithUnreadTags(ctx, r, policy.GetObjectTaggingAction, err); s3Error != ErrNone {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+				return
+			}
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
@@ -3841,6 +3862,10 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
+				if s3Error := authorizeRequestWithPotentialTags(ctx, r, policy.PutObjectTaggingAction); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
 				perr, s3Error := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts, func(existingTags string, readErr error) APIErrorCode {
 					if readErr != nil && !isRemoteTaggingNotFound(readErr) {
 						return authorizeRequestWithUnreadTags(ctx, r, policy.PutObjectTaggingAction, readErr)
@@ -3969,6 +3994,10 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
+				if s3Error := authorizeRequestWithPotentialTags(ctx, r, policy.DeleteObjectTaggingAction); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
 				perr, s3Error := proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts, func(existingTags string, readErr error) APIErrorCode {
 					if readErr != nil && !isRemoteTaggingNotFound(readErr) {
 						return authorizeRequestWithUnreadTags(ctx, r, policy.DeleteObjectTaggingAction, readErr)
@@ -4001,7 +4030,13 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 				return
 			}
 		}
-		if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, ""); s3Error != ErrNone {
+		var s3Error APIErrorCode
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			s3Error = authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, "")
+		} else {
+			s3Error = authorizeRequestWithUnreadTags(ctx, r, policy.DeleteObjectTaggingAction, err)
+		}
+		if s3Error != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 			return
 		}

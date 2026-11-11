@@ -87,7 +87,7 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 	}
 
 	statement := func(effect, resource, conditions string) string {
-		st := fmt.Sprintf(`{"Effect": %q, "Action": ["s3:GetObject", "s3:PutObjectTagging"], "Resource": ["arn:aws:s3:::%s/%s"]`,
+		st := fmt.Sprintf(`{"Effect": %q, "Action": ["s3:GetObject", "s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObjectTagging"], "Resource": ["arn:aws:s3:::%s/%s"]`,
 			effect, bucket, resource)
 		if conditions != "" {
 			st += `, "Condition": ` + conditions
@@ -263,6 +263,8 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 	taggingURL := makeTestTargetURL("", bucket, object, url.Values{"tagging": []string{""}})
 	taggingBody := []byte(`<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>`)
 	putTagging := request{"PutObjectTagging", http.MethodPut, taggingURL, nil, taggingBody}
+	getTagging := request{"GetObjectTagging", http.MethodGet, taggingURL, nil, nil}
+	deleteTagging := request{"DeleteObjectTagging", http.MethodDelete, taggingURL, nil, nil}
 	check := func(stage string, creds auth.Credentials, name string, req request, want int) {
 		t.Helper()
 		var rec *httptest.ResponseRecorder
@@ -302,6 +304,7 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 	var anonymous auth.Credentials
 	for _, u := range users {
 		check("healthy", u.creds, u.name, get, u.healthy)
+		check("healthy", u.creds, u.name, getTagging, u.healthy)
 	}
 	check("healthy", anonymous, "anonymous", get, http.StatusOK)
 	// The tags were read and allow the request: the range error is the answer.
@@ -312,12 +315,13 @@ func TestExistingObjectTagAuthReadQuorumLost(t *testing.T) {
 	missingURL := getGetObjectURL("", bucket, missing)
 	check("missing key", users[0].creds, users[0].name, request{"GET", http.MethodGet, missingURL, nil, nil}, http.StatusForbidden)
 	check("missing key", users[0].creds, users[0].name, request{"HEAD", http.MethodHead, missingURL, nil, nil}, http.StatusForbidden)
+	check("missing key", users[0].creds, users[0].name, request{"GetObjectTagging", http.MethodGet, missingURL + "?tagging", nil, nil}, http.StatusForbidden)
 
 	defer objectReadFault(z, bucket, object, 10)()
 	if _, err := z.GetObjectInfo(ctx, bucket, object, ObjectOptions{}); !isErrReadQuorum(err) {
 		t.Fatalf("GetObjectInfo with 10 of 16 drives failing: %v, want InsufficientReadQuorum", err)
 	}
-	for _, req := range []request{get, head, putTagging} {
+	for _, req := range []request{get, head, getTagging, putTagging, deleteTagging} {
 		for _, u := range users {
 			check("read quorum lost", u.creds, u.name, req, u.quorumLost)
 		}
