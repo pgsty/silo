@@ -1059,12 +1059,12 @@ func (z *erasureServerPools) decommissionPoolWalk(ctx context.Context, idx int, 
 				// One metadata-only read of each source drive per entry, regardless
 				// of its version count. No read error can become progress or trigger
 				// another walk; leave the bucket queued for an explicit retry.
-				snapshot := append(fivs.Versions, fivs.FreeVersions...)
+				snapshot := slices.Concat(fivs.Versions, fivs.FreeVersions)
 				n, countErr := z.countAbsentMigrationVersions(ctx, bi.Name, entry.name, idx, snapshot)
 				removed.Add(int64(n))
 				// The disposable usage cache is also excluded by the final
 				// verification. Its unreadability still never counts as progress.
-				if countErr != nil && !(bi.Name == minioMetaBucket && strings.Contains(entry.name, dataUsageCacheName)) {
+				if countErr != nil && (bi.Name != minioMetaBucket || !strings.Contains(entry.name, dataUsageCacheName)) {
 					verifyOnce.Do(func() { verifyErr = countErr })
 					if err == nil {
 						err = countErr

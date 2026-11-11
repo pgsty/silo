@@ -340,16 +340,6 @@ func checkRequestAuthType(ctx context.Context, r *http.Request, action policy.Ac
 	return s3Err
 }
 
-func checkRequestAuthTypeWithExistingTags(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName, existingTags string) (s3Err APIErrorCode) {
-	logger.GetReqInfo(ctx).BucketName = bucketName
-	logger.GetReqInfo(ctx).ObjectName = objectName
-
-	if s3Err = authenticateRequest(ctx, r, action); s3Err != ErrNone {
-		return s3Err
-	}
-	return authorizeRequestWithExistingTags(ctx, r, action, existingTags)
-}
-
 func checkRequestAuthTypeWithRequestTags(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName string, requestTags *string) (s3Err APIErrorCode) {
 	logger.GetReqInfo(ctx).BucketName = bucketName
 	logger.GetReqInfo(ctx).ObjectName = objectName

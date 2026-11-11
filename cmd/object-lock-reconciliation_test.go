@@ -327,12 +327,14 @@ func (f *lockBoundaryReadFailure) GetObjectNInfo(ctx context.Context, bucket, ke
 	}
 	return f.ObjectLayer.GetObjectNInfo(ctx, bucket, key, rs, h, opts)
 }
+
 func (f *lockBoundaryReadFailure) GetObjectInfo(ctx context.Context, bucket, key string, opts ObjectOptions) (ObjectInfo, error) {
 	if f.destinationError != nil && bucket == f.bucket && key == f.key && opts.VersionID == f.version {
 		return ObjectInfo{}, f.destinationError
 	}
 	return f.ObjectLayer.GetObjectInfo(ctx, bucket, key, opts)
 }
+
 func (f *lockBoundaryReadFailure) DeleteObject(ctx context.Context, bucket, key string, opts ObjectOptions) (ObjectInfo, error) {
 	f.deleteCalls++
 	return f.ObjectLayer.DeleteObject(ctx, bucket, key, opts)
