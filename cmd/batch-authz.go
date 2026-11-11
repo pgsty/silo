@@ -829,15 +829,15 @@ func batchStatementNeedsRequest(st policy.Statement, args policy.Args, supplied 
 	// Policy variables in condition values.
 	if len(st.Conditions) > 0 {
 		data, err := json.Marshal(st.Conditions)
-		if err != nil || batchUnsuppliedVariable(string(data), supplied) {
+		if err != nil || batchConditionsNeedVariables(data, supplied) {
 			return true
 		}
 	}
 	return false
 }
 
-// batchUnsuppliedVariable reports whether s holds a policy variable, ${key},
-// whose value the job does not supply.
+// batchUnsuppliedVariable follows Resource.Match: only CommonKeys are expanded,
+// and an unsupported ${...} sequence (including its nested text) stays literal.
 func batchUnsuppliedVariable(s string, supplied map[string]bool) bool {
 	for {
 		i := strings.Index(s, "${")
@@ -849,11 +849,51 @@ func batchUnsuppliedVariable(s string, supplied map[string]bool) bool {
 		if j < 0 {
 			return false
 		}
-		if !batchKeySupplied(supplied, s[:j]) {
+		if condition.CommonKeysMap[condition.KeyName(s[:j])] && !batchKeySupplied(supplied, s[:j]) {
 			return true
 		}
 		s = s[j+1:]
 	}
+}
+
+// Conditions replace each recognized variable wherever it occurs in a string
+// value, unlike the resource parser. Inspect values only, not condition keys,
+// and decode BinaryEquals as the policy evaluator does before substitution.
+func batchConditionsNeedVariables(data []byte, supplied map[string]bool) bool {
+	var conditions map[string]map[string]condition.ValueSet
+	if err := json.Unmarshal(data, &conditions); err != nil {
+		return true
+	}
+	for name, keys := range conditions {
+		name = strings.TrimPrefix(strings.TrimPrefix(name, "ForAnyValue:"), "ForAllValues:")
+		name = strings.TrimSuffix(name, "IfExists")
+		switch name {
+		case "StringEquals", "StringNotEquals", "StringEqualsIgnoreCase", "StringNotEqualsIgnoreCase", "StringLike", "StringNotLike", "BinaryEquals":
+		default:
+			continue
+		}
+		for _, values := range keys {
+			for value := range values {
+				s, err := value.GetString()
+				if err != nil {
+					return true
+				}
+				if name == "BinaryEquals" {
+					decoded, err := base64.StdEncoding.DecodeString(s)
+					if err != nil {
+						return true
+					}
+					s = string(decoded)
+				}
+				for _, key := range condition.CommonKeys {
+					if strings.Contains(s, key.VarName()) && !batchKeySupplied(supplied, string(key)) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // batchStatementMayApply matches the resources of a statement, in both forms
