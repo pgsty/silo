@@ -724,7 +724,7 @@ func (c *SiteReplicationSys) healIAMDeletions(ctx context.Context) (err error) {
 		}
 	}
 	var progressMu sync.Mutex
-	cerr := c.concDo(nil, func(id string, p madmin.PeerInfo) error {
+	cerr := c.state.concDo(nil, func(id string, p madmin.PeerInfo) error {
 		// Bound each pass, but retain acknowledgements independently of the
 		// pass deadline or unrelated changes at either site.
 		peerCtx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
