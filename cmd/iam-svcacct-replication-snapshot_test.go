@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -59,6 +60,11 @@ func svcAccStored(t *testing.T, f *groupRefreshFixture, key string) svcAccRecord
 		t.Fatalf("service account %s is not stored", key)
 	}
 	cr := u.Credentials
+	rawClaims, err := auth.ExtractClaims(cr.SessionToken, cr.SecretKey)
+	mustIAM(t, err)
+	if _, ok := rawClaims.Map()[sessionPolicyNameExtracted]; ok {
+		t.Fatal("stored JWT contains the derived policy claim")
+	}
 	claims, err := getClaimsFromTokenWithSecret(cr.SessionToken, cr.SecretKey)
 	mustIAM(t, err)
 	rec := svcAccRecord{Parent: cr.ParentUser, Secret: cr.SecretKey, Status: cr.Status, Name: cr.Name, Description: cr.Description, Expiration: cr.Expiration, UpdatedAt: u.UpdatedAt}
@@ -172,6 +178,11 @@ func svcAccPeer(t *testing.T, from *svcAccSite, key string, items ...iamReplicat
 		mustIAM(t, err)
 		var received iamReplicationItem
 		mustIAM(t, json.Unmarshal(raw, &received))
+		if create := received.SvcAccChange.Create; create != nil {
+			if _, ok := create.Claims[sessionPolicyNameExtracted]; ok {
+				t.Fatal("replication snapshot contains the derived policy claim")
+			}
+		}
 		if err := applyIAMReplicationItem(peer.ctx, received); err != nil {
 			t.Fatalf("the peer refused item %d: %v", i, err)
 		}
@@ -215,15 +226,19 @@ func TestSiteReplicationServiceAccountEdits(t *testing.T) {
 			{NewDescription: "described"},
 			{NewPolicy: json.RawMessage(`{"Statement":[]}`)},
 		}, func(r svcAccRecord) bool { return r.Policy == "" && r.Description == "described" }},
-		// Policy documents an edit ignores: one with a version and no
-		// statement, one with statements and no version. The site keeps the
-		// policy it has, and so does the peer.
-		{"policy-ignored", []madmin.UpdateServiceAccountReq{
+		{"policy-removed-with-version", []madmin.UpdateServiceAccountReq{
 			{NewPolicy: json.RawMessage(svcAccSnapshotPolicy)},
 			{NewPolicy: json.RawMessage(`{"Version":"2012-10-17","Statement":[]}`), NewName: "named"},
-			{NewPolicy: json.RawMessage(`{"Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::ignored/*"]}]}`), NewDescription: "described"},
+			{NewDescription: "described"},
 		}, func(r svcAccRecord) bool {
-			return r.Policy == svcAccPolicyText(t, []byte(svcAccSnapshotPolicy)) && r.Name == "named" && r.Description == "described"
+			return r.Policy == "" && r.Name == "named" && r.Description == "described"
+		}},
+		{"policy-missing-version", []madmin.UpdateServiceAccountReq{
+			{NewPolicy: json.RawMessage(svcAccSnapshotPolicy)},
+			{NewPolicy: json.RawMessage(strings.ReplaceAll(strings.ReplaceAll(svcAccSnapshotPolicy, `"Version":"2012-10-17",`, ""), "s3:GetObject", "s3:PutObject"))},
+			{NewDescription: "described"},
+		}, func(r svcAccRecord) bool {
+			return r.Policy == svcAccPolicyText(t, []byte(strings.ReplaceAll(svcAccSnapshotPolicy, "s3:GetObject", "s3:PutObject"))) && r.Description == "described"
 		}},
 	} {
 		for _, delivery := range []string{"late", "lost"} {
@@ -360,7 +375,40 @@ func TestSiteReplicationServiceAccountStaleCache(t *testing.T) {
 		if a.Claims[iamPolicyClaimNameSA()] != embeddedPolicyType {
 			t.Errorf("exported claims say %v, want %s", a.Claims[iamPolicyClaimNameSA()], embeddedPolicyType)
 		}
+		if _, ok := a.Claims[sessionPolicyNameExtracted]; ok {
+			t.Error("exported claims contain the derived policy claim")
+		}
 	})
+}
+
+func TestIAMServiceAccountSnapshotClaims(t *testing.T) {
+	f := newGroupRefreshFixture(t)
+	sp, err := policy.ParseConfig(strings.NewReader(svcAccSnapshotPolicy))
+	mustIAM(t, err)
+	_, _, err = f.sys.NewServiceAccount(f.ctx, f.parent.AccessKey, nil, newServiceAccountOpts{
+		accessKey: "snapshot-claims", secretKey: "snapshot-valid-secret", sessionPolicy: sp,
+		claims: map[string]any{"identity-attribute": "preserved"},
+	})
+	mustIAM(t, err)
+	u, ok := f.stored(t, "snapshot-claims")
+	if !ok {
+		t.Fatal("service account missing")
+	}
+	cr := u.Credentials
+	rawClaims, err := auth.ExtractClaims(cr.SessionToken, cr.SecretKey)
+	mustIAM(t, err)
+	derived, ok := cr.Claims[sessionPolicyNameExtracted]
+	if !ok {
+		t.Fatal("control: loaded claims must contain the derived policy")
+	}
+	snapshot, err := serviceAccountSnapshot(u)
+	mustIAM(t, err)
+	if !reflect.DeepEqual(snapshot.Claims, rawClaims.Map()) {
+		t.Fatal("snapshot claims differ from the raw JWT")
+	}
+	if u.Credentials.SessionToken != cr.SessionToken || u.Credentials.Claims[sessionPolicyNameExtracted] != derived {
+		t.Fatal("snapshot changed the source token or its cached claims")
+	}
 }
 
 // The parent was deleted and created again on both sites. The token of a

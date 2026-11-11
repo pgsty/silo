@@ -20,7 +20,6 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -2934,27 +2933,15 @@ func updatedServiceAccountCredentials(ctx context.Context, accessKey string, cr 
 	// the embedded one stays. Only a policy that was given, and is empty,
 	// removes it: the account then has all its parent is allowed, which is
 	// usually more.
-	reset := opts.sessionPolicy != nil && opts.sessionPolicy.Version == "" && len(opts.sessionPolicy.Statements) == 0
-	if _, ok := m.Lookup(policy.SessionPolicyName); ok && reset {
-		m.Delete(policy.SessionPolicyName)
-		m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
-	}
-
-	if opts.sessionPolicy != nil { // session policies is being updated
-		if err := opts.sessionPolicy.Validate(); err != nil {
+	if opts.sessionPolicy != nil {
+		policyBuf, err := marshalServiceAccountPolicy(opts.sessionPolicy)
+		if err != nil {
 			return cr, err
 		}
-
-		if opts.sessionPolicy.Version != "" && len(opts.sessionPolicy.Statements) > 0 {
-			policyBuf, err := json.Marshal(opts.sessionPolicy)
-			if err != nil {
-				return cr, err
-			}
-
-			if len(policyBuf) > maxSVCSessionPolicySize {
-				return cr, errSessionPolicyTooLarge
-			}
-
+		if len(policyBuf) == 0 {
+			m.Delete(policy.SessionPolicyName)
+			m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
+		} else {
 			// Overwrite session policy claims.
 			m.Set(policy.SessionPolicyName, base64.StdEncoding.EncodeToString(policyBuf))
 			m.Set(iamPolicyClaimNameSA(), embeddedPolicyType)

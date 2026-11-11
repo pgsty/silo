@@ -2618,8 +2618,17 @@ func (a adminAPIHandlers) importIAM(w http.ResponseWriter, r *http.Request, apiV
 						return
 					}
 				}
-				if _, gerr := globalIAMSys.AddUsersToGroup(ctx, group, grpInfo.Members); gerr != nil {
-					failed.Groups = append(failed.Groups, madmin.IAMErrEntity{Name: group, Error: err})
+				_, gerr := globalIAMSys.AddUsersToGroup(ctx, group, grpInfo.Members)
+				if gerr == nil {
+					switch grpInfo.Status {
+					case statusDisabled:
+						_, gerr = globalIAMSys.SetGroupStatus(ctx, group, false)
+					case statusEnabled:
+						_, gerr = globalIAMSys.SetGroupStatus(ctx, group, true)
+					}
+				}
+				if gerr != nil {
+					failed.Groups = append(failed.Groups, madmin.IAMErrEntity{Name: group, Error: gerr})
 				} else {
 					added.Groups = append(added.Groups, group)
 				}
@@ -2699,6 +2708,7 @@ func (a adminAPIHandlers) importIAM(w http.ResponseWriter, r *http.Request, apiV
 				opts := newServiceAccountOpts{
 					accessKey:                  user,
 					secretKey:                  svcAcctReq.SecretKey,
+					status:                     svcAcctReq.Status,
 					sessionPolicy:              sp,
 					claims:                     svcAcctReq.Claims,
 					name:                       svcAcctReq.Name,
@@ -3055,7 +3065,7 @@ func commonAddServiceAccount(r *http.Request, ldap bool) (context.Context, auth.
 		}
 		// Empty service policies mean inheritance, including for expiring keys.
 		// Normalize the replication request as well as the local credential.
-		if sp.Version == "" && sp.Statements == nil && sp.ID == "" {
+		if sp.IsEmpty() {
 			sp = nil
 			createReq.Policy = nil
 		}

@@ -4,9 +4,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -24,6 +27,133 @@ import (
 // and empty removes the embedded one.
 
 const svcAccEditPolicy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::edit/*"]}]}`
+
+func TestIAMServiceAccountPolicySemantics(t *testing.T) {
+	for _, expiring := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expiring=%v", expiring), func(t *testing.T) {
+			f := newGroupRefreshFixture(t)
+			readPolicy, err := policy.ParseConfig(strings.NewReader(svcAccEditPolicy))
+			mustIAM(t, err)
+			writePolicy, err := policy.ParseConfig(strings.NewReader(strings.ReplaceAll(svcAccEditPolicy, "s3:GetObject", "s3:PutObject")))
+			mustIAM(t, err)
+			_, err = f.sys.PolicyDBSet(f.ctx, f.parent.AccessKey, "readwrite", regUser, false)
+			mustIAM(t, err)
+			for _, action := range []policy.Action{policy.GetObjectAction, policy.PutObjectAction} {
+				if !f.sys.IsAllowed(policy.Args{AccountName: f.parent.AccessKey, Action: action, BucketName: "edit", ObjectName: "object"}) {
+					t.Fatal("control: the parent must allow reads and writes to the test object")
+				}
+			}
+			noVersion, invalidVersion, oversized := *writePolicy, *writePolicy, *writePolicy
+			noVersion.Version = ""
+			invalidVersion.Version = "2008-10-17"
+			oversized.ID = policy.ID(strings.Repeat("x", maxSVCSessionPolicySize))
+			var expiration *time.Time
+			if expiring {
+				later := UTCNow().Add(time.Hour)
+				expiration = &later
+			}
+			for i, tc := range []struct {
+				name    string
+				input   *policy.Policy
+				invalid bool
+			}{
+				{"nil", nil, false},
+				{"empty", &policy.Policy{}, false},
+				{"empty-statements", &policy.Policy{Statements: []policy.Statement{}}, false},
+				{"empty-with-version", &policy.Policy{Version: policy.DefaultVersion, Statements: []policy.Statement{}}, false},
+				{"missing-version", &noVersion, false},
+				{"version", writePolicy, false},
+				{"invalid-version", &invalidVersion, true},
+				{"empty-invalid-version", &policy.Policy{Version: "2008-10-17"}, true},
+				{"invalid-statement", &policy.Policy{Statements: []policy.Statement{{}}}, true},
+				{"oversized", &oversized, true},
+			} {
+				for _, edit := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/edit=%v", tc.name, edit), func(t *testing.T) {
+						key := fmt.Sprintf("policy-%d-%v", i, edit)
+						inputBefore, err := json.Marshal(tc.input)
+						mustIAM(t, err)
+						var before UserIdentity
+						if edit {
+							_, _, err = f.sys.NewServiceAccount(f.ctx, f.parent.AccessKey, nil, newServiceAccountOpts{
+								accessKey: key, secretKey: "policy-valid-secret", sessionPolicy: readPolicy, expiration: expiration,
+							})
+							mustIAM(t, err)
+							mustIAM(t, f.sys.store.loadIAMConfig(f.ctx, &before, getUserIdentityPath(key, svcUser)))
+							_, err = f.sys.UpdateServiceAccount(f.ctx, key, updateServiceAccountOpts{sessionPolicy: tc.input, description: "edited"})
+						} else {
+							// Snapshots can carry a stale copy of the policy in claims.
+							var claims map[string]any
+							if tc.input != nil {
+								claims = map[string]any{policy.SessionPolicyName: base64.StdEncoding.EncodeToString([]byte(svcAccEditPolicy))}
+							}
+							_, _, err = f.sys.NewServiceAccount(f.ctx, f.parent.AccessKey, nil, newServiceAccountOpts{
+								accessKey: key, secretKey: "policy-valid-secret", sessionPolicy: tc.input, expiration: expiration,
+								claims: claims,
+							})
+						}
+						if (err != nil) != tc.invalid {
+							t.Fatalf("operation error = %v, want rejected=%v", err, tc.invalid)
+						}
+						inputAfter, err := json.Marshal(tc.input)
+						mustIAM(t, err)
+						if !bytes.Equal(inputBefore, inputAfter) {
+							t.Fatal("operation changed the caller's policy")
+						}
+						var stored UserIdentity
+						loadErr := f.sys.store.loadIAMConfig(f.ctx, &stored, getUserIdentityPath(key, svcUser))
+						if tc.invalid {
+							if edit {
+								mustIAM(t, loadErr)
+								if !reflect.DeepEqual(stored, before) {
+									t.Fatal("rejected edit changed the stored account")
+								}
+							} else if loadErr != errConfigNotFound {
+								t.Fatalf("rejected create left an account: %v", loadErr)
+							}
+							return
+						}
+						mustIAM(t, loadErr)
+						claims, err := auth.ExtractClaims(stored.Credentials.SessionToken, stored.Credentials.SecretKey)
+						mustIAM(t, err)
+						if _, ok := claims.Map()[sessionPolicyNameExtracted]; ok {
+							t.Fatal("raw JWT contains the derived policy claim")
+						}
+						var want *policy.Policy
+						if tc.input != nil && !tc.input.IsEmpty() {
+							want = writePolicy
+						} else if tc.input == nil && edit {
+							want = readPolicy
+						}
+						got, err := embeddedServiceAccountPolicy(claims)
+						mustIAM(t, err)
+						if (got == nil) != (want == nil) || (got != nil && !got.Equals(*want)) {
+							t.Fatalf("stored policy = %+v, want %+v", got, want)
+						}
+						if want == nil {
+							if _, ok := claims.Lookup(policy.SessionPolicyName); ok || claims.Map()[iamPolicyClaimNameSA()] != inheritedPolicyType {
+								t.Fatal("inheritance must remove the embedded policy claim")
+							}
+						}
+						mustIAM(t, f.sys.store.LoadIAMCache(f.ctx, false))
+						u, valid, err := f.sys.CheckKey(f.ctx, key)
+						mustIAM(t, err)
+						if !valid || u.Credentials.IsTemp() != expiring {
+							t.Fatal("credential validity or expiration changed")
+						}
+						for _, action := range []policy.Action{policy.GetObjectAction, policy.PutObjectAction} {
+							allowed := f.sys.IsAllowed(policy.Args{AccountName: key, Claims: u.Credentials.Claims, Action: action, BucketName: "edit", ObjectName: "object"})
+							wantAllowed := want == nil || (want == readPolicy && action == policy.GetObjectAction) || (want == writePolicy && action == policy.PutObjectAction)
+							if allowed != wantAllowed {
+								t.Errorf("%s allowed=%v, want %v", action, allowed, wantAllowed)
+							}
+						}
+					})
+				}
+			}
+		})
+	}
+}
 
 func TestIAMServiceAccountEditKeepsPolicy(t *testing.T) {
 	f := newGroupRefreshFixture(t)
@@ -110,6 +240,7 @@ func TestIAMServiceAccountEditKeepsPolicy(t *testing.T) {
 		{"peer-status", madmin.SRSvcAccUpdate{Status: auth.AccountOff}, true, func(c auth.Credentials) bool { return c.Status == auth.AccountOff }},
 		{"peer-null", madmin.SRSvcAccUpdate{Description: "described", SessionPolicy: madmin.SRSessionPolicy("null")}, true, func(c auth.Credentials) bool { return c.Description == "described" }},
 		{"peer-empty", madmin.SRSvcAccUpdate{SessionPolicy: madmin.SRSessionPolicy(`{"Statement":[]}`)}, false, nil},
+		{"peer-empty-v", madmin.SRSvcAccUpdate{SessionPolicy: madmin.SRSessionPolicy(`{"Version":"2012-10-17","Statement":[]}`)}, false, nil},
 	} {
 		t.Run(edit.name, func(t *testing.T) {
 			key := "edit-" + edit.name

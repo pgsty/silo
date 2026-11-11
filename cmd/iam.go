@@ -1098,6 +1098,32 @@ type newServiceAccountOpts struct {
 	claims map[string]any
 }
 
+// marshalServiceAccountPolicy validates a supplied policy and normalizes its
+// version without changing the caller's policy. An empty policy means inheritance.
+func marshalServiceAccountPolicy(sp *policy.Policy) ([]byte, error) {
+	if sp == nil {
+		return nil, nil
+	}
+	p := *sp
+	if p.Version == "" {
+		p.Version = policy.DefaultVersion
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	if p.IsEmpty() {
+		return nil, nil
+	}
+	buf, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) > maxSVCSessionPolicySize {
+		return nil, errSessionPolicyTooLarge
+	}
+	return buf, nil
+}
+
 // NewServiceAccount - create a new service account
 func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, groups []string, opts newServiceAccountOpts) (auth.Credentials, time.Time, error) {
 	if !sys.Initialized() {
@@ -1115,19 +1141,9 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		return auth.Credentials{}, time.Time{}, auth.ErrNoAccessKeyWithSecretKey
 	}
 
-	var policyBuf []byte
-	if opts.sessionPolicy != nil {
-		err := opts.sessionPolicy.Validate()
-		if err != nil {
-			return auth.Credentials{}, time.Time{}, err
-		}
-		policyBuf, err = json.Marshal(opts.sessionPolicy)
-		if err != nil {
-			return auth.Credentials{}, time.Time{}, err
-		}
-		if len(policyBuf) > maxSVCSessionPolicySize {
-			return auth.Credentials{}, time.Time{}, errSessionPolicyTooLarge
-		}
+	policyBuf, err := marshalServiceAccountPolicy(opts.sessionPolicy)
+	if err != nil {
+		return auth.Credentials{}, time.Time{}, err
 	}
 
 	// found newly requested service account, to be same as
@@ -1150,6 +1166,14 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 
 	// Add all the necessary claims for the service account.
 	for k, v := range opts.claims {
+		// Older snapshots may carry this cache-only, decoded policy claim.
+		if k == sessionPolicyNameExtracted {
+			continue
+		}
+		// An explicit policy, including an empty one, owns this claim.
+		if k == policy.SessionPolicyName && opts.sessionPolicy != nil {
+			continue
+		}
 		_, ok := m[k]
 		if !ok {
 			m[k] = v
@@ -1162,7 +1186,6 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	}
 
 	var accessKey, secretKey string
-	var err error
 	if len(opts.accessKey) > 0 || len(opts.secretKey) > 0 {
 		accessKey, secretKey = opts.accessKey, opts.secretKey
 	} else {
@@ -1344,6 +1367,9 @@ func serviceAccountSnapshot(u UserIdentity) (madmin.SRSvcAccCreate, error) {
 	if err != nil {
 		return madmin.SRSvcAccCreate{}, err
 	}
+	// Extraction adds a decoded policy for local authorization. Transport only
+	// the token's claims, so peers and imports do not sign this derived value.
+	jwtClaims.Delete(sessionPolicyNameExtracted)
 	embeddedPolicy, err := embeddedServiceAccountPolicy(jwtClaims)
 	if err != nil {
 		return madmin.SRSvcAccCreate{}, err
