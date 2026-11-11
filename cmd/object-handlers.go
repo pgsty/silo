@@ -3841,26 +3841,17 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
-				// The local miss does not authorize a remote mutation. Read
-				// the addressed remote version first, then evaluate the
-				// caller against its actual ExistingObjectTag values.
-				remoteTags, readProxy := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
-				existingTags := ""
-				if remoteTags != nil {
-					existingTags = remoteTags.String()
-				}
-				if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.PutObjectTaggingAction, existingTags); s3Error != ErrNone {
+				perr, s3Error := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts, func(existingTags string, readErr error) APIErrorCode {
+					if readErr != nil && !isRemoteTaggingNotFound(readErr) {
+						return authorizeRequestWithUnreadTags(ctx, r, policy.PutObjectTaggingAction, readErr)
+					}
+					return authorizeRequestWithExistingTags(ctx, r, policy.PutObjectTaggingAction, existingTags)
+				})
+				if s3Error != ErrNone {
 					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 					return
 				}
-				if readProxy.Err != nil && !isRemoteTaggingNotFound(readProxy.Err) {
-					globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, readProxy.Err), r.URL)
-					return
-				}
 				globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, false)
-				// proxy to replication target if site replication is in place.
-				perr := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, true)
 					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
@@ -3978,25 +3969,17 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
-				// Authenticate above and authorize against the remote version's
-				// tags before sending a destructive proxy request.
-				remoteTags, readProxy := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
-				existingTags := ""
-				if remoteTags != nil {
-					existingTags = remoteTags.String()
-				}
-				if s3Error := authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, existingTags); s3Error != ErrNone {
+				perr, s3Error := proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts, func(existingTags string, readErr error) APIErrorCode {
+					if readErr != nil && !isRemoteTaggingNotFound(readErr) {
+						return authorizeRequestWithUnreadTags(ctx, r, policy.DeleteObjectTaggingAction, readErr)
+					}
+					return authorizeRequestWithExistingTags(ctx, r, policy.DeleteObjectTaggingAction, existingTags)
+				})
+				if s3Error != ErrNone {
 					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 					return
 				}
-				if readProxy.Err != nil && !isRemoteTaggingNotFound(readProxy.Err) {
-					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, readProxy.Err), r.URL)
-					return
-				}
 				globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, false)
-				// proxy to replication target if active-active replication is in place.
-				perr := proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
 					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
