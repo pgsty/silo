@@ -1831,6 +1831,7 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		MTime:                      dstOpts.MTime,
 		NoLock:                     true,
 		EncryptFn:                  dstOpts.EncryptFn,
+		IndexCB:                    dstOpts.IndexCB,
 		WantChecksum:               dstOpts.WantChecksum,
 		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
 		ReplicationRequest:         dstOpts.ReplicationRequest,

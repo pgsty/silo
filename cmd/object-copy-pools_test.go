@@ -84,7 +84,12 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				if mode == "sse-c" {
 					maps.Copy(sourceHeaders, customer(0x11))
 				}
-				data := bytes.Repeat([]byte("historical encrypted compressed content-"), 8192)
+				pattern := []byte("historical encrypted compressed content-")
+				repeats := 8192
+				if mode == "plain" {
+					repeats = compMinIndexSize/len(pattern) + 1
+				}
+				data := bytes.Repeat(pattern, repeats)
 				sourceHeaders[xhttp.AmzChecksumCRC32] = mustChecksum(t, hash.ChecksumCRC32, data)
 				key := fmt.Sprintf("copy-%s-%s-%d.txt", mode, tc.movement, sourcePool)
 				placed.uploadPool = sourcePool
@@ -144,6 +149,22 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				}
 				if copied.IsCompressed() != (!compressed && mode != "sse-c") {
 					t.Fatalf("copy did not use destination compression setting: %v", copied.IsCompressed())
+				}
+				if copied.IsCompressed() && len(data) > compMinIndexSize {
+					if len(copied.Parts) == 0 || len(copied.Parts[0].Index) == 0 {
+						t.Fatalf("compressed multi-block copy lost seek index: %+v", copied.Parts)
+					}
+					rangeHeaders := maps.Clone(getHeaders)
+					rangeHeaders["Range"] = "bytes=6000000-6000127"
+					req, err := newTestSignedRequestV4(http.MethodGet, getGetObjectURL("", bucket, key)+"?versionId="+copied.VersionID, 0, nil, globalActiveCred.AccessKey, globalActiveCred.SecretKey, rangeHeaders)
+					if err != nil {
+						t.Fatal(err)
+					}
+					rrec := httptest.NewRecorder()
+					router.ServeHTTP(rrec, req)
+					if rrec.Code != http.StatusPartialContent || !bytes.Equal(rrec.Body.Bytes(), data[6000000:6000128]) {
+						t.Fatalf("ranged GET on compressed copy: %d len=%d", rrec.Code, rrec.Body.Len())
+					}
 				}
 				if mode == "sse-kms" {
 					assertFederationKMSContext(t, copied, headers[xhttp.AmzServerSideEncryptionKmsContext])
