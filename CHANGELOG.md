@@ -14,10 +14,12 @@ for the candidate behavior and upgrade boundaries.
   GOVERNANCE retention and legal hold remain possible. Local lock revisions
   advance past stored revisions, and forced prefix deletion refuses an
   unavailable Object Lock configuration ([#336](https://github.com/pgsty/silo/issues/336)).
-- Tagging proxies authenticate and authorize every addressed destination,
-  including its stored tags. Authenticated unsigned-trailer uploads enforce
-  the request time window; anonymous uploads allowed by bucket policy remain
-  supported ([#337](https://github.com/pgsty/silo/issues/337),
+- Tagging proxies (`GET`, `PUT` and `DELETE`) authenticate and authorize every
+  present replica, including its stored tags, fail closed on unreadable targets,
+  and skip missing replicas caused by replication lag unless all targets are
+  absent. Authenticated unsigned-trailer uploads enforce the request time
+  window; anonymous uploads allowed by bucket policy remain supported
+  ([#337](https://github.com/pgsty/silo/issues/337),
   [#338](https://github.com/pgsty/silo/issues/338)).
 - `GetObjectAttributes` evaluates both Attributes and GetObject permissions
   against the addressed version's stored tags, using version actions for an
@@ -34,27 +36,36 @@ for the candidate behavior and upgrade boundaries.
   versions are actually removed, resolving the 20261109 limitation recorded
   in [#293](https://github.com/pgsty/silo/issues/293). Decommission and rebalance
   clean up successfully migrated sibling versions after concurrent deletion
-  of another version. Unreadable or conflicting metadata is not proof of
-  absence; cancellation returns an error, and a scan without physical progress
-  stops. Free-version tier ownership and the final physical-empty check remain
-  protected ([#340](https://github.com/pgsty/silo/issues/340)). See the
+  of another version. Source-removal and final empty verification check every
+  online drive and tolerate offline drives within the erasure set's read quorum,
+  while rejecting online metadata remnants, corrupt metadata, directory errors
+  and drive outages beyond parity. Cancellation returns an error, and a scan
+  without physical progress stops. Free-version tier ownership and the final
+  physical-empty check remain protected
+  ([#340](https://github.com/pgsty/silo/issues/340)). See the
   [decommission procedure](https://silo.pgsty.com/operations/deployments/baremetal-decommission-server-pool/).
-- Site-replication healing releases its state read lock before storage reads
-  and replication hooks, avoiding a deadlock when a writer is waiting
+- Site-replication bucket healing, metadata healing, status collection and
+  replication hooks snapshot site topology and release the state read lock
+  before storage I/O and peer RPCs, avoiding deadlocks and state-map races
+  when a configuration writer is waiting
   ([#341](https://github.com/pgsty/silo/issues/341)). IAM import preserves
   disabled service accounts and groups, reports group failures, and excludes
   derived session-policy claims from exported and replicated credentials
   ([#345](https://github.com/pgsty/silo/issues/345)).
 - Historical-version self-copy plans its destination pool and data rewrite
-  before encryption or compression, so a source version in another pool can
-  create a readable new version. In-place metadata updates locate the exact
-  requested version ([#343](https://github.com/pgsty/silo/issues/343)). Restore
-  expiry no longer turns a time-derived data-directory flag into a different
-  version revision; mixed healed headers can reach quorum and expired local
-  restore data can be cleaned up ([#344](https://github.com/pgsty/silo/issues/344)).
+  before encryption or compression, preserving multi-block compression seek
+  indexes so a source version in another pool creates a readable new version.
+  In-place metadata updates locate the exact requested version and preserve
+  authoritative content on moving pools, while copies that require encryption
+  or checksum recomputation select an active pool
+  ([#343](https://github.com/pgsty/silo/issues/343)). Restore expiry no longer
+  turns a time-derived data-directory flag into a different version revision;
+  mixed healed headers can reach quorum and expired local restore data can be
+  cleaned up ([#344](https://github.com/pgsty/silo/issues/344)).
 - Batch KMS rotation decodes the configured encryption context on execution
-  and after reload or retry, without adding validation-probe fields to object
-  metadata ([#346](https://github.com/pgsty/silo/issues/346)). Batch variable
+  and after reload or retry, rejecting invalid UTF-8 before changing an object
+  key and without adding validation-probe fields to object metadata
+  ([#346](https://github.com/pgsty/silo/issues/346)). Batch variable
   preflight follows the pinned policy evaluator's literal and substitution
   rules, including BinaryEquals, while retaining refusal of unavailable
   request context. This does not add AWS special-variable escape semantics
