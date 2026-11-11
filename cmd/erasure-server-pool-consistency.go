@@ -273,15 +273,36 @@ func (z *erasureServerPools) applyMigrationExpiry(ctx context.Context, bucket, o
 // lifecycle rule. A migration cleanup must never turn an asynchronous ILM
 // decision into an unconditional physical purge. It returns how many source
 // versions were removed, including versions deleted by ILM before cleanup.
-func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) (removed int, err error) {
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) (int, error) {
+	err := z.retireMovedVersions(ctx, bucket, object, source, versions, expired)
+	removed, countErr := z.countAbsentMigrationVersions(ctx, bucket, object, source, versions)
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	if err != nil {
+		return removed, err
+	}
+	return removed, countErr
+}
+
+// retireMovedVersions does not infer physical progress from a pool-level read
+// or delete result. Decommission verifies the entire walk snapshot once after
+// this cleanup and tier GC, including versions concurrently deleted by clients.
+func (z *erasureServerPools) retireMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := z.applyMigrationExpiry(ctx, bucket, object, source, expired); err != nil {
-		return 0, err
+		return err
+	}
+	if len(versions) == 0 {
+		return nil
 	}
 	object = encodeDirObject(object)
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
@@ -293,15 +314,10 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		expiredVersion := isExpiredVersion(expired, version)
 		copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{VersionID: vid, NoAuditLog: true})
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-			// ILM can remove the parent key before cleanup. Count that as
-			// progress so the next walk discovers keys below it.
-			if expiredVersion {
-				removed++
-			}
 			continue
 		}
 		if err != nil {
-			return removed, err
+			return err
 		}
 		var src *ObjectInfo
 		var retained []PoolObjInfo
@@ -313,13 +329,10 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 			}
 		}
 		if src == nil {
-			if expiredVersion {
-				removed++
-			}
 			continue
 		}
 		if !src.ModTime.Equal(version.ModTime) || src.DeleteMarker != version.Deleted {
-			return removed, PreConditionFailed{}
+			return PreConditionFailed{}
 		}
 		if expiredVersion {
 			// The logical expiry path owns this version. Keeping the source is
@@ -329,20 +342,17 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		// Successful movement is not enough if the destination changed again.
 		// Keep the source unless another copy still preserves its read result.
 		if len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime) {
-			return removed, PreConditionFailed{}
+			return PreConditionFailed{}
 		}
 		_, err = z.serverPools[source].DeleteObject(ctx, bucket, object, ObjectOptions{
 			VersionID: vid, NoLock: true, NoAuditLog: true,
 			SkipFreeVersion: true, // preserve the old prefix cleanup's tier-GC behavior
 		})
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			return removed, err
-		}
-		if err == nil {
-			removed++
+			return err
 		}
 	}
-	return removed, nil
+	return nil
 }
 
 // ilmDeletesVersionOnly reports whether the ILM action queued for a version
