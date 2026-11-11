@@ -809,33 +809,64 @@ func TestObjectTagAndVersionAuthSymmetry(t *testing.T) {
 				t.Fatalf("%s: UploadPartCopy from env=dev status=%d body=%s, want 200", backend, rec.Code, rec.Body.String())
 			}
 
-			// 5. GET / HEAD with X-Amz-Tagging-Directive: ACCESS must NOT leak X-Amz-Tagging when GetObjectTagging is denied!
-			noTagReadPolicy := fmt.Sprintf(`{
-				"Version": "2012-10-17",
-				"Statement": [{
-					"Effect": "Allow",
-					"Action": ["s3:GetObject", "s3:GetObjectVersion"],
-					"Resource": ["arn:aws:s3:::%s/*"]
-				}]
-			}`, bucket)
-			userNoTag := createTestPolicyUser(t, noTagReadPolicy)
-			for _, method := range []string{http.MethodGet, http.MethodHead} {
-				req, err := newTestSignedRequestV4(method, "/"+bucket+"/src-obj?versionId="+v1.VersionID, 0, nil, userNoTag.AccessKey, userNoTag.SecretKey, map[string]string{
-					xhttp.AmzTagDirective: "ACCESS",
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-				rec = httptest.NewRecorder()
-				router.ServeHTTP(rec, req)
-				if rec.Code != http.StatusOK {
-					t.Fatalf("%s: %s status=%d, want 200", backend, method, rec.Code)
-				}
-				if gotTag := rec.Header().Get(xhttp.AmzObjectTagging); gotTag != "" {
-					t.Fatalf("%s: %s leaked X-Amz-Tagging=%q without GetObjectVersionTagging permission", backend, method, gotTag)
-				}
-				if gotCnt := rec.Header().Get(xhttp.AmzTagCount); gotCnt != "" {
-					t.Fatalf("%s: %s leaked X-Amz-Tagging-Count=%q without GetObjectVersionTagging permission", backend, method, gotCnt)
+			// Tag counts require the same permission as values, even without ACCESS.
+			for _, tc := range []struct {
+				name, extra              string
+				currentTags, versionTags bool
+			}{
+				{"implicit-deny", "", false, false},
+				{"allow", `,{"Effect":"Allow","Action":["s3:GetObjectTagging","s3:GetObjectVersionTagging"],"Resource":"arn:aws:s3:::*"}`, true, true},
+				{"explicit-deny", `,{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::*"},{"Effect":"Deny","Action":["s3:GetObjectTagging","s3:GetObjectVersionTagging"],"Resource":"arn:aws:s3:::*"}`, false, false},
+				{"current-only", `,{"Effect":"Allow","Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::*"},{"Effect":"Deny","Action":"s3:GetObjectVersionTagging","Resource":"arn:aws:s3:::*"}`, true, false},
+				{"replicate-tags", `,{"Effect":"Allow","Action":"s3:ReplicateTags","Resource":"arn:aws:s3:::*"}`, true, true},
+			} {
+				creds := createTestPolicyUser(t, fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::%s/*"}%s]}`, bucket, tc.extra))
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					for _, access := range []bool{false, true} {
+						for _, version := range []string{"", v1.VersionID} {
+							t.Run(fmt.Sprintf("%s/headers/%s/%s/access=%t/version=%t", backend, tc.name, method, access, version != ""), func(t *testing.T) {
+								target := "/" + bucket + "/src-obj"
+								wantTags, allowed := "env=dev", tc.currentTags
+								if version != "" {
+									target += "?versionId=" + version
+									wantTags, allowed = "env=prod", tc.versionTags
+								}
+								headers := map[string]string{}
+								if access {
+									headers[xhttp.AmzTagDirective] = "ACCESS"
+								}
+								req, err := newTestSignedRequestV4(method, target, 0, nil, creds.AccessKey, creds.SecretKey, headers)
+								if err != nil {
+									t.Fatal(err)
+								}
+								rec := httptest.NewRecorder()
+								router.ServeHTTP(rec, req)
+								if rec.Code != http.StatusOK {
+									t.Fatalf("status=%d: %s", rec.Code, rec.Body.String())
+								}
+								// Normalize literal handler keys as net/http does on the wire.
+								responseHeaders := http.Header{}
+								for key, values := range rec.Header() {
+									for _, value := range values {
+										responseHeaders.Add(key, value)
+									}
+								}
+								wantCount := ""
+								if allowed {
+									wantCount = "1"
+								}
+								if !allowed || !access {
+									wantTags = ""
+								}
+								if got := responseHeaders.Get(xhttp.AmzTagCount); got != wantCount {
+									t.Errorf("tag count=%q, want %q", got, wantCount)
+								}
+								if got := responseHeaders.Get(xhttp.AmzObjectTagging); got != wantTags {
+									t.Errorf("tag values=%q, want %q", got, wantTags)
+								}
+							})
+						}
+					}
 				}
 			}
 

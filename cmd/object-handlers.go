@@ -587,9 +587,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 		hash.AddChecksumHeader(w, cs)
 	}
 
-	if opts.Tagging && !canReturnObjectTagsHeader(ctx, r, opts.VersionID, objInfo.UserTags) {
-		opts.Tagging = false
-	}
+	opts.TaggingCount = len(objInfo.UserTags) > 0 && canReturnObjectTagsHeader(ctx, r, opts.VersionID, objInfo.UserTags)
 
 	if err = setObjectHeaders(ctx, w, objInfo, rs, opts); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1116,9 +1114,7 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 		hash.AddChecksumHeader(w, cs)
 	}
 
-	if opts.Tagging && !canReturnObjectTagsHeader(ctx, r, opts.VersionID, objInfo.UserTags) {
-		opts.Tagging = false
-	}
+	opts.TaggingCount = len(objInfo.UserTags) > 0 && canReturnObjectTagsHeader(ctx, r, opts.VersionID, objInfo.UserTags)
 
 	// Set standard object headers.
 	if err = setObjectHeaders(ctx, w, objInfo, rs, opts); err != nil {

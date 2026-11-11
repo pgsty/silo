@@ -134,8 +134,8 @@ func setObjectHeaders(ctx context.Context, w http.ResponseWriter, objInfo Object
 		w.Header().Set(xhttp.Expires, objInfo.Expires.UTC().Format(http.TimeFormat))
 	}
 
-	// Set tag count if object has tags
-	if len(objInfo.UserTags) > 0 {
+	// Both the count and the optional values require permission to read tags.
+	if opts.TaggingCount && len(objInfo.UserTags) > 0 {
 		tags, _ := tags.ParseObjectTags(objInfo.UserTags)
 		if tags != nil && tags.Count() > 0 {
 			w.Header()[xhttp.AmzTagCount] = []string{strconv.Itoa(tags.Count())}
