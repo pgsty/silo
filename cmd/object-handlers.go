@@ -1680,14 +1680,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	if dstOpts.Versioned && copySrcOpts.VersionID == "" {
 		copySrcOpts.VersionID = srcInfo.VersionID
 	}
-	if !remoteCallRequired {
-		plan, err := objectAPI.prepareCopyObject(lockCtx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, copySrcOpts, dstOpts)
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-			return
-		}
-		dstOpts.copyPlan = &plan
-	}
 
 	// A key rotation rewraps the object key held in metadata; it never
 	// re-encrypts the stored bytes. When the object layer stores new object
@@ -1704,16 +1696,23 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// Without a requested destination checksum algorithm, an in-place SSE-C
 	// rotation preserves the stored checksum state, including absence; it does
 	// not add the default CRC64NVME.
-	canRotateKeyInPlace := !srcInfo.Legacy &&
+	canRotateKeyInPlace := cpSrcDstSame && sseCopyC && sseC && !chStorageClass && !srcInfo.Legacy &&
 		!copyRewritesObjectData(srcInfo.metadataOnly, copySrcOpts, dstOpts) &&
 		(replicaTrusted || !hash.NewChecksumHeader(r.Header).IsSet())
 
-	// If src == dst and either
-	// - the object is encrypted using SSE-C and two different SSE-C keys are present
-	// - the object is encrypted using SSE-S3 and the SSE-S3 header is present
-	// - the object storage class is not changing
-	// then execute a key rotation.
-	if cpSrcDstSame && (sseCopyC && sseC) && !chStorageClass && canRotateKeyInPlace {
+	if canRotateKeyInPlace {
+		// A new version may need another pool. Resolve that before rewrapping
+		// the key, since a cross-pool copy must re-encrypt the source stream.
+		plan, err := objectAPI.prepareCopyObject(lockCtx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, copySrcOpts, dstOpts)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		dstOpts.copyPlan = &plan
+		canRotateKeyInPlace = !plan.rewrite
+	}
+
+	if canRotateKeyInPlace {
 		oldKey, err = ParseSSECopyCustomerRequest(r.Header, srcInfo.UserDefined)
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1802,6 +1801,20 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 				srcInfo.Reader.AddServerSideChecksumHasher(dstOpts.WantServerSideChecksumType)
 				dstOpts.WantChecksum = nil
 			}
+		}
+
+		if !remoteCallRequired && dstOpts.copyPlan == nil {
+			// Encryption and checksum recomputation require new data. Plan
+			// with that final decision before starting either transform, but
+			// retain metadataOnly for the invalid self-copy check below.
+			planInfo := srcInfo
+			planInfo.metadataOnly = srcInfo.metadataOnly && !dstOpts.WantServerSideChecksumType.IsSet()
+			plan, err := objectAPI.prepareCopyObject(lockCtx, srcBucket, srcObject, dstBucket, dstObject, planInfo, copySrcOpts, dstOpts)
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
+			}
+			dstOpts.copyPlan = &plan
 		}
 
 		if isDstCompressed {

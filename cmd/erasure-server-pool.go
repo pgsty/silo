@@ -1708,10 +1708,13 @@ func (z *erasureServerPools) prepareCopyObject(ctx context.Context, srcBucket, s
 	reference := sameObject && !copyRewritesObjectData(srcInfo.metadataOnly && !srcInfo.Legacy, srcOpts, dstOpts)
 	inPlace := reference && (dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID || !dstOpts.Versioned && srcOpts.VersionID == "")
 	if inPlace {
-		idx, err := z.getPoolIdxExistingWithOpts(ctx, dstBucket, dstObject, ObjectOptions{
-			VersionID: dstOpts.VersionID, MetadataChg: true, NoLock: true,
-			Transition: dstOpts.Transition, SkipDecommissioned: true, SkipRebalancing: true,
-		})
+		// Metadata must stay with the authoritative source bytes, including
+		// when that pool is draining. Write allocation could select a stale
+		// duplicate and later retire the only current copy.
+		sourceOpts := srcOpts
+		sourceOpts.NoLock = true
+		sourceOpts.Transition = dstOpts.Transition
+		_, idx, err := z.getLatestObjectInfoWithIdx(ctx, srcBucket, srcObject, sourceOpts)
 		return copyObjectPlan{poolIdx: idx}, err
 	}
 	idx, err := z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)

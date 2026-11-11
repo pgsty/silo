@@ -108,23 +108,7 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				switch tc.movement {
-				case "decommission":
-					z.poolMetaMutex.Lock()
-					z.poolMeta.Pools[sourcePool].Decommission = &PoolDecommissionInfo{}
-					z.poolMetaMutex.Unlock()
-					defer func() {
-						z.poolMetaMutex.Lock()
-						z.poolMeta.Pools[sourcePool].Decommission = nil
-						z.poolMetaMutex.Unlock()
-					}()
-				case "rebalance":
-					z.rebalMu.Lock()
-					z.rebalMeta = &rebalanceMeta{PoolStats: []*rebalanceStats{{}, {}}}
-					z.rebalMeta.PoolStats[sourcePool] = &rebalanceStats{Participating: true, Info: rebalanceInfo{Status: rebalStarted}}
-					z.rebalMu.Unlock()
-					defer func() { z.rebalMu.Lock(); z.rebalMeta = nil; z.rebalMu.Unlock() }()
-				}
+				setCopyMovingPool(t, z, sourcePool, tc.movement)
 				// Toggle compression so metadata has to describe the bytes written now.
 				restore()
 				restoreTarget := setCopyChecksumCompression(true)
@@ -228,6 +212,176 @@ func TestPoolsCopyExactVersionMetadata(t *testing.T) {
 		}
 		if got := readCopyChecksumObject(t, z, bucket, key, ObjectOptions{VersionID: older.VersionID}); string(got) != "old data" {
 			t.Fatalf("historical body changed: %q", got)
+		}
+	}
+}
+
+func setCopyMovingPool(t *testing.T, z *erasureServerPools, pool int, movement string) {
+	t.Helper()
+	switch movement {
+	case "decommission":
+		z.poolMetaMutex.Lock()
+		z.poolMeta.Pools[pool].Decommission = &PoolDecommissionInfo{}
+		z.poolMetaMutex.Unlock()
+		t.Cleanup(func() {
+			z.poolMetaMutex.Lock()
+			z.poolMeta.Pools[pool].Decommission = nil
+			z.poolMetaMutex.Unlock()
+		})
+	case "rebalance":
+		z.rebalMu.Lock()
+		z.rebalMeta = &rebalanceMeta{PoolStats: []*rebalanceStats{{}, {}}}
+		z.rebalMeta.PoolStats[pool] = &rebalanceStats{Participating: true, Info: rebalanceInfo{Status: rebalStarted}}
+		z.rebalMu.Unlock()
+		t.Cleanup(func() { z.rebalMu.Lock(); z.rebalMeta = nil; z.rebalMu.Unlock() })
+	}
+}
+
+// The content that a metadata-only replica preserves must be the same content
+// that reads selected, even when write allocation would skip its pool.
+func TestCopyReplicaMetadataMovingPool(t *testing.T) {
+	z, _ := consistencyPools(t)
+	bucket, router, err := initAPIHandlerTest(t.Context(), z, nil, MakeBucketOptions{LockEnabled: true})
+	mustIAM(t, err)
+	setObjectLayer(z)
+	_, err = globalBucketMetadataSys.Update(t.Context(), bucket, bucketVersioningConfig, enabledBucketVersioningConfig)
+	mustIAM(t, err)
+	const body = "current-body"
+	for _, api := range []bool{false, true} {
+		for sourcePool := range 2 {
+			for _, movement := range []string{"decommission", "rebalance"} {
+				for _, kind := range []string{"uuid", "null"} {
+					for _, duplicate := range []string{"absent", "older", "tie"} {
+						// The lower pool index wins equal ModTimes, just as on reads.
+						if duplicate == "tie" && sourcePool != 0 {
+							continue
+						}
+						t.Run(fmt.Sprintf("api=%t/source=%d/%s/%s/%s", api, sourcePool, movement, kind, duplicate), func(t *testing.T) {
+							key := fmt.Sprintf("metadata-%t-%d-%s-%s-%s", api, sourcePool, movement, kind, duplicate)
+							oi := putConsistencyObject(t, z, bucket, key, sourcePool, body, ObjectOptions{
+								Versioned: kind == "uuid", MTime: UTCNow().Add(-time.Minute),
+								WantChecksum: hash.NewChecksumFromData(hash.ChecksumCRC32, []byte(body)),
+							})
+							version := oi.VersionID
+							if version == "" {
+								version = nullVersionID
+							}
+							if duplicate != "absent" {
+								stamp := oi.ModTime
+								if duplicate == "older" {
+									stamp = stamp.Add(-time.Hour)
+								}
+								putConsistencyObject(t, z, bucket, key, 1-sourcePool, "stale---body", ObjectOptions{
+									Versioned: kind == "uuid", VersionID: version, MTime: stamp,
+									UserDefined: poolLockMetadata("", "ON", "", objectLockTestStamp1000),
+								})
+							}
+							if got := readCopyChecksumObject(t, z, bucket, key, ObjectOptions{VersionID: version}); string(got) != body {
+								t.Fatalf("fixture: %q", got)
+							}
+							setCopyMovingPool(t, z, sourcePool, movement)
+							if api {
+								headers := map[string]string{
+									xhttp.AmzCopySource:        "/" + bucket + "/" + key + "?versionId=" + version,
+									xhttp.AmzMetadataDirective: "REPLACE", "X-Amz-Meta-Updated": "yes",
+									xhttp.MinIOSourceReplicationRequest: "true", xhttp.AmzBucketReplicationStatus: "REPLICA",
+								}
+								rec := r5Request(t, router, globalActiveCred, http.MethodPut, "/"+bucket+"/"+key+"?versionId="+version, "", headers)
+								if rec.Code != http.StatusOK {
+									t.Fatalf("metadata copy: %d %s", rec.Code, rec.Body.String())
+								}
+								assertCopyChecksumResponse(t, rec, hash.ChecksumCRC32, []byte(body))
+							} else {
+								oi.metadataOnly = true
+								oi.UserDefined["X-Amz-Meta-Updated"] = "yes"
+								_, err = z.CopyObject(t.Context(), bucket, key, bucket, key, oi,
+									ObjectOptions{VersionID: version}, ObjectOptions{Versioned: kind == "uuid", VersionID: version, MTime: oi.ModTime, ReplicaLockReconcile: true})
+								mustIAM(t, err)
+							}
+							if got := readCopyChecksumObject(t, z, bucket, key, ObjectOptions{VersionID: version}); string(got) != body {
+								t.Fatalf("metadata copy replaced content: %q", got)
+							}
+							stored, err := z.serverPools[sourcePool].GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: version})
+							mustIAM(t, err)
+							if stored.UserDefined["X-Amz-Meta-Updated"] != "yes" || !bytes.Equal(stored.Checksum, oi.Checksum) {
+								t.Fatalf("metadata/checksum: %v, %x; want checksum %x", stored.UserDefined, stored.Checksum, oi.Checksum)
+							}
+							if duplicate != "absent" && storedObjectLockState(stored.UserDefined).legalHold != "ON" {
+								t.Fatal("lost protection from the retired copy")
+							}
+							_, err = z.serverPools[1-sourcePool].GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: version})
+							if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+								t.Fatalf("stale copy not retired: %v", err)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestAPICopyRewriteMovingPool(t *testing.T) {
+	z, _ := consistencyPools(t)
+	placed := &copyUploadPool{erasureServerPools: z}
+	bucket, router, err := initAPIHandlerTest(t.Context(), placed, nil, MakeBucketOptions{})
+	mustIAM(t, err)
+	setObjectLayer(placed)
+	previousKMS := GlobalKMS
+	GlobalKMS, err = kms.NewBuiltin("copy-key", bytes.Repeat([]byte{0x33}, 32))
+	mustIAM(t, err)
+	defer func() { GlobalKMS = previousKMS }()
+	for sourcePool := range 2 {
+		for _, movement := range []string{"decommission", "rebalance"} {
+			for _, mode := range []string{"sse-s3", "checksum", "default-checksum", "invalid-self-copy"} {
+				t.Run(fmt.Sprintf("source=%d/%s/%s", sourcePool, movement, mode), func(t *testing.T) {
+					key := fmt.Sprintf("rewrite-%d-%s-%s", sourcePool, movement, mode)
+					data := []byte("rewriting a source on a draining pool")
+					sourceHeaders := map[string]string{}
+					if mode != "default-checksum" {
+						sourceHeaders[xhttp.AmzChecksumCRC32] = mustChecksum(t, hash.ChecksumCRC32, data)
+					}
+					placed.uploadPool = sourcePool
+					putCopyChecksumSource(t, router, globalActiveCred, bucket, key, data, sourceHeaders)
+					setCopyMovingPool(t, z, sourcePool, movement)
+					headers := map[string]string{xhttp.AmzMetadataDirective: "REPLACE"}
+					wantChecksum := hash.ChecksumCRC32
+					switch mode {
+					case "sse-s3":
+						headers[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
+					case "checksum", "invalid-self-copy":
+						headers[xhttp.AmzChecksumAlgo] = "SHA256"
+						wantChecksum = hash.ChecksumSHA256
+						if mode == "invalid-self-copy" {
+							delete(headers, xhttp.AmzMetadataDirective)
+						}
+					case "default-checksum":
+						wantChecksum = hash.ChecksumCRC64NVME
+					}
+					rec := copyChecksumRequest(t, router, globalActiveCred, bucket, key, key, headers)
+					if mode == "invalid-self-copy" {
+						if rec.Code != http.StatusBadRequest {
+							t.Fatalf("invalid self-copy: %d %s", rec.Code, rec.Body.String())
+						}
+						_, err := z.serverPools[1-sourcePool].GetObjectInfo(t.Context(), bucket, key, ObjectOptions{})
+						if !isErrObjectNotFound(err) {
+							t.Fatalf("rejected copy wrote a destination: %v", err)
+						}
+						return
+					}
+					if rec.Code != http.StatusOK {
+						t.Fatalf("rewrite: %d %s", rec.Code, rec.Body.String())
+					}
+					assertCopyChecksumResponse(t, rec, wantChecksum, data)
+					if got := readCopyChecksumObject(t, z, bucket, key, ObjectOptions{}); !bytes.Equal(got, data) {
+						t.Fatalf("rewritten body: %q", got)
+					}
+					if _, err := z.serverPools[1-sourcePool].GetObjectInfo(t.Context(), bucket, key, ObjectOptions{}); err != nil {
+						t.Fatalf("rewrite did not reach active pool: %v", err)
+					}
+					assertCopyChecksum(t, z, bucket, key, wantChecksum, data, false, nil)
+				})
+			}
 		}
 	}
 }
