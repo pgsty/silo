@@ -84,6 +84,11 @@ func TestAPISSEKMSHTTPContext(t *testing.T) {
 					invalid   bool
 				}{
 					{"unicode", `{"区域":"杭州","emoji":"🔑","�":"replacement"}`, false},
+					{"array", `[]`, true},
+					{"invalid-json", `not-json`, true},
+					{"trailing-json", `{"tenant":"ok"} {}`, true},
+					{"number-value", `{"tenant":1}`, true},
+					{"invalid-base64", "", true},
 					{"invalid-key", "{\"\xff\":\"value\"}", true},
 					{"invalid-value", "{\"tenant\":\"\xff\"}", true},
 					{"colliding-keys", "{\"\xff\":\"a\",\"\xfe\":\"b\"}", true},
@@ -98,6 +103,9 @@ func TestAPISSEKMSHTTPContext(t *testing.T) {
 							t.Fatal(err)
 						}
 						headers := encryption(tc.raw)
+						if tc.name == "invalid-base64" {
+							headers[xhttp.AmzServerSideEncryptionKmsContext] = "not-base64!"
+						}
 						wantData := replacement
 						var rec *httptest.ResponseRecorder
 						switch operation {
@@ -155,6 +163,12 @@ func TestAPISSEKMSHTTPContext(t *testing.T) {
 							t.Fatal(err)
 						}
 						if tc.invalid {
+							if operation == "multipart" {
+								uploads, err := obj.ListMultipartUploads(t.Context(), bucket, key, "", "", "", 100)
+								if err != nil || len(uploads.Uploads) != 0 {
+									t.Fatalf("rejected context created multipart upload: %+v, %v", uploads, err)
+								}
+							}
 							if !maps.Equal(before.UserDefined, after.UserDefined) || !before.ModTime.Equal(after.ModTime) {
 								t.Fatal("rejected context changed existing object metadata")
 							}

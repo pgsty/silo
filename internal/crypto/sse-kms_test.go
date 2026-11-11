@@ -38,6 +38,13 @@ func TestKMSParseHTTPContext(t *testing.T) {
 		{name: "empty", raw: `{}`, want: kms.Context{}},
 		{name: "null", raw: `null`},
 		{name: "unicode", raw: `{"区域":"杭州","emoji":"🔑","�":"replacement"}`, want: kms.Context{"区域": "杭州", "emoji": "🔑", "�": "replacement"}},
+		{name: "array", raw: `[]`, invalid: true},
+		{name: "invalid-json", raw: `not-json`, invalid: true},
+		{name: "trailing-json", raw: `{"tenant":"ok"} {}`, invalid: true},
+		{name: "number-value", raw: `{"tenant":1}`, invalid: true},
+		{name: "invalid-base64", invalid: true},
+		{name: "empty-header", invalid: true},
+		{name: "nil-header-values", invalid: true},
 		{name: "invalid-key", raw: "{\"\xff\":\"value\"}", invalid: true},
 		{name: "invalid-value", raw: "{\"tenant\":\"\xff\"}", invalid: true},
 		{name: "colliding-keys", raw: "{\"\xff\":\"a\",\"\xfe\":\"b\"}", invalid: true},
@@ -50,11 +57,19 @@ func TestKMSParseHTTPContext(t *testing.T) {
 			if tc.raw != "" {
 				header.Set(xhttp.AmzServerSideEncryptionKmsContext, base64.StdEncoding.EncodeToString([]byte(tc.raw)))
 			}
+			switch tc.name {
+			case "invalid-base64":
+				header.Set(xhttp.AmzServerSideEncryptionKmsContext, "not-base64!")
+			case "empty-header":
+				header.Set(xhttp.AmzServerSideEncryptionKmsContext, "")
+			case "nil-header-values":
+				header[xhttp.AmzServerSideEncryptionKmsContext] = nil
+			}
 			key, context, err := S3KMS.ParseHTTP(header)
 			if tc.invalid {
 				var apiErr kms.Error
 				if !errors.As(err, &apiErr) || apiErr.Code != http.StatusBadRequest || apiErr.APICode != "InvalidArgument" {
-					t.Fatalf("invalid UTF-8: got %v, want 400 InvalidArgument", err)
+					t.Fatalf("invalid context: got %v, want 400 InvalidArgument", err)
 				}
 				return
 			}
