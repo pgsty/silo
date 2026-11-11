@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -98,6 +99,11 @@ func batchKeyRotateContext(encoded string) (kms.Context, error) {
 	b, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, err
+	}
+	// Saving the context replaces invalid UTF-8 and can collapse distinct
+	// keys, changing the associated data required to decrypt the object.
+	if !utf8.Valid(b) {
+		return nil, fmt.Errorf("KMS context must be valid UTF-8: %w", errInvalidArgument)
 	}
 	if err = jsoniter.ConfigCompatibleWithStandardLibrary.Unmarshal(b, &ctx); err != nil {
 		return nil, err

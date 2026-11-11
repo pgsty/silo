@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -56,7 +57,7 @@ func TestBatchRotationContextInitialRetryAndReload(t *testing.T) {
 			mustIAM(t, err)
 			original, err := f.obj.PutObject(f.ctx, f.bucket, object, mustGetPutObjReader(t, bytes.NewReader(ciphertext), int64(len(ciphertext)), "", ""), ObjectOptions{Versioned: true, UserDefined: metadata})
 			mustIAM(t, err)
-			contextJSON := `{"tenant":"acme","purpose":"batch-rotation"}`
+			contextJSON := `{"tenant":"acme","purpose":"batch-rotation","区域":"杭州","�":"replacement","emoji":"🔑"}`
 			encoded := base64.StdEncoding.EncodeToString([]byte(contextJSON))
 			rec, job := f.submit(t, globalActiveCred, fmt.Sprintf("keyrotate:\n  apiVersion: v1\n  bucket: %s\n  prefix: rotation/\n  encryption:\n    type: sse-kms\n    key: context-key\n    context: %s\n", f.bucket, encoded))
 			if job == nil {
@@ -91,7 +92,7 @@ func TestBatchRotationContextInitialRetryAndReload(t *testing.T) {
 			mustIAM(t, err)
 			var got kms.Context
 			mustIAM(t, json.Unmarshal(raw, &got))
-			if !maps.Equal(got, kms.Context{"tenant": "acme", "purpose": "batch-rotation"}) {
+			if !maps.Equal(got, kms.Context{"tenant": "acme", "purpose": "batch-rotation", "区域": "杭州", "�": "replacement", "emoji": "🔑"}) {
 				t.Fatalf("stored context %v", got)
 			}
 			actual, err := crypto.S3KMS.UnsealObjectKey(configured, after.UserDefined, f.bucket, object)
@@ -103,5 +104,74 @@ func TestBatchRotationContextInitialRetryAndReload(t *testing.T) {
 				t.Fatal("rotated object is unreadable")
 			}
 		})
+	}
+}
+
+func TestBatchRotationInvalidUTF8LeavesObjectReadable(t *testing.T) {
+	for _, tc := range []struct{ name, raw string }{
+		{"colliding-keys", "{\"\xff\":\"a\",\"\xfe\":\"b\"}"},
+		{"replacement-key", "{\"\xff\":\"a\",\"�\":\"b\"}"},
+		{"invalid-value", "{\"tenant\":\"\xff\"}"},
+	} {
+		for _, phase := range []string{"submit", "reload"} {
+			t.Run(tc.name+"/"+phase, func(t *testing.T) {
+				f := newBatchAuthzFixture(t)
+				previous := GlobalKMS
+				t.Cleanup(func() { GlobalKMS = previous })
+				configured, err := kms.NewBuiltin("context-key", bytes.Repeat([]byte{0x42}, 32))
+				mustIAM(t, err)
+				GlobalKMS = configured
+				const object, payload = "rotation/context", "the original encrypted payload must remain readable"
+				metadata := map[string]string{}
+				key, err := newEncryptMetadata(f.ctx, crypto.S3KMS, "context-key", nil, f.bucket, object, metadata, kms.Context{"tenant": "old"})
+				mustIAM(t, err)
+				ciphertext, err := io.ReadAll(crypto.EncryptSinglePart(strings.NewReader(payload), key))
+				mustIAM(t, err)
+				original, err := f.obj.PutObject(f.ctx, f.bucket, object, mustGetPutObjReader(t, bytes.NewReader(ciphertext), int64(len(ciphertext)), "", ""), ObjectOptions{Versioned: true, UserDefined: metadata})
+				mustIAM(t, err)
+				encoded := base64.StdEncoding.EncodeToString([]byte(tc.raw))
+				submitContext := encoded
+				if phase == "reload" {
+					submitContext = base64.StdEncoding.EncodeToString([]byte(`{"tenant":"safe"}`))
+				}
+				rec, job := f.submit(t, globalActiveCred, fmt.Sprintf("keyrotate:\n  apiVersion: v1\n  bucket: %s\n  prefix: rotation/\n  encryption:\n    type: sse-kms\n    key: context-key\n    context: %s\n", f.bucket, submitContext))
+				if phase == "submit" {
+					if job != nil || rec.Code != http.StatusBadRequest {
+						t.Fatalf("invalid UTF-8 context accepted: %d %s", rec.Code, rec.Body.String())
+					}
+				} else {
+					if job == nil {
+						t.Fatalf("valid submit: %d %s", rec.Code, rec.Body.String())
+					}
+					// Simulate a manifest saved by a version which accepted these
+					// bytes. Execution must validate again before changing the key.
+					job.KeyRotate.Encryption.Context = encoded
+					job.KeyRotate.Flags.Retry.Attempts = 1
+					manifest, err := job.MarshalMsg([]byte(batchJobEnvelope))
+					mustIAM(t, err)
+					mustIAM(t, saveConfig(f.ctx, f.obj, getJobPath(*job), manifest))
+					loaded := &BatchJobRequest{}
+					mustIAM(t, loaded.load(f.ctx, f.obj, getJobPath(*job)))
+					mustIAM(t, loaded.KeyRotate.Start(f.ctx, f.obj, *loaded))
+					progress := f.jobInfo(t, loaded)
+					if progress.Complete || !progress.Failed || progress.Objects != 0 || progress.ObjectsFailed != 1 {
+						t.Fatalf("invalid context reported as success: %+v", progress)
+					}
+				}
+				after, err := f.obj.GetObjectInfo(f.ctx, f.bucket, object, ObjectOptions{VersionID: original.VersionID})
+				mustIAM(t, err)
+				if after.UserDefined[crypto.MetaContext] != metadata[crypto.MetaContext] {
+					t.Fatal("rejected rotation changed stored context")
+				}
+				actual, err := crypto.S3KMS.UnsealObjectKey(configured, after.UserDefined, f.bucket, object)
+				mustIAM(t, err)
+				if actual != key {
+					t.Fatal("rejected rotation changed data key")
+				}
+				if got := readCopyChecksumObject(t, f.obj, f.bucket, object, ObjectOptions{VersionID: original.VersionID}); string(got) != payload {
+					t.Fatal("rejected rotation damaged stored content")
+				}
+			})
+		}
 	}
 }
