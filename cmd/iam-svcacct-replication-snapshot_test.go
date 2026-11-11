@@ -528,3 +528,51 @@ func TestSiteReplicationHookReadsStorageUnlocked(t *testing.T) {
 		t.Errorf("the site sent %d items for the account, want the create and the edit", len(got))
 	}
 }
+
+// Healing must release its own configuration lock before calling the hook.
+// Otherwise a waiting configuration writer blocks the hook's next read lock.
+func TestSiteReplicationHealReadsStorageUnlocked(t *testing.T) {
+	const key = "heal-unlocked"
+	site := newSvcAccSite(t)
+	site.create(t, key)
+	stored := svcAccStored(t, site.groupRefreshFixture, key)
+	local := madmin.UserInfo{Status: madmin.AccountEnabled, UpdatedAt: stored.UpdatedAt}
+	remote := madmin.UserInfo{Status: madmin.AccountDisabled, UpdatedAt: stored.UpdatedAt.Add(-time.Minute)}
+	info := srStatusInfo{Sites: globalSiteReplicationSys.state.Peers, UserStats: map[string]map[string]srUserStatsSummary{key: {
+		globalDeploymentID(): {userInfo: srUserInfo{UserInfo: local}},
+		"remote":             {SRUserStatsSummary: madmin.SRUserStatsSummary{UserInfoMismatch: true}, userInfo: srUserInfo{UserInfo: remote}},
+	}}}
+	paused := &svcAccPausedStore{IAMStorageAPI: site.sys.store.IAMStorageAPI, loading: make(chan struct{}), proceed: make(chan struct{})}
+	site.sys.store.IAMStorageAPI = paused
+	release := sync.OnceFunc(func() { close(paused.proceed) })
+	defer release()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- globalSiteReplicationSys.healUsers(site.ctx, site.obj, key, info)
+	}()
+	select {
+	case <-paused.loading:
+	case err := <-done:
+		t.Fatalf("heal did not read the account from storage (err=%v)", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("heal did not reach the storage read")
+	}
+	// Testing the writer lock without waiting keeps a regression from leaving
+	// deadlocked goroutines behind in the test process.
+	if globalSiteReplicationSys.TryLock() {
+		globalSiteReplicationSys.Unlock() //nolint:staticcheck // only the lock is of interest
+	} else {
+		t.Error("heal holds the replication configuration lock during a storage read")
+	}
+	release()
+	select {
+	case err := <-done:
+		mustIAM(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("heal did not return")
+	}
+	if got := site.items(key); len(got) != 2 {
+		t.Errorf("the site sent %d items, want the create and the healed snapshot", len(got))
+	}
+}

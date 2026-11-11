@@ -5227,9 +5227,7 @@ func (c *SiteReplicationSys) healPolicies(ctx context.Context, objAPI ObjectLaye
 	// create IAM policy on peer cluster if missing
 	ps := info.PolicyStats[policy]
 
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	if !c.isEnabled() {
 		return nil
 	}
 
@@ -5285,9 +5283,7 @@ func (c *SiteReplicationSys) healUserPolicies(ctx context.Context, objAPI Object
 	// create user policy mapping on peer cluster if missing
 	us := info.UserStats[user]
 
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	if !c.isEnabled() {
 		return nil
 	}
 	var (
@@ -5347,9 +5343,7 @@ func (c *SiteReplicationSys) healGroupPolicies(ctx context.Context, objAPI Objec
 	// create group policy mapping on peer cluster if missing
 	gs := info.GroupStats[group]
 
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	if !c.isEnabled() {
 		return nil
 	}
 
@@ -5413,9 +5407,7 @@ func (c *SiteReplicationSys) healUsers(ctx context.Context, objAPI ObjectLayer, 
 	// create user if missing; fix user policy mapping if missing
 	us := info.UserStats[user]
 
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	if !c.isEnabled() {
 		return nil
 	}
 	var (
@@ -5531,9 +5523,7 @@ func (c *SiteReplicationSys) healUsers(ctx context.Context, objAPI ObjectLayer, 
 }
 
 func (c *SiteReplicationSys) healGroups(ctx context.Context, objAPI ObjectLayer, group string, info srStatusInfo) error {
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	if !c.isEnabled() {
 		return nil
 	}
 
