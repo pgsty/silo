@@ -83,43 +83,62 @@ const (
 
 // BatchJobKeyRotateEncryption defines key rotation encryption options passed
 type BatchJobKeyRotateEncryption struct {
-	Type       BatchKeyRotationType `yaml:"type" json:"type"`
-	Key        string               `yaml:"key" json:"key"`
-	Context    string               `yaml:"context" json:"context"`
-	kmsContext kms.Context          `msg:"-"`
+	Type    BatchKeyRotationType `yaml:"type" json:"type"`
+	Key     string               `yaml:"key" json:"key"`
+	Context string               `yaml:"context" json:"context"`
+}
+
+// batchKeyRotateContext decodes the persisted configuration on every run. It
+// must not depend on unpersisted derived state or mutate shared job options.
+func batchKeyRotateContext(encoded string) (kms.Context, error) {
+	ctx := kms.Context{}
+	if encoded == "" {
+		return ctx, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	if err = jsoniter.ConfigCompatibleWithStandardLibrary.Unmarshal(b, &ctx); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = kms.Context{}
+	}
+	return ctx, nil
 }
 
 // Validate validates input key rotation encryption options.
 func (e BatchJobKeyRotateEncryption) Validate() error {
+	_, err := e.validate()
+	return err
+}
+
+// validate also returns a fresh context for the actual rotation. Validation's
+// probe entry is added to a separate map, never to the object's context.
+func (e BatchJobKeyRotateEncryption) validate() (kms.Context, error) {
 	if e.Type != sses3 && e.Type != ssekms {
-		return errInvalidArgument
+		return nil, errInvalidArgument
 	}
 	spaces := strings.HasPrefix(e.Key, " ") || strings.HasSuffix(e.Key, " ")
 	if e.Type == ssekms && spaces {
-		return crypto.ErrInvalidEncryptionKeyID
+		return nil, crypto.ErrInvalidEncryptionKeyID
 	}
-
-	if e.Type == ssekms && GlobalKMS != nil {
-		ctx := kms.Context{}
-		if e.Context != "" {
-			b, err := base64.StdEncoding.DecodeString(e.Context)
-			if err != nil {
-				return err
-			}
-
-			json := jsoniter.ConfigCompatibleWithStandardLibrary
-			if err := json.Unmarshal(b, &ctx); err != nil {
-				return err
-			}
-		}
-		e.kmsContext = kms.Context{}
-		maps.Copy(e.kmsContext, ctx)
-		ctx["MinIO batch API"] = "batchrotate" // Context for a test key operation
-		if _, err := GlobalKMS.GenerateKey(GlobalContext, &kms.GenerateKeyRequest{Name: e.Key, AssociatedData: ctx}); err != nil {
-			return err
+	if e.Type != ssekms {
+		return nil, nil
+	}
+	ctx, err := batchKeyRotateContext(e.Context)
+	if err != nil {
+		return nil, err
+	}
+	if GlobalKMS != nil {
+		probe := maps.Clone(ctx)
+		probe["MinIO batch API"] = "batchrotate" // Context for a test key operation
+		if _, err := GlobalKMS.GenerateKey(GlobalContext, &kms.GenerateKeyRequest{Name: e.Key, AssociatedData: probe}); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return ctx, nil
 }
 
 // BatchKeyRotateFilter holds all the filters currently supported for batch replication
@@ -296,11 +315,11 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	}
 
 	if (sseKMS || sseS3) && r.Encryption.Type == ssekms {
-		if err = r.Encryption.Validate(); err != nil {
+		newKeyContext, err = r.Encryption.validate()
+		if err != nil {
 			return err
 		}
 		newKeyID = strings.TrimPrefix(r.Encryption.Key, crypto.ARNPrefix)
-		newKeyContext = r.Encryption.kmsContext
 	}
 	if err = rotateKey(ctx, []byte{}, newKeyID, []byte{}, r.Bucket, oi.Name, encMetadata, newKeyContext); err != nil {
 		return err
