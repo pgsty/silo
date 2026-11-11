@@ -96,5 +96,4 @@ func TestGetObjectAttributesReadQuorumLost(t *testing.T) {
 	check("read quorum lost", "withList", withList, object, http.StatusServiceUnavailable)
 	check("read quorum lost", "tagged", tagged, object, http.StatusServiceUnavailable)
 	check("read quorum lost", "unauthorized", unauthorized, object, http.StatusForbidden)
-
 }
