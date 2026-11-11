@@ -257,6 +257,27 @@ func TestDecommissionConcurrentParentDeleteRescansChildren(t *testing.T) {
 	}
 }
 
+func TestDecommissionDegradedPoolRescansChildren(t *testing.T) {
+	z, bucket := migrationTestPools(t)
+	putConsistencyObject(t, z, bucket, "k", 0, "parent", ObjectOptions{})
+	putConsistencyObject(t, z, bucket, "k/b", 0, "child", ObjectOptions{})
+	var wrapped int
+	t.Cleanup(conditionalPutSwapDisks(z.serverPools[0], "k", func(d StorageAPI) StorageAPI {
+		wrapped++
+		if wrapped == 1 {
+			return nil
+		}
+		return d
+	}))
+	if failed := migrationTestWalk(t, z, bucket, 0, "decommission"); failed != 0 {
+		t.Fatalf("failed moves: %d", failed)
+	}
+	mustIAM(t, z.checkAfterDecomBucket(t.Context(), 0, decomBucketInfo{Name: bucket}))
+	if body := migrationTestBody(t, z.GetObjectNInfo, bucket, "k/b", ""); body != "child" {
+		t.Fatalf("child reads %q", body)
+	}
+}
+
 func TestFreeVersionDecommissionRescansChildren(t *testing.T) {
 	f := newFreeVersionTest(t, "")
 	f.bucket = "free-parent"
@@ -407,6 +428,50 @@ func TestPoolsMigrationPhysicalProgress(t *testing.T) {
 	}
 }
 
+func TestCountAbsentMigrationVersionsToleratesConfiguredOfflineDrives(t *testing.T) {
+	makeDisks := func(offlineCount int, asError bool) []StorageAPI {
+		disks := make([]StorageAPI, 4)
+		for i := range disks {
+			disks[i] = migrationProgressRawDisk{err: errFileNotFound, reads: &atomic.Int32{}}
+		}
+		for i := range offlineCount {
+			if asError {
+				disks[i] = migrationProgressRawDisk{err: errDiskNotFound, reads: &atomic.Int32{}}
+			} else {
+				disks[i] = nil
+			}
+		}
+		return disks
+	}
+	snapshot := []FileInfo{{VersionID: mustGetUUID()}}
+	for _, tc := range []struct {
+		name      string
+		offline   int
+		parity    int
+		asError   bool
+		wantCount int
+		wantErr   bool
+	}{
+		{name: "nil-drive-within-parity", offline: 1, parity: 1, wantCount: 1},
+		{name: "read-error-within-parity", offline: 1, parity: 1, asError: true, wantCount: 1},
+		{name: "half-offline-within-parity", offline: 2, parity: 2, wantCount: 1},
+		{name: "offline-beyond-parity", offline: 2, parity: 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			disks := makeDisks(tc.offline, tc.asError)
+			er := erasureObjects{
+				setDriveCount:      len(disks),
+				defaultParityCount: tc.parity,
+				getDisks:           func() []StorageAPI { return disks },
+			}
+			got, err := er.countAbsentMigrationVersions(t.Context(), "bucket", "object", snapshot)
+			if got != tc.wantCount || (err != nil) != tc.wantErr {
+				t.Fatalf("removed=%d err=%v, want %d / error=%t", got, err, tc.wantCount, tc.wantErr)
+			}
+		})
+	}
+}
+
 // A successful quorum deletion can leave one source drive behind. It must not
 // count as physical removal or pass the final check, nor cause a retry loop.
 func TestDecommissionQuorumDeletionIsNotPhysicalProgress(t *testing.T) {
@@ -472,12 +537,20 @@ func TestDecommissionFinalVerificationFailsClosed(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			z, bucket := migrationTestPools(t)
 			switch state {
-			case "offline-drive", "directory-error":
+			case "offline-drive":
+				set := z.serverPools[0].getHashedSet("k")
+				maxOffline := set.defaultParityCount + 1
+				wrapped := 0
 				t.Cleanup(conditionalPutSwapDisks(z.serverPools[0], "k", func(d StorageAPI) StorageAPI {
-					if state == "directory-error" {
-						return migrationProgressListFaultDisk{StorageAPI: d}
+					wrapped++
+					if wrapped <= maxOffline {
+						return nil
 					}
-					return nil
+					return d
+				}))
+			case "directory-error":
+				t.Cleanup(conditionalPutSwapDisks(z.serverPools[0], "k", func(d StorageAPI) StorageAPI {
+					return migrationProgressListFaultDisk{StorageAPI: d}
 				}))
 			default:
 				// Real metadata on only one drive, without a readable quorum.

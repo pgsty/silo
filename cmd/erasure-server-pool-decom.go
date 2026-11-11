@@ -777,7 +777,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 }
 
 // decommissionPoolWalk walks bucket bi of pool idx once and returns the number
-// of snapshot versions verified absent from every source drive afterwards.
+// of snapshot versions verified absent from every online source drive afterwards.
 func (z *erasureServerPools) decommissionPoolWalk(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -1271,7 +1271,7 @@ func (z *erasureServerPools) removeFreeVersions(ctx context.Context, bucket, obj
 	return nil
 }
 
-// checkAfterDecomBucket verifies that a source bucket is physically empty
+// checkAfterDecomBucket verifies that a source bucket's online drives are empty
 // before it is removed from the resumable decommission queue. ILM decisions
 // are deliberately not treated as an exemption: an expired version remains
 // until the expiry path has performed its logical delete, replication, and
@@ -1285,14 +1285,17 @@ func (z *erasureServerPools) checkAfterDecomBucket(ctx context.Context, idx int,
 		if len(disks) == 0 {
 			return toObjectErr(errErasureReadQuorum, bi.Name)
 		}
+		readQuorum := set.migrationReadQuorum(len(disks))
+		onlineCount := 0
 		for _, disk := range disks {
 			if disk == nil {
-				return toObjectErr(errDiskNotFound, bi.Name)
+				continue
 			}
 			// Quorum listings omit minority versions, and WalkDir can skip
 			// unreadable metadata. Inspect physical directory entries instead:
 			// even a corrupt or truncated xl.meta must keep this pool queued.
 			pending := []string{bi.Prefix}
+			diskOffline := false
 			for len(pending) > 0 {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -1305,6 +1308,10 @@ func (z *erasureServerPools) checkAfterDecomBucket(ctx context.Context, idx int,
 				}
 				if errors.Is(err, errFileNotFound) || errors.Is(err, errVolumeNotFound) {
 					continue // A concurrent deletion can remove the directory.
+				}
+				if errors.Is(err, errDiskNotFound) {
+					diskOffline = true
+					break
 				}
 				if err != nil {
 					return err
@@ -1322,6 +1329,13 @@ func (z *erasureServerPools) checkAfterDecomBucket(ctx context.Context, idx int,
 					}
 				}
 			}
+			if diskOffline {
+				continue
+			}
+			onlineCount++
+		}
+		if onlineCount < readQuorum {
+			return toObjectErr(errErasureReadQuorum, bi.Name)
 		}
 	}
 	return ctx.Err()

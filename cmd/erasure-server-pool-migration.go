@@ -32,7 +32,17 @@ func migrationVersionKey(versionID string) string {
 	return versionID
 }
 
-// countAbsentMigrationVersions counts snapshot versions that no source drive
+// migrationReadQuorum requires enough online drives to intersect every
+// committed write quorum. All of those drives must be checked: a minority
+// remnant still prevents progress. Unknown set geometry tolerates no outages.
+func (er erasureObjects) migrationReadQuorum(diskCount int) int {
+	if er.setDriveCount <= 0 || er.setDriveCount != diskCount || er.defaultParityCount < 0 || er.defaultParityCount > er.setDriveCount/2 {
+		return diskCount
+	}
+	return er.defaultRQuorum()
+}
+
+// countAbsentMigrationVersions counts snapshot versions that no online source drive
 // holds anymore, including free versions. A pool-level NotFound is insufficient:
 // the ordinary read path can return it for inconsistent metadata. Only readable
 // per-drive metadata (or physical absence) proves progress for another walk.
@@ -52,20 +62,31 @@ func (er erasureObjects) countAbsentMigrationVersions(ctx context.Context, bucke
 	if len(disks) == 0 {
 		return 0, toObjectErr(errErasureReadQuorum, bucket, object)
 	}
+	readQuorum := er.migrationReadQuorum(len(disks))
+	offline := make([]bool, len(disks))
 	stored := make([][]FileInfo, len(disks))
 	g := errgroup.WithNErrs(len(disks))
 	for i := range disks {
 		g.Go(func() error {
 			if disks[i] == nil {
-				return errDiskNotFound
+				offline[i] = true
+				return nil
 			}
 			raw, err := disks[i].ReadXL(ctx, bucket, object, false)
+			if errors.Is(err, errDiskNotFound) {
+				offline[i] = true
+				return nil
+			}
 			if errors.Is(err, errFileNotFound) {
 				// ReadXL also returns NotFound for an empty xl.meta, and may
 				// ignore legacy metadata. Confirm physical absence before using
 				// that result as progress. This does not descend into child keys.
 				// Both reads run in parallel across drives, once per object.
 				entries, err := disks[i].ListDir(ctx, "", bucket, object, -1)
+				if errors.Is(err, errDiskNotFound) {
+					offline[i] = true
+					return nil
+				}
 				if err != nil && !errors.Is(err, errFileNotFound) && !errors.Is(err, errVolumeNotFound) {
 					return err
 				}
@@ -100,6 +121,15 @@ func (er erasureObjects) countAbsentMigrationVersions(ctx context.Context, bucke
 		for _, version := range stored[i] {
 			delete(absent, migrationVersionKey(version.VersionID))
 		}
+	}
+	offlineCount := 0
+	for _, unavailable := range offline {
+		if unavailable {
+			offlineCount++
+		}
+	}
+	if len(disks)-offlineCount < readQuorum {
+		return 0, toObjectErr(errErasureReadQuorum, bucket, object)
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
