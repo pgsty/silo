@@ -43,7 +43,10 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousKMS, previousTLS := GlobalKMS, globalIsTLS
-	GlobalKMS = kms.NewStub("copy-key")
+	GlobalKMS, err = kms.NewBuiltin("copy-key", bytes.Repeat([]byte{0x33}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
 	globalIsTLS = true
 	defer func() { GlobalKMS, globalIsTLS = previousKMS, previousTLS }()
 	customer := func(value byte) map[string]string {
@@ -51,9 +54,18 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 		sum := md5.Sum(key)
 		return map[string]string{xhttp.AmzServerSideEncryptionCustomerAlgorithm: xhttp.AmzEncryptionAES, xhttp.AmzServerSideEncryptionCustomerKey: base64.StdEncoding.EncodeToString(key), xhttp.AmzServerSideEncryptionCustomerKeyMD5: base64.StdEncoding.EncodeToString(sum[:])}
 	}
-	for _, mode := range []string{"plain", "compressed", "sse-s3", "sse-c"} {
+	for _, tc := range []struct{ mode, movement string }{
+		{"plain", "active"},
+		{"compressed", "active"},
+		{"sse-s3", "active"},
+		{"sse-c", "active"},
+		{"sse-kms", "active"},
+		{"sse-c", "decommission"},
+		{"sse-kms", "rebalance"},
+	} {
+		mode := tc.mode
 		for _, sourcePool := range []int{0, 1} {
-			t.Run(fmt.Sprintf("%s/source=%d", mode, sourcePool), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/%s/source=%d", mode, tc.movement, sourcePool), func(t *testing.T) {
 				compressed := mode == "compressed"
 				restore := setCopyChecksumCompression(true)
 				globalCompressConfigMu.Lock()
@@ -64,12 +76,17 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				if mode == "sse-s3" {
 					sourceHeaders[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
 				}
+				if mode == "sse-kms" {
+					sourceHeaders[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+					sourceHeaders[xhttp.AmzServerSideEncryptionKmsID] = "copy-key"
+					sourceHeaders[xhttp.AmzServerSideEncryptionKmsContext] = base64.StdEncoding.EncodeToString([]byte(`{"tenant":"source"}`))
+				}
 				if mode == "sse-c" {
 					maps.Copy(sourceHeaders, customer(0x11))
 				}
 				data := bytes.Repeat([]byte("historical encrypted compressed content-"), 8192)
 				sourceHeaders[xhttp.AmzChecksumCRC32] = mustChecksum(t, hash.ChecksumCRC32, data)
-				key := fmt.Sprintf("copy-%s-%d.txt", mode, sourcePool)
+				key := fmt.Sprintf("copy-%s-%s-%d.txt", mode, tc.movement, sourcePool)
 				placed.uploadPool = sourcePool
 				putCopyChecksumSource(t, router, globalActiveCred, bucket, key, data, sourceHeaders)
 				original, err := z.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{})
@@ -91,6 +108,23 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				switch tc.movement {
+				case "decommission":
+					z.poolMetaMutex.Lock()
+					z.poolMeta.Pools[sourcePool].Decommission = &PoolDecommissionInfo{}
+					z.poolMetaMutex.Unlock()
+					defer func() {
+						z.poolMetaMutex.Lock()
+						z.poolMeta.Pools[sourcePool].Decommission = nil
+						z.poolMetaMutex.Unlock()
+					}()
+				case "rebalance":
+					z.rebalMu.Lock()
+					z.rebalMeta = &rebalanceMeta{PoolStats: []*rebalanceStats{{}, {}}}
+					z.rebalMeta.PoolStats[sourcePool] = &rebalanceStats{Participating: true, Info: rebalanceInfo{Status: rebalStarted}}
+					z.rebalMu.Unlock()
+					defer func() { z.rebalMu.Lock(); z.rebalMeta = nil; z.rebalMu.Unlock() }()
+				}
 				// Toggle compression so metadata has to describe the bytes written now.
 				restore()
 				restoreTarget := setCopyChecksumCompression(true)
@@ -102,6 +136,11 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				getHeaders := map[string]string{}
 				if mode == "sse-s3" {
 					headers[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
+				}
+				if mode == "sse-kms" {
+					headers[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+					headers[xhttp.AmzServerSideEncryptionKmsID] = "copy-key"
+					headers[xhttp.AmzServerSideEncryptionKmsContext] = base64.StdEncoding.EncodeToString([]byte(`{"tenant":"destination"}`))
 				}
 				if mode == "sse-c" {
 					maps.Copy(headers, customer(0x22))
@@ -121,6 +160,10 @@ func TestAPICopyHistoricalVersionAcrossPools(t *testing.T) {
 				}
 				if copied.IsCompressed() != (!compressed && mode != "sse-c") {
 					t.Fatalf("copy did not use destination compression setting: %v", copied.IsCompressed())
+				}
+				if mode == "sse-kms" {
+					assertFederationKMSContext(t, copied, headers[xhttp.AmzServerSideEncryptionKmsContext])
+					assertFederationKMSContext(t, original, sourceHeaders[xhttp.AmzServerSideEncryptionKmsContext])
 				}
 				if _, err = z.serverPools[1-sourcePool].GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: copied.VersionID}); err != nil {
 					t.Fatalf("copy was not placed with destination: %v", err)
