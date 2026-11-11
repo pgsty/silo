@@ -126,9 +126,8 @@ func latestBucketConfig(bucket, file string, info srStatusInfo) (bucketConfigSta
 }
 
 func (c *SiteReplicationSys) healBucketConfig(ctx context.Context, bucket, file string, info srStatusInfo) error {
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	state, ok := c.stateSnapshot()
+	if !ok {
 		return nil
 	}
 	latest, found := latestBucketConfig(bucket, file, info)
@@ -177,7 +176,7 @@ func (c *SiteReplicationSys) healBucketConfig(ctx context.Context, bucket, file 
 			_, err = globalBucketMetadataSys.updateAndParseMetadata(ctx, bucket, file, latest.data, false, false, &latest.at)
 		} else {
 			var client *madmin.AdminClient
-			client, err = c.getAdminClient(ctx, id)
+			client, err = state.getAdminClient(id)
 			if err == nil {
 				err = client.SRPeerReplicateBucketMeta(ctx, newBucketConfigReplicationEvent(bucket, file, incoming))
 			}

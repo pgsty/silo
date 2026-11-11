@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -195,4 +196,324 @@ func TestSiteReplicationMetaInfoCachedPeerState(t *testing.T) {
 	if got.State.Name != "" || got.State.Peers != nil {
 		t.Fatal("returned cached peer state that was not requested")
 	}
+}
+
+type siteBucketDeletePausedLayer struct {
+	ObjectLayer
+	once             sync.Once
+	deleting, resume chan struct{}
+}
+
+func (l *siteBucketDeletePausedLayer) DeleteBucket(ctx context.Context, bucket string, opts DeleteBucketOptions) error {
+	l.once.Do(func() { close(l.deleting); <-l.resume })
+	return l.ObjectLayer.DeleteBucket(ctx, bucket, opts)
+}
+
+func TestSiteReplicationHealAndHooksReleaseLock(t *testing.T) {
+	cases := []string{
+		"make-bucket-hook",
+		"delete-bucket-hook",
+		"bucket-meta-hook",
+		"iam-change-hook",
+		"configure-repl",
+		"peer-bucket-delete",
+		"heal-bucket-make",
+		"heal-bucket-delete",
+		"heal-bucket-repl-config",
+		"heal-bucket-config",
+		"heal-cors",
+		"heal-ilm-expiry-config",
+		"heal-bucket-ilm-expiry",
+	}
+	for _, tc := range cases {
+		t.Run(tc, func(t *testing.T) {
+			site := newSvcAccSite(t)
+			c := &globalSiteReplicationSys
+			const bucket = "sr-lock-test-bucket"
+			mustIAM(t, site.obj.MakeBucket(site.ctx, bucket, MakeBucketOptions{VersioningEnabled: true}))
+			_, err := globalBucketMetadataSys.Update(site.ctx, bucket, bucketVersioningConfig, enabledBucketVersioningConfig)
+			mustIAM(t, err)
+
+			entered, proceed := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			pause := func() {
+				once.Do(func() { close(entered) })
+				<-proceed
+			}
+			release := sync.OnceFunc(func() { close(proceed) })
+			defer release()
+
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				pause()
+				if strings.HasSuffix(r.URL.Path, iamRevisionPeerPath) {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(iamRevisionResponse{
+						iamRevisionStatus: iamRevisionStatus{Version: iamRevisionProtocol, Node: "node", Instance: "boot", Digest: "fixture"},
+					})
+					return
+				}
+				if r.Method == http.MethodGet {
+					if _, ok := r.URL.Query()["versioning"]; ok {
+						w.Header().Set("Content-Type", "application/xml")
+						_, _ = w.Write([]byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`))
+						return
+					}
+					if _, ok := r.URL.Query()["location"]; ok {
+						w.Header().Set("Content-Type", "application/xml")
+						_, _ = w.Write([]byte(`<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+						return
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer peer.Close()
+
+			pausedObj := &siteBucketDeletePausedLayer{
+				ObjectLayer: site.obj,
+				deleting:    entered,
+				resume:      proceed,
+			}
+			if tc == "peer-bucket-delete" || tc == "heal-bucket-delete" {
+				setObjectLayer(pausedObj)
+				defer setObjectLayer(site.obj)
+			}
+
+			local := globalDeploymentID()
+			now := UTCNow().Truncate(time.Second)
+			peers := site.peers(peer.URL)
+			for id, p := range peers {
+				p.ReplicateILMExpiry = true
+				peers[id] = p
+			}
+			c.Lock()
+			c.enabled = true
+			c.state = srState{
+				Name:                    "local",
+				ServiceAccountAccessKey: site.parent.AccessKey,
+				Peers:                   peers,
+				UpdatedAt:               now,
+			}
+			c.Unlock()
+
+			done := make(chan error, 1)
+			go func() {
+				switch tc {
+				case "make-bucket-hook":
+					done <- c.MakeBucketHook(site.ctx, bucket, MakeBucketOptions{CreatedAt: now})
+				case "delete-bucket-hook":
+					done <- c.DeleteBucketHook(site.ctx, bucket, true)
+				case "bucket-meta-hook":
+					done <- c.BucketMetaHook(site.ctx, madmin.SRBucketMeta{
+						Type:      madmin.SRBucketMetaTypeTags,
+						Bucket:    bucket,
+						UpdatedAt: now,
+					})
+				case "iam-change-hook":
+					site.create(t, "sr-lock-hook-sa")
+					done <- c.IAMChangeHook(site.ctx, madmin.SRIAMItem{
+						Type:         madmin.SRIAMItemSvcAcc,
+						SvcAccChange: &madmin.SRSvcAccChange{Create: &madmin.SRSvcAccCreate{AccessKey: "sr-lock-hook-sa"}},
+						UpdatedAt:    now,
+					})
+				case "configure-repl":
+					done <- c.PeerBucketConfigureReplHandler(site.ctx, bucket)
+				case "peer-bucket-delete":
+					done <- c.PeerBucketDeleteHandler(site.ctx, bucket, DeleteBucketOptions{Force: true})
+				case "heal-bucket-make":
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						BucketStats: map[string]map[string]srBucketStatsSummary{
+							bucket: {
+								local:    {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now}}},
+								"remote": {HasBucket: false},
+							},
+						},
+					}
+					done <- c.healBucket(site.ctx, site.obj, bucket, info)
+				case "heal-bucket-delete":
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						BucketStats: map[string]map[string]srBucketStatsSummary{
+							bucket: {
+								local:    {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute), DeletedAt: now}}},
+								"remote": {HasBucket: false, BucketMarkedDeleted: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{DeletedAt: now.Add(-2 * time.Minute)}}},
+							},
+						},
+					}
+					done <- c.healBucket(site.ctx, pausedObj, bucket, info)
+				case "heal-bucket-repl-config":
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						BucketStats: map[string]map[string]srBucketStatsSummary{
+							bucket: {
+								local: {HasBucket: true, ReplicationCfgMismatch: true},
+							},
+						},
+					}
+					done <- c.healBucketReplicationConfig(site.ctx, site.obj, bucket, info, &validateReplicationDestinationOptions{CheckReady: true})
+				case "heal-bucket-config":
+					tagPayload := base64.StdEncoding.EncodeToString([]byte(`<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>`))
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						BucketStats: map[string]map[string]srBucketStatsSummary{
+							bucket: {
+								local:    {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute), Tags: &tagPayload, TagConfigUpdatedAt: now}}},
+								"remote": {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute)}}},
+							},
+						},
+					}
+					done <- c.healBucketConfig(site.ctx, bucket, bucketTaggingConfig, info)
+				case "heal-cors":
+					corsPayload := base64.StdEncoding.EncodeToString([]byte(`<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`))
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						BucketStats: map[string]map[string]srBucketStatsSummary{
+							bucket: {
+								local:    {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute), CorsConfig: &corsPayload, CorsConfigUpdatedAt: now}}},
+								"remote": {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute)}}},
+							},
+						},
+					}
+					done <- c.healCORSMetadata(site.ctx, site.obj, bucket, info)
+				case "heal-ilm-expiry-config":
+					stalePeers := site.peers(peer.URL)
+					for id, p := range stalePeers {
+						p.ReplicateILMExpiry = false
+						stalePeers[id] = p
+					}
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						PeerStates: map[string]madmin.SRStateInfo{
+							local:    {Name: "local", Peers: peers, UpdatedAt: now},
+							"remote": {Name: "remote", Peers: stalePeers, UpdatedAt: now.Add(-time.Minute)},
+						},
+					}
+					done <- c.healILMExpiryConfig(site.ctx, site.obj, info)
+				case "heal-bucket-ilm-expiry":
+					lcXML := `<LifecycleConfiguration><Rule><ID>exp</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`
+					lcPayload := base64.StdEncoding.EncodeToString([]byte(lcXML))
+					info := srStatusInfo{
+						Sites: site.peers(peer.URL),
+						BucketStats: map[string]map[string]srBucketStatsSummary{
+							bucket: {
+								local:    {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute), ExpiryLCConfig: &lcPayload, ExpiryLCConfigUpdatedAt: now}}},
+								"remote": {HasBucket: true, meta: srBucketMetaInfo{SRBucketInfo: madmin.SRBucketInfo{CreatedAt: now.Add(-time.Minute)}}},
+							},
+						},
+					}
+					done <- c.healBucketILMExpiry(site.ctx, site.obj, bucket, info)
+				}
+			}()
+
+			select {
+			case <-entered:
+			case err := <-done:
+				t.Fatalf("operation returned before reaching storage/peer pause point: %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for storage/peer pause point")
+			}
+
+			if c.TryLock() {
+				c.state.Name = "mutated-while-in-flight"
+				delete(c.state.Peers, "remote")
+				c.state.UpdatedAt = now.Add(time.Second)
+				c.Unlock()
+			} else {
+				t.Error("SiteReplicationSys lock held across storage I/O or peer RPC")
+			}
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("operation deadlocked after writer mutation")
+			}
+		})
+	}
+}
+
+func TestSiteReplicationConcurrentStateUpdates(t *testing.T) {
+	site := newSvcAccSite(t)
+	c := &globalSiteReplicationSys
+	const bucket = "sr-concurrent-state-bucket"
+	mustIAM(t, site.obj.MakeBucket(site.ctx, bucket, MakeBucketOptions{VersioningEnabled: true}))
+	_, err := globalBucketMetadataSys.Update(site.ctx, bucket, bucketVersioningConfig, enabledBucketVersioningConfig)
+	mustIAM(t, err)
+
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "metainfo") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(madmin.SRInfo{DeploymentID: "remote"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			if _, ok := r.URL.Query()["versioning"]; ok {
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`))
+				return
+			}
+			if _, ok := r.URL.Query()["location"]; ok {
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(`<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>`))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peer.Close()
+
+	basePeers := site.peers(peer.URL)
+	now := UTCNow().Truncate(time.Second)
+	c.Lock()
+	c.enabled = true
+	c.state = srState{
+		Name:                    "local",
+		ServiceAccountAccessKey: site.parent.AccessKey,
+		Peers:                   maps.Clone(basePeers),
+		UpdatedAt:               now,
+	}
+	c.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		for i := range 10 {
+			_ = c.PeerEditReq(site.ctx, madmin.PeerInfo{
+				DeploymentID:       "remote",
+				Name:               "remote",
+				Endpoint:           peer.URL,
+				ReplicateILMExpiry: i%2 == 0,
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := range 10 {
+			peers := site.peers(peer.URL)
+			p := peers["remote"]
+			p.ReplicateILMExpiry = i%2 == 1
+			peers["remote"] = p
+			_ = c.PeerStateEditReq(site.ctx, madmin.SRStateEditReq{
+				Peers:     peers,
+				UpdatedAt: now.Add(time.Duration(i+1) * time.Second),
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 10 {
+			_ = c.PeerBucketConfigureReplHandler(site.ctx, bucket)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 5 {
+			_ = c.healBuckets(site.ctx, site.obj)
+		}
+	}()
+	wg.Wait()
 }

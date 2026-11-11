@@ -676,9 +676,8 @@ func (c *SiteReplicationSys) healIAMDeletions(ctx context.Context) (err error) {
 	}()
 	c.iamHealMu.Lock()
 	defer c.iamHealMu.Unlock()
-	c.RLock()
-	defer c.RUnlock()
-	if !c.enabled {
+	state, ok := c.stateSnapshot()
+	if !ok {
 		return nil
 	}
 	snapshot := globalIAMSys.store.revisionIndex().snapshot()
@@ -719,17 +718,17 @@ func (c *SiteReplicationSys) healIAMDeletions(ctx context.Context) (err error) {
 		c.iamRevisionProgress = make(map[string]iamRevisionProgress)
 	}
 	for id := range c.iamRevisionProgress {
-		if _, present := c.state.Peers[id]; !present {
+		if _, present := state.Peers[id]; !present {
 			delete(c.iamRevisionProgress, id)
 		}
 	}
 	var progressMu sync.Mutex
-	cerr := c.state.concDo(nil, func(id string, p madmin.PeerInfo) error {
+	cerr := state.concDo(nil, func(id string, p madmin.PeerInfo) error {
 		// Bound each pass, but retain acknowledgements independently of the
 		// pass deadline or unrelated changes at either site.
 		peerCtx, cancel := context.WithTimeout(ctx, defaultContextTimeout)
 		defer cancel()
-		client, err := c.getAdminClient(peerCtx, id)
+		client, err := state.getAdminClient(id)
 		if err != nil {
 			return err
 		}
