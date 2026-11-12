@@ -8,6 +8,11 @@ replace github.com/minio/console => github.com/pgsty/silo-console v0.0.0-2026111
 
 replace github.com/minio/mc => github.com/pgsty/mc v0.0.0-20261111180825-a37a9f054fba
 
+// v22.7.0 does not compile on NetBSD because its unix implementation uses
+// CLOCK_MONOTONIC, which is unavailable there. Keep the last portable release
+// until go-systemd ships the upstream fix.
+replace github.com/coreos/go-systemd/v22 => github.com/coreos/go-systemd/v22 v22.6.0
+
 // Install tools using 'go install tool'.
 tool (
 	github.com/tinylib/msgp
