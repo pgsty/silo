@@ -608,6 +608,13 @@ func (s *TestSuiteIAM) TestSTSWithTags(c *check) {
 	// Validate sts creds can access the object
 	c.mustPutObjectWithTags(ctx, minioClient, bucket, object)
 	c.mustGetObject(ctx, minioClient, bucket, object)
+	// An object-tag condition does not grant permission to read the tags.
+	c.mustHeadObject(ctx, minioClient, bucket, object, 0)
+	tagReadPolicyBytes := bytes.Replace(policyBytes, []byte(`"s3:GetObject"`),
+		[]byte(`["s3:GetObject", "s3:GetObjectTagging"]`), 1)
+	if err = s.adm.AddCannedPolicy(ctx, policy, tagReadPolicyBytes); err != nil {
+		c.Fatalf("unable to grant conditional tag read permission: %v", err)
+	}
 	c.mustHeadObject(ctx, minioClient, bucket, object, 2)
 
 	// Validate that the client can remove objects
