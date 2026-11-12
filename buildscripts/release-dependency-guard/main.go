@@ -50,8 +50,8 @@ func validate(modules map[string]module, consoleVersion, mcTag, mcCommit string)
 	if _, err := selected(modules["github.com/minio/console"], "github.com/pgsty/silo-console"); err != nil {
 		return err
 	}
-	if !atLeast("v"+consoleVersion, "v2.7.1") {
-		return fmt.Errorf("embedded Console %s lacks the policy fixes; need 2.7.1 or newer", consoleVersion)
+	if !atLeast("v"+consoleVersion, "v2.7.2") {
+		return fmt.Errorf("embedded Console %s lacks the v2.7.2 release; need 2.7.2 or newer", consoleVersion)
 	}
 	mc, err := selected(modules["github.com/minio/mc"], "github.com/pgsty/mc")
 	if err != nil {

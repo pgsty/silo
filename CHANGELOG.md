@@ -5,7 +5,7 @@
 Package version: `20261112000000.0.0`. Publication status and artifacts are
 listed in [GitHub Releases](https://github.com/pgsty/silo/releases). This
 section covers the changes after the published 20261109 source `d998292387cc`,
-adopting Go `1.27.4`, `silo-pkg v3.16.1`, embedded Console `v2.7.1`, and
+adopting Go `1.27.4`, `silo-pkg v3.16.1`, embedded Console `v2.7.2`, and
 bundled `mcli 20261112`. See the
 [server compatibility notes](https://silo.pgsty.com/compatibility/server/)
 for behavior and upgrade boundaries.
@@ -139,7 +139,7 @@ for behavior and upgrade boundaries.
   the matching `admin accesskey` and `idp ldap/openid accesskey` commands, and
   any other `update-service-account` request without `newPolicy` removed the
   inline policy on the receiving site and on site-replication peers for
-  non-root parent users. In the matching Console (`v2.7.1`), turn off **Restrict
+  non-root parent users. In the matching Console (`v2.7.2`), turn off **Restrict
   beyond user policy** or enter `{}` to remove an inline policy; clearing the
   editor while restriction is enabled prevents saving, save errors render inside
   the edit modal, and HTTP-to-HTTPS browser redirects preserve the request host

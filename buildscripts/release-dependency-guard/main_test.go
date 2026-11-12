@@ -11,14 +11,14 @@ func TestReleaseDependencySelection(t *testing.T) {
 		name, pkg, console, tag, mcSHA string
 		local, upstream, wantError     bool
 	}{
-		{name: "coordinated", pkg: "v3.16.1", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit},
-		{name: "old-package", pkg: "v3.16.0", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, wantError: true},
-		{name: "prerelease-package", pkg: "v3.16.1-rc.1", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, wantError: true},
-		{name: "old-embedded-console", pkg: "v3.16.1", console: "2.7.0", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, wantError: true},
-		{name: "old-container-client", pkg: "v3.16.1", console: "2.7.1", tag: "RELEASE.2026-11-09T00-00-00Z", mcSHA: commit, wantError: true},
-		{name: "source-binary-mismatch", pkg: "v3.16.1", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: "ffffffffffffffffffffffffffffffffffffffff", wantError: true},
-		{name: "workspace-console", pkg: "v3.16.1", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, local: true, wantError: true},
-		{name: "upstream-console", pkg: "v3.16.1", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, upstream: true, wantError: true},
+		{name: "coordinated", pkg: "v3.16.1", console: "2.7.2", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit},
+		{name: "old-package", pkg: "v3.16.0", console: "2.7.2", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, wantError: true},
+		{name: "prerelease-package", pkg: "v3.16.1-rc.1", console: "2.7.2", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, wantError: true},
+		{name: "old-embedded-console", pkg: "v3.16.1", console: "2.7.1", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, wantError: true},
+		{name: "old-container-client", pkg: "v3.16.1", console: "2.7.2", tag: "RELEASE.2026-11-09T00-00-00Z", mcSHA: commit, wantError: true},
+		{name: "source-binary-mismatch", pkg: "v3.16.1", console: "2.7.2", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: "ffffffffffffffffffffffffffffffffffffffff", wantError: true},
+		{name: "workspace-console", pkg: "v3.16.1", console: "2.7.2", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, local: true, wantError: true},
+		{name: "upstream-console", pkg: "v3.16.1", console: "2.7.2", tag: "RELEASE.2026-11-12T00-00-00Z", mcSHA: commit, upstream: true, wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			modules := map[string]module{
