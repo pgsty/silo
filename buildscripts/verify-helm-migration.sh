@@ -120,6 +120,10 @@ if [ -z "${app_version}" ] || [ "${image_tag}" != "${app_version}" ]; then
 	echo "helm/silo: image.tag '${image_tag}' must equal appVersion '${app_version}'" >&2
 	exit 1
 fi
+if [ -n "${RELEASE_TAG:-}" ] && [ "${image_tag}" != "${RELEASE_TAG}" ]; then
+	echo "helm/silo: image.tag '${image_tag}' must equal RELEASE_TAG '${RELEASE_TAG}'" >&2
+	exit 1
+fi
 
 helm_run package "${new_chart}" --destination "${output_dir}" >/dev/null
 test -s "${work_dir}/silo-${chart_version}.tgz"
