@@ -159,6 +159,11 @@ func setObjectHeaders(ctx context.Context, w http.ResponseWriter, objInfo Object
 			continue
 		}
 
+		// Tag count and tag values are gated above by opts.TaggingCount / opts.Tagging.
+		if equals(k, xhttp.AmzTagCount, xhttp.AmzObjectTagging) {
+			continue
+		}
+
 		// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
 		if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
 			continue

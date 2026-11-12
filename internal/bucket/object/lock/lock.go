@@ -466,29 +466,34 @@ func ParseObjectLockRetentionHeaders(h http.Header, allowPastRetainDate bool) (r
 	return rmode, RetentionDate{retDate}, nil
 }
 
+func lookupMetaFold(meta map[string]string, key string) (string, bool) {
+	if v, ok := meta[strings.ToLower(key)]; ok {
+		return v, true
+	}
+	if v, ok := meta[key]; ok {
+		return v, true
+	}
+	for k, v := range meta {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 // GetObjectRetentionMeta constructs ObjectRetention from metadata
 func GetObjectRetentionMeta(meta map[string]string) ObjectRetention {
 	var mode RetMode
 	var retainTill RetentionDate
 
-	var modeStr, tillStr string
-	ok := false
-
-	modeStr, ok = meta[strings.ToLower(AmzObjectLockMode)]
-	if !ok {
-		modeStr, ok = meta[AmzObjectLockMode]
-	}
+	modeStr, ok := lookupMetaFold(meta, AmzObjectLockMode)
 	if ok {
 		mode = parseRetMode(modeStr)
 	} else {
 		return ObjectRetention{}
 	}
 
-	tillStr, ok = meta[strings.ToLower(AmzObjectLockRetainUntilDate)]
-	if !ok {
-		tillStr, ok = meta[AmzObjectLockRetainUntilDate]
-	}
-	if ok {
+	if tillStr, ok := lookupMetaFold(meta, AmzObjectLockRetainUntilDate); ok {
 		if t, e := amztime.ISO8601Parse(tillStr); e == nil {
 			retainTill = RetentionDate{t.UTC()}
 		}
@@ -498,11 +503,7 @@ func GetObjectRetentionMeta(meta map[string]string) ObjectRetention {
 
 // GetObjectLegalHoldMeta constructs ObjectLegalHold from metadata
 func GetObjectLegalHoldMeta(meta map[string]string) ObjectLegalHold {
-	holdStr, ok := meta[strings.ToLower(AmzObjectLockLegalHold)]
-	if !ok {
-		holdStr, ok = meta[AmzObjectLockLegalHold]
-	}
-	if ok {
+	if holdStr, ok := lookupMetaFold(meta, AmzObjectLockLegalHold); ok {
 		return ObjectLegalHold{XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/", Status: parseLegalHoldStatus(holdStr)}
 	}
 	return ObjectLegalHold{}
@@ -592,16 +593,17 @@ func FilterObjectLockMetadata(metadata map[string]string, filterRetention, filte
 	dst := metadata
 	var copied bool
 	delKey := func(key string) {
-		key = strings.ToLower(key)
-		if _, ok := metadata[key]; !ok {
-			return
+		for k := range metadata {
+			if !strings.EqualFold(k, key) {
+				continue
+			}
+			if !copied {
+				dst = make(map[string]string, len(metadata))
+				maps.Copy(dst, metadata)
+				copied = true
+			}
+			delete(dst, k)
 		}
-		if !copied {
-			dst = make(map[string]string, len(metadata))
-			maps.Copy(dst, metadata)
-			copied = true
-		}
-		delete(dst, key)
 	}
 	legalHold := GetObjectLegalHoldMeta(metadata)
 	if !legalHold.Status.Valid() || filterLegalHold {

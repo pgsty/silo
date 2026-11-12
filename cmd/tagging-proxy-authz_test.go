@@ -178,3 +178,149 @@ func TestAPITaggingProxyAuthorization(t *testing.T) {
 		}
 	}})
 }
+
+func headerValuesFold(h http.Header, name string) []string {
+	var out []string
+	for k, vals := range h {
+		if strings.EqualFold(k, name) {
+			out = append(out, vals...)
+		}
+	}
+	return out
+}
+
+func TestAPIProxyGetHeadTagCountAndLockHeaders(t *testing.T) {
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: func(obj ObjectLayer, backend, bucket string, router http.Handler, root auth.Credentials, t *testing.T) {
+		explicitDenyTagAndLock := newDeleteAuthzPolicyUser(t, backend, bucket, fmt.Sprintf(`[
+			{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":["arn:aws:s3:::%s/*"]},
+			{"Effect":"Deny","Action":["s3:GetObjectTagging","s3:GetObjectVersionTagging","s3:GetObjectRetention","s3:GetObjectLegalHold"],"Resource":["arn:aws:s3:::%s/*"]}
+		]`, bucket, bucket))
+		readOnlyNoTagNoLock := newDeleteAuthzPolicyUser(t, backend, bucket, fmt.Sprintf(`[
+			{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":["arn:aws:s3:::%s/*"]}
+		]`, bucket))
+
+		globalBucketTargetSys.Lock()
+		globalBucketTargetSys.targetsMap[bucket] = nil
+		globalBucketTargetSys.Unlock()
+
+		const payload = "remote-active-active-body"
+		const etag = "d41d8cd98f00b204e9800998ecf8427e"
+
+		target := newILMTestTarget(t)
+		registerILMTestTarget(t, obj, bucket, target, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("ETag", `"`+etag+`"`)
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+			w.Header().Set("Last-Modified", "Wed, 12 Nov 2026 00:00:00 GMT")
+			w.Header()[xhttp.AmzTagCount] = []string{"2"}
+			if strings.EqualFold(r.Header.Get(xhttp.AmzTagDirective), accessDirective) {
+				w.Header()[xhttp.AmzObjectTagging] = []string{"secret=alpha&tier=gold"}
+			}
+			w.Header().Set(xhttp.AmzObjectLockMode, "GOVERNANCE")
+			w.Header().Set(xhttp.AmzObjectLockRetainUntilDate, "2026-12-31T00:00:00Z")
+			w.Header().Set(xhttp.AmzObjectLockLegalHold, "ON")
+			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodGet {
+				_, _ = w.Write([]byte(payload))
+			}
+		})
+
+		globalBucketTargetSys.Lock()
+		globalBucketTargetSys.targetsMap[bucket][0].Credentials = &madmin.Credentials{
+			AccessKey: "repl-svc",
+			SecretKey: "repl-svc-secret",
+		}
+		globalBucketTargetSys.Unlock()
+
+		rule := configs[0].Rules[0]
+		rule.Priority = 1
+		rule.Destination = replication.Destination{ARN: target.arn, Bucket: target.bucket}
+		cfg := replication.Config{Rules: []replication.Rule{rule}}
+
+		meta, err := globalBucketMetadataSys.Get(bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta.replicationConfig = &cfg
+		globalBucketMetadataSys.Set(bucket, meta)
+
+		for _, method := range []string{http.MethodHead, http.MethodGet} {
+			for _, tc := range []struct {
+				name string
+				cred auth.Credentials
+			}{
+				{name: "explicit-deny-tag-and-lock", cred: explicitDenyTagAndLock},
+				{name: "implicit-no-tag-or-lock", cred: readOnlyNoTagNoLock},
+			} {
+				t.Run(backend+"/"+method+"/"+tc.name, func(t *testing.T) {
+					req, err := newTestSignedRequestV4(method, "/"+bucket+"/remote-only.txt", 0, nil, tc.cred.AccessKey, tc.cred.SecretKey, map[string]string{xhttp.AmzTagDirective: accessDirective})
+					if err != nil {
+						t.Fatal(err)
+					}
+					rec := httptest.NewRecorder()
+					router.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Fatalf("status=%d, want 200: %s", rec.Code, rec.Body.String())
+					}
+					wire := rec.Result().Header
+					for _, hdr := range []string{
+						"X-Amz-Tagging-Count",
+						"X-Amz-Tagging",
+						"X-Amz-Object-Lock-Mode",
+						"X-Amz-Object-Lock-Retain-Until-Date",
+						"X-Amz-Object-Lock-Legal-Hold",
+					} {
+						if got := headerValuesFold(wire, hdr); len(got) != 0 {
+							t.Errorf("unauthorized caller leaked %s=%v (raw=%v)", hdr, got, rec.Header())
+						}
+					}
+				})
+			}
+
+			t.Run(backend+"/"+method+"/authorized-single-tag-count-and-lock-preserved", func(t *testing.T) {
+				req, err := newTestSignedRequestV4(method, "/"+bucket+"/remote-only.txt", 0, nil, root.AccessKey, root.SecretKey, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status=%d, want 200: %s", rec.Code, rec.Body.String())
+				}
+				wire := rec.Result().Header
+				if got := headerValuesFold(wire, "X-Amz-Tagging-Count"); len(got) != 1 || got[0] != "2" {
+					t.Errorf("authorized X-Amz-Tagging-Count=%v, want single [2] (raw=%v)", got, rec.Header())
+				}
+				if got := headerValuesFold(wire, "X-Amz-Tagging"); len(got) != 0 {
+					t.Errorf("unexpected X-Amz-Tagging without ACCESS directive: %v", got)
+				}
+				if got := wire.Get("X-Amz-Object-Lock-Mode"); got != "GOVERNANCE" {
+					t.Errorf("authorized X-Amz-Object-Lock-Mode=%q, want GOVERNANCE", got)
+				}
+				if got := wire.Get("X-Amz-Object-Lock-Retain-Until-Date"); got != "2026-12-31T00:00:00Z" {
+					t.Errorf("authorized X-Amz-Object-Lock-Retain-Until-Date=%q, want 2026-12-31T00:00:00Z", got)
+				}
+				if got := wire.Get("X-Amz-Object-Lock-Legal-Hold"); got != "ON" {
+					t.Errorf("authorized X-Amz-Object-Lock-Legal-Hold=%q, want ON", got)
+				}
+
+				reqAccess, err := newTestSignedRequestV4(method, "/"+bucket+"/remote-only.txt", 0, nil, root.AccessKey, root.SecretKey, map[string]string{xhttp.AmzTagDirective: accessDirective})
+				if err != nil {
+					t.Fatal(err)
+				}
+				recAccess := httptest.NewRecorder()
+				router.ServeHTTP(recAccess, reqAccess)
+				if recAccess.Code != http.StatusOK {
+					t.Fatalf("ACCESS status=%d, want 200: %s", recAccess.Code, recAccess.Body.String())
+				}
+				wireAccess := recAccess.Result().Header
+				if got := headerValuesFold(wireAccess, "X-Amz-Tagging-Count"); len(got) != 1 || got[0] != "2" {
+					t.Errorf("ACCESS X-Amz-Tagging-Count=%v, want single [2]", got)
+				}
+				if got := headerValuesFold(wireAccess, "X-Amz-Tagging"); len(got) != 1 || got[0] != "secret=alpha&tier=gold" {
+					t.Errorf("ACCESS X-Amz-Tagging=%v, want [secret=alpha&tier=gold]", got)
+				}
+			})
+		}
+	}})
+}

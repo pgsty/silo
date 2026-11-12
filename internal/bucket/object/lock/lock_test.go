@@ -608,6 +608,28 @@ func TestFilterObjectLockMetadata(t *testing.T) {
 				"x-amz-object-lock-retain-until-date": "2020-02-01",
 			},
 		},
+		{
+			metadata: map[string]string{
+				"X-Amz-Object-Lock-Legal-Hold":        "ON",
+				"X-Amz-Object-Lock-Mode":              "GOVERNANCE",
+				"X-Amz-Object-Lock-Retain-Until-Date": "2026-12-31T00:00:00Z",
+			},
+			expected:        map[string]string{},
+			filterRetention: true,
+			filterLegalHold: true,
+		},
+		{
+			metadata: map[string]string{
+				"X-Amz-Object-Lock-Legal-Hold":        "ON",
+				"X-Amz-Object-Lock-Mode":              "GOVERNANCE",
+				"X-Amz-Object-Lock-Retain-Until-Date": "2026-12-31T00:00:00Z",
+			},
+			expected: map[string]string{
+				"X-Amz-Object-Lock-Legal-Hold":        "ON",
+				"X-Amz-Object-Lock-Mode":              "GOVERNANCE",
+				"X-Amz-Object-Lock-Retain-Until-Date": "2026-12-31T00:00:00Z",
+			},
+		},
 	}
 
 	for i, tt := range tests {

@@ -2711,6 +2711,9 @@ func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRa
 		}
 		oi.UserDefined = make(map[string]string, len(objInfo.Metadata))
 		for k, v := range objInfo.Metadata {
+			if equals(k, xhttp.AmzTagCount, xhttp.AmzObjectTagging) {
+				continue
+			}
 			oi.UserDefined[k] = v[0]
 		}
 		ce, ok := oi.UserDefined[xhttp.ContentEncoding]
