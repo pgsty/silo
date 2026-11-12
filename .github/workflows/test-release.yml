@@ -104,6 +104,10 @@ jobs:
           args: check --config .github/goreleaser.yml
 
       - name: Validate Helm chart and legacy upgrade identity
+        env:
+          # Compute test variables sets a synthetic GoReleaser fixture tag;
+          # real tag equality is enforced in release.yml.
+          RELEASE_TAG: ""
         run: buildscripts/verify-helm-migration.sh
 
       - name: Install Syft
