@@ -44,10 +44,10 @@
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo 控制台">
 </p>
 
-### SILO 20261109
+### SILO 20261112
 
 > [!WARNING]
-> [SILO 20261109](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z)（包版本 `20261109000000.0.0`，源码 `d998292387cc`）修复了多池生命周期、原生恢复、Object Lock、批处理授权与 IAM 等缺陷，内嵌 Console `v2.7.0` 并配套 `mcli 20261109`、`silo-pkg v3.16.0` 与 Go `1.27.3`。升级前请阅读[发布说明与升级要求](https://silo.pgsty.com/zh/blog/release/silo-20261109/)。
+> [SILO 20261112](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-12T00-00-00Z)（包版本 `20261112000000.0.0`，源码 `44e848fedf8c`）修复了 S3 批量删除路径校验与对象锁边界、服务账号内联策略保留与 IAM 导入状态、双活标签代理鉴权、无签名尾标流重放窗口、`GetObjectAttributes` 与 ZIP 归档标签鉴权、压缩加密区间读取、生命周期旧头部修订匹配以及存储池多轮退役等缺陷，内嵌 Console `v2.7.2` 并配套 `mcli 20261112`、`silo-pkg v3.16.1` 与 Go `1.27.4`。升级前请阅读[发布说明与升级要求](https://silo.pgsty.com/zh/blog/release/silo-20261112/)。
 
 > [!NOTE]
 > 2026-08-06，`pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 改为 `main`。最后一个 MinIO 品牌发布是 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支上的 [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z)。
@@ -59,7 +59,7 @@ docker run -d --name silo -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=change-me-long-password \
   -v "$PWD/data:/data" \
-  docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z server /data --console-address ":9001"
+  docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z server /data --console-address ":9001"
 ```
 
 <p align="center">
@@ -98,7 +98,7 @@ Silo 保留 S3 与存储格式兼容性，包括既有 `MINIO_*` 环境变量、
 
 ### TLS 与 Go 升级
 
-Server 20260916 恢复了 Go 默认密钥交换策略，Server 20261109 在 Go 1.27.3 下保留该行为。S3 监听端口、节点间连接、站点与桶复制、身份提供方、etcd 及外部 HTTP 服务均使用 Go 默认 TLS 密钥交换。若对端无法接受 ML-KEM，设置 `GODEBUG=tlsmlkem=0` 可在当前进程禁用默认混合密钥交换（证书校验保持开启）；该选项不会禁用 ML-DSA 签名，也不能解决所有 TLS 连接重置问题，建议在升级不兼容对端后移除该临时配置。若仅新增的 SecP 混合组引发问题，可设置 `GODEBUG=tlssecpmlkem=0` 仅禁用这些组并保留 `X25519MLKEM768`。
+Server 20260916 恢复了 Go 默认密钥交换策略，Server 20261112 在 Go 1.27.4 下保留该行为。S3 监听端口、节点间连接、站点与桶复制、身份提供方、etcd 及外部 HTTP 服务均使用 Go 默认 TLS 密钥交换。若对端无法接受 ML-KEM，设置 `GODEBUG=tlsmlkem=0` 可在当前进程禁用默认混合密钥交换（证书校验保持开启）；该选项不会禁用 ML-DSA 签名，也不能解决所有 TLS 连接重置问题，建议在升级不兼容对端后移除该临时配置。若仅新增的 SecP 混合组引发问题，可设置 `GODEBUG=tlssecpmlkem=0` 仅禁用这些组并保留 `X25519MLKEM768`。
 
 在 Go 1.27 构建中，macOS 上设置 `SSL_CERT_FILE` 或 `SSL_CERT_DIR` 会以磁盘根证书和 Go 验证器替代系统钥匙串信任；陈旧或不完整的 CA 路径可能导致原先受信任的连接失败，清除继承的环境变量即可恢复钥匙串信任。配置的 `CAs` 目录中的显式证书仍会叠加加入所选根证书池。Go 1.27 二进制要求 macOS 13 或更高版本。详见 [Go 1.27 发行说明](https://go.dev/doc/go1.27)与 [Go 1.27 TLS 与 OIDC 发现指南](https://silo.pgsty.com/zh/blog/design/go127-tls-oidc-discovery/)。
 

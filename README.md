@@ -44,10 +44,10 @@ It follows one rule: **the product and its delivery surfaces are renamed; the pr
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo Console">
 </p>
 
-### SILO 20261109
+### SILO 20261112
 
 > [!WARNING]
-> [SILO 20261109](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z) (`20261109000000.0.0`, source `d998292387cc`) fixes storage, lifecycle, native restore, Object Lock, batch authorization, and IAM defects, embedding Console `v2.7.0` with `mcli 20261109`, `silo-pkg v3.16.0`, and Go `1.27.3`. Review the [release notes and upgrade requirements](https://silo.pgsty.com/blog/release/silo-20261109/) before upgrading.
+> [SILO 20261112](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-12T00-00-00Z) (`20261112000000.0.0`, source `44e848fedf8c`) fixes S3 bulk-delete path validation and Object Lock boundaries, service-account inline-policy preservation and IAM import status, active-active tagging proxy authorization, streaming trailer replay windows, `GetObjectAttributes` and ZIP archive tag authorization, compressed encrypted range reads, lifecycle old-header revision matching, and multi-pass pool decommissioning, embedding Console `v2.7.2` with `mcli 20261112`, `silo-pkg v3.16.1`, and Go `1.27.4`. Review the [release notes and upgrade requirements](https://silo.pgsty.com/blog/release/silo-20261112/) before upgrading.
 
 > [!NOTE]
 > On 2026-08-06, `pgsty/minio` became `pgsty/silo`, and the default branch changed from `master` to `main`. The last MinIO-branded release is [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) on the [`minio`](https://github.com/pgsty/silo/tree/minio) branch.
@@ -59,7 +59,7 @@ docker run -d --name silo -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=change-me-long-password \
   -v "$PWD/data:/data" \
-  docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z server /data --console-address ":9001"
+  docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z server /data --console-address ":9001"
 ```
 
 <p align="center">
@@ -98,7 +98,7 @@ Every divergence from upstream is listed in the code-verified [compatibility aud
 
 ### TLS and Go upgrades
 
-Server 20260916 restored Go's default key exchange; Server 20261109 retains it with Go 1.27.3.
+Server 20260916 restored Go's default key exchange; Server 20261112 retains it with Go 1.27.4.
 TLS key exchange follows Go's defaults across the S3 listener, node links,
 replication, identity providers, etcd, and external HTTP services. If an endpoint
 cannot accept ML-KEM, `GODEBUG=tlsmlkem=0` disables the default hybrid exchanges
