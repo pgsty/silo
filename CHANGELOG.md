@@ -31,8 +31,12 @@ for behavior and upgrade boundaries.
   present replica, including its stored tags, fail closed on unreadable targets,
   and skip missing replicas caused by replication lag unless all targets are
   absent; active-active `GET` and `HEAD` proxies enforce `s3:ExistingObjectTag`
-  and `s3:versionid` before returning peer responses and forward
-  `X-Amz-Tagging-Directive: ACCESS` on `HEAD`. Authenticated unsigned-trailer
+  and `s3:versionid` before returning peer responses, forward
+  `X-Amz-Tagging-Directive: ACCESS` on `HEAD`, gate proxied
+  `x-amz-tagging-count` and `X-Amz-Tagging` headers on tag-read authorization
+  without emitting duplicate headers, and filter canonical-case peer
+  `X-Amz-Object-Lock-*` headers when `s3:GetObjectRetention` or
+  `s3:GetObjectLegalHold` is denied. Authenticated unsigned-trailer
   uploads enforce the request time window and header signatures, SigV4 header,
   presigned, streaming and POST policy verifiers bind the credential-scope date
   to the signed request timestamp, streaming trailer readers bound trailer memory
@@ -46,12 +50,15 @@ for behavior and upgrade boundaries.
   `SelectObjectContent` evaluate `s3:ExistingObjectTag` and `s3:versionid`
   (preserving retryable `5xx` server errors for callers authorized by tag
   conditions when storage is unreadable, resolving the 20261109 limitation in
+  [#293](https://github.com/pgsty/silo/issues/293) via
   [PR #294](https://github.com/pgsty/silo/pull/294)); `CopyObject` and
   `UploadPartCopy` authorize source `s3:ExistingObjectTag` and `s3:versionid`
-  as well as destination `s3:RequestObjectTag` on copied tags; `X-Amz-Tagging`
-  is returned on `GET`/`HEAD` (`X-Amz-Tagging-Directive: ACCESS`) only when
-  `s3:GetObjectTagging` / `s3:GetObjectVersionTagging` (or `s3:ReplicateTags`)
-  permits; `ListObjectsV2` / `ListObjectVersions` with `metadata=true` evaluate
+  as well as destination `s3:RequestObjectTag` on copied tags; both
+  `x-amz-tagging-count` and `X-Amz-Tagging` (`X-Amz-Tagging-Directive: ACCESS`)
+  are omitted on `GET`/`HEAD` (including versioned reads, STS sessions,
+  presigned/anonymous requests and replication proxies) unless
+  `s3:GetObjectTagging` / `s3:GetObjectVersionTagging` (with no explicit `Deny`)
+  or signed `s3:ReplicateTags` permits; `ListObjectsV2` / `ListObjectVersions` with `metadata=true` evaluate
   current-object and per-version metadata permissions respectively, using stored tags; and `GetObjectAttributes`,
   tagging handlers (`GET`/`PUT`/`DELETE`) and ZIP `GET`/`HEAD`/member listings
   authorize stored tags and version actions without mutating unindexed archives
@@ -71,7 +78,8 @@ for behavior and upgrade boundaries.
   bulk execution.
 - Decommission rescans keys hidden below another key only while source
   versions are actually removed, resolving the 20261109 limitation recorded
-  in [#293](https://github.com/pgsty/silo/issues/293). Decommission and rebalance
+  in [#334](https://github.com/pgsty/silo/issues/334)
+  ([PR #335](https://github.com/pgsty/silo/pull/335)). Decommission and rebalance
   clean up successfully migrated sibling versions after concurrent deletion
   of another version. Source-removal and final empty verification check every
   online drive and tolerate offline drives within the erasure set's read quorum,
@@ -100,14 +108,20 @@ for behavior and upgrade boundaries.
   In-place metadata updates locate the exact requested version and preserve
   authoritative content on moving pools, while copies that require encryption
   or checksum recomputation select an active pool
-  ([#343](https://github.com/pgsty/silo/issues/343)).
+  ([#343](https://github.com/pgsty/silo/issues/343)). Indexed `Range` reads into
+  compressed, server-side encrypted (`SSE-S3`, `SSE-KMS`, `SSE-C`) objects also
+  succeed when the target compressed block starts inside the first 64 KiB
+  encrypted frame (`decryptSkip > 0`), without rewriting stored objects.
 - Batch KMS rotation decodes and validates the configured encryption context
-  (and incoming HTTP SSE-KMS context headers) as strict UTF-8 JSON before
-  changing an object key and without adding validation-probe fields to object
-  metadata, supports `SSE-S3` to `SSE-KMS` key migration and multipart metadata
-  preservation, and rewrites legacy `XLV1` objects onto `XLv2` streams instead
-  of failing in-place metadata updates
-  ([#346](https://github.com/pgsty/silo/issues/346)). Batch variable
+  as strict UTF-8 JSON before changing an object key and without adding
+  validation-probe fields to object metadata, supports `SSE-S3` to `SSE-KMS`
+  key migration and multipart metadata preservation, and rewrites legacy `XLV1`
+  objects onto `XLv2` streams instead of failing in-place metadata updates
+  ([#346](https://github.com/pgsty/silo/issues/346)). Incoming HTTP
+  `X-Amz-Server-Side-Encryption-Context` headers on `PutObject`, `CopyObject`,
+  `CreateMultipartUpload` and browser `POST` uploads reject empty values,
+  malformed Base64/UTF-8/JSON, trailing tokens and non-string/non-`null` member
+  values with `400 InvalidArgument` instead of `500 InternalError`. Batch variable
   preflight follows the pinned policy evaluator's literal and substitution
   rules, including BinaryEquals, while retaining refusal of unavailable
   request context. This does not add AWS special-variable escape semantics
@@ -125,11 +139,15 @@ for behavior and upgrade boundaries.
   the matching `admin accesskey` and `idp ldap/openid accesskey` commands, and
   any other `update-service-account` request without `newPolicy` removed the
   inline policy on the receiving site and on site-replication peers for
-  non-root parent users. In the matching Console, turn off **Restrict beyond
-  user policy** or enter `{}` to remove an inline policy; clearing the editor
-  while restriction is enabled prevents saving. Upgrade every site, then review
-  accounts that `svcacct info` reports with `Policy: implied` and re-apply
-  restrictions where needed.
+  non-root parent users. In the matching Console (`v2.7.1`), turn off **Restrict
+  beyond user policy** or enter `{}` to remove an inline policy; clearing the
+  editor while restriction is enabled prevents saving, save errors render inside
+  the edit modal, and HTTP-to-HTTPS browser redirects preserve the request host
+  or `CONSOLE_SECURE_TLS_HOST` when bound to `--host 0.0.0.0`
+  (`unrolled/secure v1.18.0`). Freeze service-account edits on un-upgraded
+  `20261109` nodes during rollout; after upgrading every site, review accounts
+  that `svcacct info` reports with `Policy: implied` and re-apply restrictions
+  where needed.
 
 - S3 `DeleteObjects` on a single pool stops at an entry whose name fails the
   object name check: the entry returns `XMinioInvalidObjectName` and is not

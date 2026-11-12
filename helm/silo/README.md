@@ -107,6 +107,11 @@ When upgrading an existing Silo release to `RELEASE.2026-11-12T00-00-00Z` (chart
 - `helm upgrade --reuse-values` keeps the previously saved `image.tag` and
   `mcImage.tag`; pass `--set-string image.tag=RELEASE.2026-11-12T00-00-00Z` and
   `--set-string mcImage.tag=RELEASE.2026-11-12T00-00-00Z` explicitly.
+- When upgrading from `20261109`, avoid editing service accounts on un-upgraded
+  pods or peer sites until every node runs `20261112`, drain active batch jobs,
+  and pause pool decommission or concurrent multi-pool writes during rolling pod
+  restarts so lock-ordering and cross-pool `null`-version Object Lock checks
+  apply uniformly.
 - When upgrading from `20261026` or earlier, drain or cancel active batch jobs
   before upgrading; `20261026` cannot resume submitter-bound batch manifests on
   downgrade, single-pool clusters whose erasure sets do not all share the same
