@@ -21,6 +21,9 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/minio/minio/internal/auth"
@@ -100,4 +103,81 @@ func TestAPICompressedEncryptedRange(t *testing.T) {
 			}
 		},
 	})
+}
+
+func TestAPICompressedEncryptedRangeCorruptBlockRejected(t *testing.T) {
+	resetTestGlobals()
+	ctx := GlobalContext
+	obj, fsDir, err := prepareFSWithDisks(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeAll(fsDir)
+	defer obj.Shutdown(ctx)
+
+	bucket, router, err := initAPIHandlerTest(ctx, obj, nil, MakeBucketOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
+	previousKMS, previousTLS := GlobalKMS, globalIsTLS
+	GlobalKMS, err = kms.NewBuiltin("range-key", bytes.Repeat([]byte{0x42}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalIsTLS = true
+	defer func() { GlobalKMS, globalIsTLS = previousKMS, previousTLS }()
+	restore := setCopyChecksumCompression(true)
+	defer restore()
+
+	cred := globalActiveCred
+	payload := bytes.Repeat([]byte("compressible-A"), 1<<20)
+
+	for _, mode := range []string{"compressed", "sse-kms"} {
+		key := "corrupt-" + mode + ".txt"
+		headers := map[string]string{}
+		if mode == "sse-kms" {
+			headers[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+			headers[xhttp.AmzServerSideEncryptionKmsID] = "range-key"
+		}
+		putCopyChecksumSource(t, router, cred, bucket, key, payload, headers)
+
+		rec := attributesPartsSignedRequest(t, router, cred, http.MethodGet, getGetObjectURL("", bucket, key), nil,
+			map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", 1<<20, (1<<20)+999)})
+		if rec.Code != http.StatusPartialContent || !bytes.Equal(rec.Body.Bytes(), payload[1<<20:(1<<20)+1000]) {
+			t.Fatalf("%s pre-corrupt range failed: code=%d", mode, rec.Code)
+		}
+
+		corruptedAny := false
+		_ = filepath.Walk(fsDir, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info.IsDir() || !strings.Contains(path, key) {
+				return nil
+			}
+			raw, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return nil
+			}
+			if strings.HasSuffix(path, "part.1") {
+				raw[len(raw)/2] ^= 0xff
+				_ = os.WriteFile(path, raw, info.Mode())
+				corruptedAny = true
+			} else if strings.HasSuffix(path, xlStorageFormatFile) && len(raw) > 256 {
+				raw[len(raw)-64] ^= 0xff
+				_ = os.WriteFile(path, raw, info.Mode())
+				corruptedAny = true
+			}
+			return nil
+		})
+		if !corruptedAny {
+			t.Fatalf("%s: failed to locate backing storage file to corrupt", mode)
+		}
+
+		recAfter := attributesPartsSignedRequest(t, router, cred, http.MethodGet, getGetObjectURL("", bucket, key), nil,
+			map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", 1<<20, (1<<20)+999)})
+		if recAfter.Code == http.StatusPartialContent && recAfter.Body.Len() == 1000 {
+			t.Fatalf("%s: corrupted range unexpectedly returned 206 with 1000 bytes", mode)
+		}
+	}
 }
