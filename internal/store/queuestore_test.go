@@ -34,6 +34,31 @@ type TestItem struct {
 	Property string `json:"property"`
 }
 
+func TestQueueStoreSetLimit(t *testing.T) {
+	queue := NewQueueStore[TestItem](t.TempDir(), 1, testItemExt)
+	if err := queue.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Put(testItem); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Put(testItem); err != errLimitExceeded {
+		t.Fatalf("expected full queue, got %v", err)
+	}
+	queue.SetLimit(2)
+	if _, err := queue.Put(testItem); err != nil {
+		t.Fatalf("new queue limit was not applied: %v", err)
+	}
+	queue.SetLimit(1)
+	if queue.Len() != 2 {
+		t.Fatal("reducing the limit discarded pending events")
+	}
+	queue.SetLimit(0)
+	if _, err := queue.Put(testItem); err != nil {
+		t.Fatalf("default queue limit was not restored: %v", err)
+	}
+}
+
 var (
 	// TestDir
 	queueDir = filepath.Join(os.TempDir(), "minio_test")
