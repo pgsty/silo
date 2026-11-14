@@ -1371,6 +1371,9 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 	}
 
 	if legacyJSON {
+		if fi.ExpireRestored {
+			return nil // Legacy objects cannot contain a completed transition.
+		}
 		// Delete the meta file, if there are no more versions the
 		// top level parent is automatically removed.
 		return s.deleteFile(volumeDir, pathJoin(volumeDir, path), true, false)
@@ -1998,13 +2001,8 @@ func (s *xlStorage) openFile(filePath string, mode int, skipParent string) (f *o
 	if skipParent == "" {
 		skipParent = s.drivePath
 	}
-	// Create top level directories if they don't exist.
-	// with mode 0777 mkdir honors system umask.
-	if err = mkdirAll(pathutil.Dir(filePath), 0o777, skipParent); err != nil {
-		return nil, osErrToFileErr(err)
-	}
-
-	w, err := OpenFile(filePath, mode, 0o666)
+	// Create top level directories if they don't exist, then open the file.
+	w, err := openFileAll(filePath, mode, false, skipParent)
 	if err != nil {
 		// File path cannot be verified since one of the parents is a file.
 		switch {
@@ -2155,21 +2153,10 @@ func (s *xlStorage) writeAllDirect(ctx context.Context, filePath string, fileSiz
 		skipParent = s.drivePath
 	}
 
-	// Create top level directories if they don't exist.
-	// with mode 0777 mkdir honors system umask.
-	parentFilePath := pathutil.Dir(filePath)
-	if err = mkdirAll(parentFilePath, 0o777, skipParent); err != nil {
-		return osErrToFileErr(err)
-	}
-
 	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect && fileSize > 0
 
-	var w *os.File
-	if odirectEnabled {
-		w, err = OpenFileDirectIO(filePath, flags, 0o666)
-	} else {
-		w, err = OpenFile(filePath, flags, 0o666)
-	}
+	// Create top level directories if they don't exist, then open the file.
+	w, err := openFileAll(filePath, flags, odirectEnabled, skipParent)
 	if err != nil {
 		return osErrToFileErr(err)
 	}
@@ -2508,8 +2495,11 @@ func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, immediate
 	}
 
 	// Delete parent directory obviously not recursively. Errors for
-	// parent directories shouldn't trickle down.
-	s.deleteFile(basePath, pathutil.Dir(pathutil.Clean(deletePath)), false, false)
+	// parent directories shouldn't trickle down. The trailing slash
+	// removes only an empty directory: a concurrent writer can have
+	// replaced the parent with a file, for example the xl.meta of an
+	// object whose name is that parent path, and it must stay.
+	s.deleteFile(basePath, pathutil.Dir(pathutil.Clean(deletePath))+SlashSeparator, false, false)
 
 	return nil
 }
@@ -2890,6 +2880,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			}
 			// if its a partial rename() do not attempt to delete recursively.
 			s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+			// renameAll() creates the object directory before the rename; if the
+			// staged data was already gone, drop it and its parents while empty,
+			// otherwise they outlive the other objects there and are listed as an
+			// empty prefix. The trailing slash removes only an empty directory.
+			s.deleteFile(dstVolumeDir, pathutil.Dir(dstFilePath)+SlashSeparator, false, false)
 			return res, osErrToFileErr(err)
 		}
 		diskHealthCheckOK(ctx, err)
@@ -2925,6 +2920,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		// if its a partial rename() do not attempt to delete recursively.
 		// this can be healed since all parts are available.
 		s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+		// As with the data rename above, renameAll() may have created the
+		// object directory; drop it and its parents while empty. A moved
+		// data directory keeps it, since the trailing slash removes only an
+		// empty directory.
+		s.deleteFile(dstVolumeDir, pathutil.Dir(dstFilePath)+SlashSeparator, false, false)
 		err = osErrToFileErr(err)
 		if errors.Is(err, errFileNotFound) {
 			// The staged xl.meta disappeared between staging and commit.

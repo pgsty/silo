@@ -37,7 +37,8 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
-	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/replication"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
@@ -161,7 +162,7 @@ func (n noncurrentVersionsTask) OpHash() uint64 {
 }
 
 func (j jentry) OpHash() uint64 {
-	return xxh3.HashString(j.TierName + j.ObjName)
+	return xxh3.HashString(j.Bucket + j.Object + j.TierName + j.RemoteObject + j.RemoteVersionID)
 }
 
 func (e expiryTask) OpHash() uint64 {
@@ -353,7 +354,16 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 			case noncurrentVersionsTask:
 				deleteObjectVersions(es.ctx, es.objAPI, v.bucket, v.versions, v.events)
 			case jentry:
-				transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
+				z, ok := es.objAPI.(*erasureServerPools)
+				if !ok {
+					transitionLogIf(es.ctx, errTierOwnershipUnavailable)
+					continue
+				}
+				transitionLogIf(es.ctx, z.deleteTierTuple(es.ctx, v.Bucket, v.Object, tierRemoteTuple{
+					Tier:      v.TierName,
+					Object:    v.RemoteObject,
+					VersionID: v.RemoteVersionID,
+				}))
 			case freeVersionTask:
 				oi := v.ObjectInfo
 				traceFn := globalLifecycleSys.trace(oi)
@@ -369,19 +379,26 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 					}
 					return err
 				}
-				// Remove the remote object
-				err := deleteObjectFromRemoteTier(es.ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
+				z, ok := es.objAPI.(*erasureServerPools)
+				if !ok {
+					transitionLogIf(es.ctx, errTierOwnershipUnavailable)
+					traceFn(ILMFreeVersionDelete, nil, errTierOwnershipUnavailable)
+					continue
+				}
+
+				// Check ownership, remove the remote object, and remove only the
+				// matching free record while the object lock is held.
+				err := z.deleteTierTuple(es.ctx, oi.Bucket, oi.Name, tierRemoteTuple{
+					Tier:      oi.TransitionedObject.Tier,
+					Object:    oi.TransitionedObject.Name,
+					VersionID: oi.TransitionedObject.VersionID,
+				})
 				if ignoreNotFoundErr(err) != nil {
 					transitionLogIf(es.ctx, err)
 					traceFn(ILMFreeVersionDelete, nil, err)
 					continue
 				}
 
-				// Remove this free version
-				_, err = es.objAPI.DeleteObject(es.ctx, oi.Bucket, oi.Name, ObjectOptions{
-					VersionID:        oi.VersionID,
-					InclFreeVersions: true,
-				})
 				if err == nil {
 					auditLogLifecycle(es.ctx, oi, ILMFreeVersionDelete, nil, traceFn)
 				}
@@ -610,8 +627,9 @@ func enqueueTransitionImmediate(obj ObjectInfo, src lcEventSrc) {
 func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) error {
 	traceFn := globalLifecycleSys.trace(*oi)
 	opts := ObjectOptions{
-		Versioned:  globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
-		Expiration: ExpirationOptions{Expire: true},
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		Expiration:       ExpirationOptions{Expire: true},
 	}
 	if lcEvent.Action.DeleteVersioned() {
 		opts.VersionID = oi.VersionID
@@ -621,6 +639,17 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		// delete locally restored copy of object or object version
 		// from the source, while leaving metadata behind. The data on
 		// transitioned tier lies untouched and still accessible
+		//
+		// The restored copy belongs to this version, also when it is the
+		// latest one (DeleteRestoredAction). Without its version ID the
+		// delete applies to the object: a versioned bucket gets a delete
+		// marker that hides it, a suspended one strips the null version.
+		// An empty version ID is the null version, as callers that read
+		// it without the versioning of the bucket leave it.
+		opts.VersionID = oi.VersionID
+		if opts.VersionID == "" {
+			opts.VersionID = nullVersionID
+		}
 		opts.Transition.ExpireRestored = true
 		_, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
 		if err == nil {
@@ -631,44 +660,54 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		return err
 	}
 
-	// Delete remote object from warm-tier
-	//
-	// Unless the expiry only puts a delete marker on top of the version, as
-	// for an object that is not transitioned: with versioning enabled, or
-	// suspended and the version is not the null version, the version stays
-	// as a noncurrent version and must remain readable. Its remote object is
-	// removed later, through the free version added when the version itself
-	// is deleted.
-	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name)
+	// Recheck the lifecycle decision and create the hot-tier tombstone before
+	// touching the remote tier. If the lifecycle configuration changed after
+	// the scanner queued this task, DeleteObject rejects the stale action while
+	// the remote object is still protected.
 	keepRemote := opts.VersionID == "" &&
 		(opts.Versioned || (opts.VersionSuspended && oi.VersionID != "" && oi.VersionID != nullVersionID))
-	if !keepRemote {
-		err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
-		if err == nil {
-			// Skip adding free version since we successfully deleted the
-			// remote object
-			opts.SkipFreeVersion = true
-		} else {
-			transitionLogIf(ctx, err)
-		}
+
+	// Delete the hot-tier namespace first. For a transitioned version this
+	// leaves a durable free-version record until the remote delete succeeds;
+	// that record is the retry point if the process stops between the two
+	// operations.
+	dobj, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts)
+	if err != nil {
+		return err
 	}
 
-	// Now, delete object from hot-tier namespace
-	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
-		return err
+	if !keepRemote {
+		z, ok := objectAPI.(*erasureServerPools)
+		if !ok {
+			transitionLogIf(ctx, errTierOwnershipUnavailable)
+			return nil // The completed local expiry owns a durable free record.
+		}
+		if err := z.deleteTierTuple(ctx, oi.Bucket, oi.Name, tierRemoteTuple{
+			Tier:      oi.TransitionedObject.Tier,
+			Object:    oi.TransitionedObject.Name,
+			VersionID: oi.TransitionedObject.VersionID,
+		}); err != nil {
+			// The hot delete has already created a durable free record. Keep
+			// the expiry successful while the scanner retries remote cleanup;
+			// ownership or tier errors must never cause a second remote delete
+			// without that record.
+			transitionLogIf(ctx, err)
+		}
 	}
 
 	// Send audit for the lifecycle delete operation
 	defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
-	eventName := event.ObjectRemovedDelete
-	if oi.DeleteMarker {
-		eventName = event.ObjectRemovedDeleteMarkerCreated
-	}
+	// Name what the delete did: a marker it created, or the version it
+	// removed.
+	eventName := ilmExpiryEventName(opts.VersionID, dobj)
 	objInfo := ObjectInfo{
 		Name:         oi.Name,
-		VersionID:    oi.VersionID,
-		DeleteMarker: oi.DeleteMarker,
+		VersionID:    dobj.VersionID,
+		DeleteMarker: dobj.DeleteMarker,
+	}
+	if objInfo.VersionID == "" {
+		objInfo.VersionID = opts.VersionID
 	}
 	// Notify object deleted event.
 	sendEvent(eventArgs{
@@ -943,8 +982,10 @@ func postRestoreOpts(ctx context.Context, r *http.Request, bucket, object string
 	}, nil
 }
 
-// set ObjectOptions for PUT call to restore temporary copy of transitioned data
-func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo ObjectInfo) (putOpts ObjectOptions) {
+// set ObjectOptions for PUT call to restore temporary copy of transitioned data.
+// opts are the restore's options, with the versioning POST captured: the
+// bucket's versioning may have changed since, and must not mint a new version.
+func putRestoreOpts(rreq *RestoreObjectRequest, objInfo ObjectInfo, opts ObjectOptions) (putOpts ObjectOptions) {
 	meta := make(map[string]string)
 	sc := rreq.OutputLocation.S3.StorageClass
 	if sc == "" {
@@ -967,8 +1008,8 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 			meta[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
 		}
 		return ObjectOptions{
-			Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, object),
-			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, object),
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
 			UserDefined:      meta,
 		}
 	}
@@ -976,17 +1017,35 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 	if len(objInfo.UserTags) != 0 {
 		meta[xhttp.AmzObjectTagging] = objInfo.UserTags
 	}
-	// Set restore object status
+	// Set restore object status; a completed restore has no attempt.
 	restoreExpiry := lifecycle.ExpectedExpiryTime(time.Now().UTC(), rreq.Days)
 	meta[xhttp.AmzRestore] = completedRestoreObj(restoreExpiry).String()
+	delete(meta, restoreAttemptKey)
 	return ObjectOptions{
-		Versioned:        globalBucketVersioningSys.PrefixEnabled(bucket, object),
-		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(bucket, object),
+		Versioned:        opts.Versioned,
+		VersionSuspended: opts.VersionSuspended,
 		UserDefined:      meta,
-		VersionID:        objInfo.VersionID,
+		VersionID:        restoreVersionID(objInfo.VersionID),
 		MTime:            objInfo.ModTime,
 		Expires:          objInfo.Expires,
 	}
+}
+
+// restoredCopyExpires reports whether the restored copy of oi, as read now,
+// expires by its own reason: lifecycle expires the restored copy of this
+// version, its restore deadline is valid and has passed, its transition is
+// complete and no restore is running. Another rule falling due is no reason.
+func restoredCopyExpires(ctx context.Context, lc lifecycle.Lifecycle, lr lock.Retention, rcfg *replication.Config, oi ObjectInfo) bool {
+	if !evalActionFromLifecycle(ctx, lc, lr, rcfg, oi).Action.DeleteRestored() {
+		return false
+	}
+	status, err := parseRestoreObjStatus(oi.UserDefined[xhttp.AmzRestore])
+	if err != nil {
+		return false
+	}
+	expiry, completed := status.Expiry()
+	return completed && !expiry.IsZero() && UTCNow().After(expiry) &&
+		oi.TransitionedObject.Status == lifecycle.TransitionComplete && !oi.RestoreOngoing
 }
 
 var errRestoreHDRMalformed = fmt.Errorf("x-amz-restore header malformed")

@@ -20,7 +20,6 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -372,7 +371,18 @@ func (c *iamCache) removeGroupFromMembershipsMap(group string) {
 	}
 }
 
-func (c *iamCache) policyDBGetGroups(store *IAMStoreSys, userPolicyPresent bool, groups ...string) ([]string, error) {
+// iamMappingLoader is what policyDBGet and policyDBGetGroups need of the
+// store: the identity backend in use and the loads of a mapping or a group
+// the cache does not hold. *IAMStoreSys loads under the lock its caller
+// holds; a caller that must not hold the cache lock across a storage read
+// wraps it (see batchPolicySnapshot).
+type iamMappingLoader interface {
+	getUsersSysType() UsersSysType
+	loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error
+	loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m *xsync.MapOf[string, MappedPolicy]) error
+}
+
+func (c *iamCache) policyDBGetGroups(store iamMappingLoader, userPolicyPresent bool, groups ...string) ([]string, error) {
 	var policies []string
 	for _, group := range groups {
 		if store.getUsersSysType() == MinIOUsersSysType {
@@ -444,7 +454,7 @@ func (c *iamCache) policyDBGetGroups(store *IAMStoreSys, userPolicyPresent bool,
 // information in IAM (i.e sys.iam*Map) - this info is stored only in the STS
 // generated credentials. Thus we skip looking up group memberships, user map,
 // and group map and check the appropriate policy maps directly.
-func (c *iamCache) policyDBGet(store *IAMStoreSys, name string, isGroup bool, policyPresent bool) ([]string, time.Time, error) {
+func (c *iamCache) policyDBGet(store iamMappingLoader, name string, isGroup bool, policyPresent bool) ([]string, time.Time, error) {
 	if isGroup {
 		if store.getUsersSysType() == MinIOUsersSysType {
 			g, ok := c.iamGroupsMap[name]
@@ -1706,48 +1716,70 @@ func filterPolicies(cache *iamCache, policyName string, bucketName string) (stri
 	return strings.Join(policies, ","), policy.MergePolicies(toMerge...)
 }
 
-// MergePolicies - accepts a comma separated list of policy names as a string
-// and returns only policies that currently exist in MinIO. It includes hot loading
-// of policies if not in the memory
-func (store *IAMStoreSys) MergePolicies(policyName string) (string, policy.Policy) {
-	var policies []string
-	var missingPolicies []string
-	var toMerge []policy.Policy
-
+// MergePolicies loads and combines the named policies. Only confirmed absent
+// policies may be omitted: a failed read could hide an explicit Deny.
+func (store *IAMStoreSys) MergePolicies(policyName string) (string, policy.Policy, error) {
+	names := newMappedPolicy(policyName).toSlice()
+	allCached := true
 	cache := store.rlock()
-	for _, policy := range newMappedPolicy(policyName).toSlice() {
-		if policy == "" {
+	for _, name := range names {
+		if name == "" {
 			continue
 		}
-		p, found := cache.iamPolicyDocsMap[policy]
-		if !found {
-			missingPolicies = append(missingPolicies, policy)
-			continue
+		if _, found := cache.iamPolicyDocsMap[name]; !found {
+			allCached = false
+			break
 		}
-		policies = append(policies, policy)
-		toMerge = append(toMerge, p.Policy)
+	}
+	if allCached {
+		names, combined := filterPolicies(cache, policyName, "")
+		store.runlock()
+		return names, combined, nil
 	}
 	store.runlock()
 
-	if len(missingPolicies) > 0 {
-		m := make(map[string]PolicyDoc)
-		for _, policy := range missingPolicies {
+	// Re-read every document under the writer lock so a concurrent edit or
+	// deletion cannot be overwritten by a stale lazy load. Publish the loaded
+	// documents only when the whole selection succeeds.
+	cache = store.lock()
+	defer store.unlock()
+	var policies []string
+	var toMerge []policy.Policy
+	loaded := make(map[string]PolicyDoc)
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		p, found := cache.iamPolicyDocsMap[name]
+		if !found {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = store.loadPolicyDoc(ctx, policy, m)
+			err := func() error {
+				// Retain writeMu to serialize cache revisions, but let cached
+				// authorization readers proceed while storage is unavailable.
+				store.IAMStorageAPI.unlock()
+				defer store.IAMStorageAPI.lock()
+				return store.loadPolicyDoc(ctx, name, loaded)
+			}()
 			cancel()
+			if errors.Is(err, errNoSuchPolicy) {
+				continue
+			}
+			if err != nil {
+				return "", policy.Policy{}, fmt.Errorf("load IAM policy %q: %w", name, err)
+			}
+			p, found = loaded[name]
+			if !found {
+				return "", policy.Policy{}, fmt.Errorf("load IAM policy %q returned no document", name)
+			}
 		}
-
-		cache := store.lock()
-		maps.Copy(cache.iamPolicyDocsMap, m)
-		store.unlock()
-
-		for policy, p := range m {
-			policies = append(policies, policy)
-			toMerge = append(toMerge, p.Policy)
-		}
+		policies = append(policies, name)
+		toMerge = append(toMerge, p.Policy)
 	}
-
-	return strings.Join(policies, ","), policy.MergePolicies(toMerge...)
+	if len(loaded) > 0 {
+		maps.Copy(cache.iamPolicyDocsMap, loaded)
+		cache.updatedAt = time.Now()
+	}
+	return strings.Join(policies, ","), policy.MergePolicies(toMerge...), nil
 }
 
 // GetBucketUsers - returns users (not STS or service accounts) that have access
@@ -2745,37 +2777,26 @@ func (store *IAMStoreSys) SetUserStatus(ctx context.Context, accessKey string, s
 	cache := store.lock()
 	defer store.unlock()
 
-	ui, ok := cache.iamUsersMap[accessKey]
-	if !ok {
-		return updatedAt, errNoSuchUser
-	}
-	cred := ui.Credentials
-
-	if cred.IsTemp() || cred.IsServiceAccount() {
+	if ui, ok := cache.iamUsersMap[accessKey]; ok && (ui.Credentials.IsTemp() || ui.Credentials.IsServiceAccount()) {
 		return updatedAt, errIAMActionNotAllowed
 	}
-
-	uinfo := newUserIdentity(auth.Credentials{
-		AccessKey: accessKey,
-		SecretKey: cred.SecretKey,
-		Status: func() string {
-			switch string(status) {
-			case string(madmin.AccountEnabled), string(auth.AccountOn):
-				return auth.AccountOn
-			}
-			return auth.AccountOff
-		}(),
+	u, _, err := store.editStoredIdentity(ctx, cache, accessKey, regUser, func(stored *UserIdentity) error {
+		if stored.Credentials.IsTemp() || stored.Credentials.IsServiceAccount() {
+			return errIAMActionNotAllowed
+		}
+		stored.Credentials.Status = auth.AccountOff
+		if status == madmin.AccountEnabled {
+			stored.Credentials.Status = auth.AccountOn
+		}
+		return nil
 	})
-
-	if err := store.saveUserIdentity(ctx, accessKey, regUser, &uinfo); err != nil {
+	if errors.Is(err, errIAMIdentityGone) {
+		return updatedAt, errNoSuchUser
+	}
+	if err != nil {
 		return updatedAt, err
 	}
-
-	if err := cache.updateUserWithClaims(accessKey, uinfo); err != nil {
-		return updatedAt, err
-	}
-
-	return uinfo.UpdatedAt, nil
+	return u.UpdatedAt, nil
 }
 
 // AddServiceAccount - add a new service account
@@ -2809,10 +2830,12 @@ func (store *IAMStoreSys) AddServiceAccount(ctx context.Context, cred auth.Crede
 	}
 
 	u := newUserIdentity(cred)
-	err = store.saveUserIdentity(ctx, u.Credentials.AccessKey, svcUser, &u)
+	create := &iamIdentityCreate{UserIdentity: u}
+	err = store.saveIAMRevision(ctx, getUserIdentityPath(u.Credentials.AccessKey, svcUser), create)
 	if err != nil {
 		return updatedAt, err
 	}
+	u = create.UserIdentity
 
 	if err := cache.updateUserWithClaims(u.Credentials.AccessKey, u); err != nil {
 		// Persistence already replaced the credential. A failed refresh must
@@ -2830,15 +2853,39 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	cache := store.lock()
 	defer store.unlock()
 
-	ui, ok := cache.iamUsersMap[accessKey]
-	if !ok || !ui.Credentials.IsServiceAccount() {
+	u, _, err := store.editStoredIdentity(ctx, cache, accessKey, svcUser, func(stored *UserIdentity) error {
+		if !stored.Credentials.IsServiceAccount() {
+			return errIAMIdentityGone
+		}
+		if opts.parentUser != "" && stored.Credentials.ParentUser != opts.parentUser {
+			// Not the account the caller was authorized for: it was
+			// deleted and created again for another parent meanwhile.
+			return errIAMIdentityGone
+		}
+		cr, err := updatedServiceAccountCredentials(ctx, accessKey, stored.Credentials, opts)
+		if err != nil {
+			return err
+		}
+		stored.Credentials = cr
+		return nil
+	})
+	if errors.Is(err, errIAMIdentityGone) {
 		return updatedAt, errNoSuchServiceAccount
 	}
-	cr := ui.Credentials
+	if err != nil {
+		return updatedAt, err
+	}
+	return u.UpdatedAt, nil
+}
+
+// updatedServiceAccountCredentials returns cr, the stored credential of
+// service account accessKey, with the edits of opts and a session token
+// signed again for them.
+func updatedServiceAccountCredentials(ctx context.Context, accessKey string, cr auth.Credentials, opts updateServiceAccountOpts) (auth.Credentials, error) {
 	currentSecretKey := cr.SecretKey
 	if opts.secretKey != "" {
 		if !auth.IsSecretKeyValid(opts.secretKey) {
-			return updatedAt, auth.ErrInvalidSecretKeyLength
+			return cr, auth.ErrInvalidSecretKeyLength
 		}
 		cr.SecretKey = opts.secretKey
 	}
@@ -2854,7 +2901,7 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	if opts.expiration != nil {
 		expirationInUTC := opts.expiration.UTC()
 		if err := validateSvcExpirationInUTC(ctx, expirationInUTC); err != nil {
-			return updatedAt, err
+			return cr, err
 		}
 		cr.Expiration = expirationInUTC
 	}
@@ -2870,42 +2917,31 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	case auth.AccountOn, auth.AccountOff:
 		cr.Status = opts.status
 	default:
-		return updatedAt, errors.New("unknown account status value")
+		return cr, errors.New("unknown account status value")
 	}
 
 	m, err := getClaimsFromTokenWithSecret(cr.SessionToken, currentSecretKey)
 	if err != nil {
-		return updatedAt, fmt.Errorf("unable to get svc acc claims: %v", err)
+		return cr, fmt.Errorf("unable to get svc acc claims: %v", err)
 	}
 
 	// Extracted session policy name string can be removed as its not useful
 	// at this point.
 	m.Delete(sessionPolicyNameExtracted)
 
-	nosp := opts.sessionPolicy == nil || opts.sessionPolicy.Version == "" && len(opts.sessionPolicy.Statements) == 0
-
-	// sessionPolicy is nil and there is embedded policy attached we remove
-	// embedded policy at that point.
-	if _, ok := m.Lookup(policy.SessionPolicyName); ok && nosp {
-		m.Delete(policy.SessionPolicyName)
-		m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
-	}
-
-	if opts.sessionPolicy != nil { // session policies is being updated
-		if err := opts.sessionPolicy.Validate(); err != nil {
-			return updatedAt, err
+	// A nil sessionPolicy is an edit that does not concern the policy, and
+	// the embedded one stays. Only a policy that was given, and is empty,
+	// removes it: the account then has all its parent is allowed, which is
+	// usually more.
+	if opts.sessionPolicy != nil {
+		policyBuf, err := marshalServiceAccountPolicy(opts.sessionPolicy)
+		if err != nil {
+			return cr, err
 		}
-
-		if opts.sessionPolicy.Version != "" && len(opts.sessionPolicy.Statements) > 0 {
-			policyBuf, err := json.Marshal(opts.sessionPolicy)
-			if err != nil {
-				return updatedAt, err
-			}
-
-			if len(policyBuf) > maxSVCSessionPolicySize {
-				return updatedAt, errSessionPolicyTooLarge
-			}
-
+		if len(policyBuf) == 0 {
+			m.Delete(policy.SessionPolicyName)
+			m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
+		} else {
 			// Overwrite session policy claims.
 			m.Set(policy.SessionPolicyName, base64.StdEncoding.EncodeToString(policyBuf))
 			m.Set(iamPolicyClaimNameSA(), embeddedPolicyType)
@@ -2914,21 +2950,11 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 
 	cr.SessionToken, err = auth.JWTSignWithAccessKey(accessKey, m.Map(), cr.SecretKey)
 	if err != nil {
-		return updatedAt, err
+		return cr, err
 	}
-
-	u := newUserIdentity(cr)
-	if err := store.saveUserIdentity(ctx, u.Credentials.AccessKey, svcUser, &u); err != nil {
-		return updatedAt, err
-	}
-
-	if err := cache.updateUserWithClaims(u.Credentials.AccessKey, u); err != nil {
-		delete(cache.iamUsersMap, accessKey)
-		cache.updatedAt = UTCNow()
-		return updatedAt, err
-	}
-
-	return u.UpdatedAt, nil
+	// The stored claims are those of the new token; the save extracts them.
+	cr.Claims = nil
+	return cr, nil
 }
 
 // ListTempAccounts - lists only temporary accounts from the cache.
@@ -3072,20 +3098,14 @@ func (store *IAMStoreSys) UpdateUserSecretKey(ctx context.Context, accessKey, se
 	cache := store.lock()
 	defer store.unlock()
 
-	cache.updatedAt = time.Now()
-
-	ui, ok := cache.iamUsersMap[accessKey]
-	if !ok {
+	_, _, err := store.editStoredIdentity(ctx, cache, accessKey, regUser, func(stored *UserIdentity) error {
+		stored.Credentials.SecretKey = secretKey
+		return nil
+	})
+	if errors.Is(err, errIAMIdentityGone) {
 		return errNoSuchUser
 	}
-	cred := ui.Credentials
-	cred.SecretKey = secretKey
-	u := newUserIdentity(cred)
-	if err := store.saveUserIdentity(ctx, accessKey, regUser, &u); err != nil {
-		return err
-	}
-
-	return cache.updateUserWithClaims(accessKey, u)
+	return err
 }
 
 // GetSTSAndServiceAccounts - returns all STS and Service account credentials.
@@ -3111,39 +3131,99 @@ func (store *IAMStoreSys) getSTSAndServiceAccounts(cache *iamCache) []auth.Crede
 	return res
 }
 
-// UpdateUserIdentity - updates a user credential.
-func (store *IAMStoreSys) UpdateUserIdentity(ctx context.Context, cred auth.Credentials) error {
+// RefreshUserGroups sets the groups of the STS or service-account
+// credential that cred was read from to groups, on the record stored now
+// (see editStoredIdentity). Nothing else of the record changes. A
+// credential that is gone, expired or now has another parent, whose groups
+// the directory lookup did not compute, is left alone in storage and
+// dropped from the cache. It reports whether it wrote.
+func (store *IAMStoreSys) RefreshUserGroups(ctx context.Context, cred auth.Credentials, groups []string) (bool, error) {
 	cache := store.lock()
 	defer store.unlock()
 
-	cache.updatedAt = time.Now()
-
-	userType := regUser
-	if cred.IsServiceAccount() {
-		userType = svcUser
-	} else if cred.IsTemp() {
+	userType := svcUser
+	if !cred.IsServiceAccount() {
+		if !cred.IsTemp() {
+			return false, errInvalidArgument
+		}
 		userType = stsUser
 	}
-	ui := newUserIdentity(cred)
-	// Overwrite the user identity here. As store should be
-	// atomic, it shouldn't cause any corruption.
-	if err := store.saveUserIdentity(ctx, cred.AccessKey, userType, &ui); err != nil {
-		return err
+	_, unchanged, err := store.editStoredIdentity(ctx, cache, cred.AccessKey, userType, func(stored *UserIdentity) error {
+		if stored.Credentials.ParentUser != cred.ParentUser || stored.Credentials.IsExpired() {
+			return errIAMIdentityGone
+		}
+		if set.CreateStringSet(stored.Credentials.Groups...).Equals(set.CreateStringSet(groups...)) {
+			return errIAMIdentityUnchanged
+		}
+		stored.Credentials.Groups = groups
+		return nil
+	})
+	if errors.Is(err, errIAMIdentityGone) || errors.Is(err, errIAMStaleUpdate) {
+		return false, nil
 	}
+	if err != nil {
+		return false, err
+	}
+	return !unchanged, nil
+}
 
-	return cache.updateUserWithClaims(cred.AccessKey, ui)
+// editStoredIdentity applies edit to identity accessKey of userType as it
+// is stored now, under its revision lock (see iamIdentityEdit), and caches
+// the result. The caller holds the cache lock. When the identity is absent
+// or deleted in storage, or edit returns errIAMIdentityGone because it is
+// no longer the identity the edit addressed, errIAMIdentityGone is
+// returned; a replicated edit older than what is stored returns
+// errIAMStaleUpdate. Either way storage holds something else than the
+// cached copy, which is dropped, so a lookup loads what is stored.
+func (store *IAMStoreSys) editStoredIdentity(ctx context.Context, cache *iamCache, accessKey string, userType IAMUserType, edit func(u *UserIdentity) error) (UserIdentity, bool, error) {
+	op := &iamIdentityEdit{accessKey: accessKey, edit: edit}
+	err := store.saveIAMRevision(ctx, getUserIdentityPath(accessKey, userType), op)
+	if errors.Is(err, errIAMIdentityGone) || errors.Is(err, errIAMStaleUpdate) {
+		// Storage holds something else than the cached copy: drop it.
+		store.forgetCachedIdentity(cache, accessKey, userType)
+	}
+	if err != nil {
+		return UserIdentity{}, false, err
+	}
+	if err := cache.updateUserWithClaims(accessKey, op.UserIdentity); err != nil {
+		// Stored but not cached: a lookup loads it.
+		store.forgetCachedIdentity(cache, accessKey, userType)
+		return UserIdentity{}, false, err
+	}
+	return op.UserIdentity, op.unchanged, nil
+}
+
+// forgetCachedIdentity drops identity accessKey of userType from the cache;
+// a lookup then loads it from storage. Users and service accounts share a
+// map, so an entry of the other kind under the same key is kept.
+func (store *IAMStoreSys) forgetCachedIdentity(cache *iamCache, accessKey string, userType IAMUserType) {
+	switch userType {
+	case stsUser:
+		delete(cache.iamSTSAccountsMap, accessKey)
+	default:
+		if ui, ok := cache.iamUsersMap[accessKey]; ok && ui.Credentials.IsServiceAccount() == (userType == svcUser) {
+			delete(cache.iamUsersMap, accessKey)
+		}
+	}
+	cache.updatedAt = time.Now()
+	if store.group != nil {
+		store.group.Forget(accessKey)
+	}
 }
 
 // LoadUser - attempts to load user info from storage and updates cache.
 func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error {
 	groupLoad := env.Get("_MINIO_IAM_GROUP_REFRESH", config.EnableOff) == config.EnableOn
 
-	newCachePopulate := func() (val any, err error) {
-		newCache := newIamCache()
+	newCachePopulate := func(ctx context.Context) (newCache *iamCache, err error) {
+		newCache = newIamCache()
 		newCache.revisions = store.revisionIndex()
 
 		// Check for service account first
-		store.loadUser(ctx, accessKey, svcUser, newCache.iamUsersMap)
+		err = store.loadUser(ctx, accessKey, svcUser, newCache.iamUsersMap)
+		if err != nil && !errors.Is(err, errNoSuchUser) && !errors.Is(err, errConfigNotFound) {
+			return nil, err
+		}
 
 		svc, found := newCache.iamUsersMap[accessKey]
 		if found {
@@ -3161,6 +3241,9 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 
 		if !found {
 			err = store.loadUser(ctx, accessKey, regUser, newCache.iamUsersMap)
+			if err != nil && !errors.Is(err, errNoSuchUser) && !errors.Is(err, errConfigNotFound) {
+				return nil, err
+			}
 			if _, found = newCache.iamUsersMap[accessKey]; found {
 				// NOTE: we are not worried about loading errors from policies.
 				store.loadMappedPolicyWithRetry(ctx, accessKey, regUser, false, newCache.iamUserPolicyMap, 3)
@@ -3204,63 +3287,70 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 		return newCache, err
 	}
 
-	var (
-		val any
-		err error
-	)
-	if store.group != nil {
-		val, err, _ = store.group.Do(accessKey, newCachePopulate)
-	} else {
-		val, err = newCachePopulate()
-	}
-
-	// Return error right away if any.
-	if err != nil {
-		if errors.Is(err, errNoSuchUser) || errors.Is(err, errConfigNotFound) {
-			return nil
+	load := func() (any, error) {
+		loadedAt := time.Now()
+		newCache, err := newCachePopulate(ctx)
+		if err != nil {
+			return nil, err
 		}
-		return err
+
+		cache := store.lock()
+		defer store.unlock()
+
+		if cache.updatedAt.After(loadedAt) {
+			err = store.withIAMStorage(ctx, func(ctx context.Context) error {
+				newCache, err = newCachePopulate(ctx)
+				return err
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// We need to merge the new cache with the existing cache because the
+		// periodic IAM reload is partial. The periodic load here is to account.
+		newCache.iamGroupPolicyMap.Range(func(k string, v MappedPolicy) bool {
+			cache.iamGroupPolicyMap.Store(k, v)
+			return true
+		})
+
+		maps.Copy(cache.iamGroupsMap, newCache.iamGroupsMap)
+
+		maps.Copy(cache.iamPolicyDocsMap, newCache.iamPolicyDocsMap)
+
+		maps.Copy(cache.iamUserGroupMemberships, newCache.iamUserGroupMemberships)
+
+		newCache.iamUserPolicyMap.Range(func(k string, v MappedPolicy) bool {
+			cache.iamUserPolicyMap.Store(k, v)
+			return true
+		})
+
+		maps.Copy(cache.iamUsersMap, newCache.iamUsersMap)
+
+		maps.Copy(cache.iamSTSAccountsMap, newCache.iamSTSAccountsMap)
+
+		newCache.iamSTSPolicyMap.Range(func(k string, v MappedPolicy) bool {
+			cache.iamSTSPolicyMap.Store(k, v)
+			return true
+		})
+
+		cache.updatedAt = time.Now()
+		return nil, nil
 	}
 
-	newCache, ok := val.(*iamCache)
-	if !ok {
+	var err error
+	if store.group != nil {
+		_, err, _ = store.group.Do(accessKey, load)
+	} else {
+		_, err = load()
+	}
+	if errors.Is(err, errNoSuchUser) || errors.Is(err, errConfigNotFound) {
 		return nil
 	}
-
-	cache := store.lock()
-	defer store.unlock()
-
-	// We need to merge the new cache with the existing cache because the
-	// periodic IAM reload is partial. The periodic load here is to account.
-	newCache.iamGroupPolicyMap.Range(func(k string, v MappedPolicy) bool {
-		cache.iamGroupPolicyMap.Store(k, v)
-		return true
-	})
-
-	maps.Copy(cache.iamGroupsMap, newCache.iamGroupsMap)
-
-	maps.Copy(cache.iamPolicyDocsMap, newCache.iamPolicyDocsMap)
-
-	maps.Copy(cache.iamUserGroupMemberships, newCache.iamUserGroupMemberships)
-
-	newCache.iamUserPolicyMap.Range(func(k string, v MappedPolicy) bool {
-		cache.iamUserPolicyMap.Store(k, v)
-		return true
-	})
-
-	maps.Copy(cache.iamUsersMap, newCache.iamUsersMap)
-
-	maps.Copy(cache.iamSTSAccountsMap, newCache.iamSTSAccountsMap)
-
-	newCache.iamSTSPolicyMap.Range(func(k string, v MappedPolicy) bool {
-		cache.iamSTSPolicyMap.Store(k, v)
-		return true
-	})
-
-	cache.updatedAt = time.Now()
-
-	return nil
+	return err
 }
+
+var errTokenSigningKeyUnavailable = errors.New("token signing key unavailable")
 
 func extractJWTClaims(u UserIdentity) (jwtClaims *jwt.MapClaims, err error) {
 	keys := make([]string, 0, 3)
@@ -3272,7 +3362,7 @@ func extractJWTClaims(u UserIdentity) (jwtClaims *jwt.MapClaims, err error) {
 	if globalSiteReplicationSys.isEnabled() {
 		secretKey, err := getTokenSigningKey()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", errTokenSigningKeyUnavailable, err)
 		}
 		keys = append(keys, secretKey)
 	}

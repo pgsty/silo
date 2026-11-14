@@ -622,7 +622,11 @@ func (a adminAPIHandlers) TemporaryAccountInfo(w http.ResponseWriter, r *http.Re
 			policiesNames = policySet.ToSlice()
 		}
 
-		stsAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		stsAccountPolicy, err = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
 	}
 
 	policyJSON, err := json.MarshalIndent(stsAccountPolicy, "", " ")
@@ -881,15 +885,16 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// A request without a policy, or with a JSON null for one, keeps the
+	// policy the account has. An empty policy document is passed on as
+	// such: it is the request to remove the embedded policy.
 	var sp *policy.Policy
-	if len(updateReq.NewPolicy) > 0 {
-		sp, err = policy.ParseConfigStrict(bytes.NewReader(updateReq.NewPolicy))
+	trimmedPolicy := bytes.TrimSpace(updateReq.NewPolicy)
+	if len(trimmedPolicy) > 0 && !bytes.Equal(trimmedPolicy, []byte("null")) {
+		sp, err = parseSessionPolicyStrictBytes(trimmedPolicy)
 		if err != nil {
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
-		}
-		if sp.Version == "" && len(sp.Statements) == 0 {
-			sp = nil
 		}
 	}
 	opts := updateServiceAccountOpts{
@@ -899,6 +904,9 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 		description:   updateReq.NewDescription,
 		expiration:    updateReq.NewExpiration,
 		sessionPolicy: sp,
+		// The edit applies to the stored account only while it still has
+		// the parent the checks above authorized.
+		parentUser: svcAccount.ParentUser,
 	}
 	updatedAt, err := globalIAMSys.UpdateServiceAccount(ctx, accessKey, opts)
 	if err != nil {
@@ -907,21 +915,13 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 	}
 
 	// Call site replication hook - non-root user accounts are replicated.
+	// The hook sends the account as it is stored after this edit, not the
+	// fields the request changed (see replicationItem).
 	if svcAccount.ParentUser != globalActiveCred.AccessKey {
 		replLogIf(ctx, globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
-			Type: madmin.SRIAMItemSvcAcc,
-			SvcAccChange: &madmin.SRSvcAccChange{
-				Update: &madmin.SRSvcAccUpdate{
-					AccessKey:     accessKey,
-					SecretKey:     opts.secretKey,
-					Status:        opts.status,
-					Name:          opts.name,
-					Description:   opts.description,
-					SessionPolicy: madmin.SRSessionPolicy(updateReq.NewPolicy),
-					Expiration:    updateReq.NewExpiration,
-				},
-			},
-			UpdatedAt: updatedAt,
+			Type:         madmin.SRIAMItemSvcAcc,
+			SvcAccChange: &madmin.SRSvcAccChange{Update: &madmin.SRSvcAccUpdate{AccessKey: accessKey}},
+			UpdatedAt:    updatedAt,
 		}))
 	}
 
@@ -987,7 +987,11 @@ func (a adminAPIHandlers) InfoServiceAccount(w http.ResponseWriter, r *http.Requ
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
 		}
-		svcAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		svcAccountPolicy, err = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
 	}
 
 	policyJSON, err := json.MarshalIndent(svcAccountPolicy, "", " ")
@@ -1466,6 +1470,7 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 	roleArn := policy.Args{Claims: cred.Claims}.GetRoleArn()
 	policySetFromClaims, hasPolicyClaim := policy.GetPoliciesFromClaims(cred.Claims, iamPolicyClaimNameOpenID())
 	var effectivePolicy policy.Policy
+	var policyErr error
 
 	var buf []byte
 	switch {
@@ -1489,10 +1494,10 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		policySlice := newMappedPolicy(policy).toSlice()
-		effectivePolicy = globalIAMSys.GetCombinedPolicy(policySlice...)
+		effectivePolicy, policyErr = globalIAMSys.GetCombinedPolicy(policySlice...)
 
 	case hasPolicyClaim:
-		effectivePolicy = globalIAMSys.GetCombinedPolicy(policySetFromClaims.ToSlice()...)
+		effectivePolicy, policyErr = globalIAMSys.GetCombinedPolicy(policySetFromClaims.ToSlice()...)
 
 	default:
 		policies, err := globalIAMSys.PolicyDBGet(accountName, cred.Groups...)
@@ -1501,7 +1506,11 @@ func (a adminAPIHandlers) AccountInfoHandler(w http.ResponseWriter, r *http.Requ
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
 		}
-		effectivePolicy = globalIAMSys.GetCombinedPolicy(policies...)
+		effectivePolicy, policyErr = globalIAMSys.GetCombinedPolicy(policies...)
+	}
+	if policyErr != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, policyErr), r.URL)
+		return
 	}
 
 	buf, err = json.MarshalIndent(effectivePolicy, "", " ")
@@ -1758,7 +1767,7 @@ func (a adminAPIHandlers) AddCannedPolicy(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	iamPolicy, err := policy.ParseConfigStrict(bytes.NewReader(iamPolicyBytes))
+	iamPolicy, err := parsePolicyStrictBytes(iamPolicyBytes)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -2189,7 +2198,11 @@ func (a adminAPIHandlers) InfoAccessKey(w http.ResponseWriter, r *http.Request) 
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 			return
 		}
-		svcAccountPolicy = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		svcAccountPolicy, err = globalIAMSys.GetCombinedPolicy(policiesNames...)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
 	}
 
 	policyJSON, err := json.MarshalIndent(svcAccountPolicy, "", " ")
@@ -2379,36 +2392,12 @@ func (a adminAPIHandlers) ExportIAM(w http.ResponseWriter, r *http.Request) {
 					// skip site-replication service account.
 					continue
 				}
-				claims, err := globalIAMSys.GetClaimsForSvcAcc(ctx, acc.Credentials.AccessKey)
+				// The stored record only: this server's cache may not have
+				// heard of an edit made through another server.
+				svcAccts[user], err = serviceAccountSnapshot(acc)
 				if err != nil {
 					writeErrorResponse(ctx, w, exportError(ctx, err, iamFile, ""), r.URL)
 					return
-				}
-				sa, policy, err := globalIAMSys.GetServiceAccount(ctx, acc.Credentials.AccessKey)
-				if err != nil {
-					writeErrorResponse(ctx, w, exportError(ctx, err, iamFile, ""), r.URL)
-					return
-				}
-
-				var policyJSON []byte
-				if policy != nil {
-					policyJSON, err = json.Marshal(policy)
-					if err != nil {
-						writeErrorResponse(ctx, w, exportError(ctx, err, iamFile, ""), r.URL)
-						return
-					}
-				}
-				svcAccts[user] = madmin.SRSvcAccCreate{
-					Parent:        acc.Credentials.ParentUser,
-					AccessKey:     user,
-					SecretKey:     acc.Credentials.SecretKey,
-					Groups:        acc.Credentials.Groups,
-					Claims:        claims,
-					SessionPolicy: policyJSON,
-					Status:        acc.Credentials.Status,
-					Name:          sa.Name,
-					Description:   sa.Description,
-					Expiration:    &sa.Expiration,
 				}
 			}
 
@@ -2522,23 +2511,34 @@ func (a adminAPIHandlers) importIAM(w http.ResponseWriter, r *http.Request, apiV
 			return
 		default:
 			defer f.Close()
-			var allPolicies map[string]policy.Policy
+			var policyDocuments map[string]json.RawMessage
 			data, err = io.ReadAll(f)
 			if err != nil {
 				writeErrorResponseJSON(ctx, w, importErrorWithAPIErr(ctx, ErrInvalidRequest, err, allPoliciesFile, ""), r.URL)
 				return
 			}
-			err = json.Unmarshal(data, &allPolicies)
+			err = json.Unmarshal(data, &policyDocuments)
 			if err != nil {
 				writeErrorResponseJSON(ctx, w, importErrorWithAPIErr(ctx, ErrAdminConfigBadJSON, err, allPoliciesFile, ""), r.URL)
 				return
+			}
+			// Validate the entire policy file before applying any entries. Keep
+			// legacy semantic validation, but never discard unknown wire fields.
+			allPolicies := make(map[string]*policy.Policy, len(policyDocuments))
+			for policyName, document := range policyDocuments {
+				parsed, parseErr := parsePolicySnapshotBytes(document)
+				if parseErr != nil {
+					writeErrorResponseJSON(ctx, w, importErrorWithAPIErr(ctx, ErrAdminConfigBadJSON, parseErr, allPoliciesFile, policyName), r.URL)
+					return
+				}
+				allPolicies[policyName] = parsed
 			}
 			for policyName, policy := range allPolicies {
 				if policy.IsEmpty() {
 					err = globalIAMSys.DeletePolicy(ctx, policyName, true)
 					removed.Policies = append(removed.Policies, policyName)
 				} else {
-					_, err = globalIAMSys.SetPolicy(ctx, policyName, policy)
+					_, err = globalIAMSys.SetPolicy(ctx, policyName, *policy)
 					added.Policies = append(added.Policies, policyName)
 				}
 				if err != nil {
@@ -2630,8 +2630,17 @@ func (a adminAPIHandlers) importIAM(w http.ResponseWriter, r *http.Request, apiV
 						return
 					}
 				}
-				if _, gerr := globalIAMSys.AddUsersToGroup(ctx, group, grpInfo.Members); gerr != nil {
-					failed.Groups = append(failed.Groups, madmin.IAMErrEntity{Name: group, Error: err})
+				_, gerr := globalIAMSys.AddUsersToGroup(ctx, group, grpInfo.Members)
+				if gerr == nil {
+					switch grpInfo.Status {
+					case statusDisabled:
+						_, gerr = globalIAMSys.SetGroupStatus(ctx, group, false)
+					case statusEnabled:
+						_, gerr = globalIAMSys.SetGroupStatus(ctx, group, true)
+					}
+				}
+				if gerr != nil {
+					failed.Groups = append(failed.Groups, madmin.IAMErrEntity{Name: group, Error: gerr})
 				} else {
 					added.Groups = append(added.Groups, group)
 				}
@@ -2677,10 +2686,13 @@ func (a adminAPIHandlers) importIAM(w http.ResponseWriter, r *http.Request, apiV
 				var sp *policy.Policy
 				var err error
 				if len(svcAcctReq.SessionPolicy) > 0 {
-					sp, err = policy.ParseConfig(bytes.NewReader(svcAcctReq.SessionPolicy))
-					if err != nil {
-						writeErrorResponseJSON(ctx, w, importError(ctx, err, allSvcAcctsFile, user), r.URL)
-						return
+					trimmedSP := bytes.TrimSpace(svcAcctReq.SessionPolicy)
+					if len(trimmedSP) > 0 && !bytes.Equal(trimmedSP, []byte("null")) {
+						sp, err = parsePolicySnapshotBytes(trimmedSP)
+						if err != nil {
+							writeErrorResponseJSON(ctx, w, importError(ctx, err, allSvcAcctsFile, user), r.URL)
+							return
+						}
 					}
 				}
 				// service account access key cannot have space characters
@@ -2709,14 +2721,16 @@ func (a adminAPIHandlers) importIAM(w http.ResponseWriter, r *http.Request, apiV
 					}
 				}
 				opts := newServiceAccountOpts{
-					accessKey:                  user,
-					secretKey:                  svcAcctReq.SecretKey,
-					sessionPolicy:              sp,
-					claims:                     svcAcctReq.Claims,
-					name:                       svcAcctReq.Name,
-					description:                svcAcctReq.Description,
-					expiration:                 svcAcctReq.Expiration,
-					allowSiteReplicatorAccount: false,
+					accessKey:                   user,
+					secretKey:                   svcAcctReq.SecretKey,
+					status:                      svcAcctReq.Status,
+					sessionPolicy:               sp,
+					claims:                      svcAcctReq.Claims,
+					name:                        svcAcctReq.Name,
+					description:                 svcAcctReq.Description,
+					expiration:                  svcAcctReq.Expiration,
+					allowSiteReplicatorAccount:  false,
+					preserveEmptyEmbeddedPolicy: svcAcctClaimsHaveEmbeddedPolicy(svcAcctReq.Claims),
 				}
 
 				if _, _, err = globalIAMSys.NewServiceAccount(ctx, svcAcctReq.Parent, svcAcctReq.Groups, opts); err != nil {
@@ -2949,7 +2963,15 @@ func canManageRootCredentials(cred auth.Credentials) bool {
 func isAllowedServiceAccountAction(cred auth.Credentials, args policy.Args) bool {
 	if args.DenyOnly && !args.IsOwner && !cred.IsTemp() && !cred.IsServiceAccount() && newGlobalAuthZPluginFn() == nil {
 		policies, err := globalIAMSys.PolicyDBGet(args.AccountName, args.Groups...)
-		return err == nil && globalIAMSys.GetCombinedPolicy(policies...).IsAllowed(args)
+		if err != nil {
+			return false
+		}
+		combined, err := globalIAMSys.GetCombinedPolicy(policies...)
+		if err != nil {
+			iamLogIf(GlobalContext, err)
+			return false
+		}
+		return combined.IsAllowed(args)
 	}
 	return globalIAMSys.IsAllowed(args)
 }
@@ -3052,14 +3074,17 @@ func commonAddServiceAccount(r *http.Request, ldap bool) (context.Context, auth.
 	}
 
 	var sp *policy.Policy
-	if len(createReq.Policy) > 0 {
-		sp, err = policy.ParseConfigStrict(bytes.NewReader(createReq.Policy))
+	trimmedCreatePolicy := bytes.TrimSpace(createReq.Policy)
+	if bytes.Equal(trimmedCreatePolicy, []byte("null")) {
+		createReq.Policy = nil
+	} else if len(trimmedCreatePolicy) > 0 {
+		sp, err = parseSessionPolicyStrictBytes(trimmedCreatePolicy)
 		if err != nil {
 			return ctx, auth.Credentials{}, newServiceAccountOpts{}, madmin.AddServiceAccountReq{}, "", toAdminAPIErr(ctx, err)
 		}
 		// Empty service policies mean inheritance, including for expiring keys.
 		// Normalize the replication request as well as the local credential.
-		if sp.Version == "" && sp.Statements == nil && sp.ID == "" {
+		if sp.IsEmpty() {
 			sp = nil
 			createReq.Policy = nil
 		}

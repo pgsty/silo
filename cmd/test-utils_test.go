@@ -62,6 +62,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/signer"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
@@ -188,6 +189,10 @@ func calculateStreamContentLength(dataLen, chunkSize int64) int64 {
 }
 
 func prepareFS(ctx context.Context) (ObjectLayer, string, error) {
+	return prepareFSWithDisks(ctx, nil)
+}
+
+func prepareFSWithDisks(ctx context.Context, wrapDisk func(StorageAPI) StorageAPI) (ObjectLayer, string, error) {
 	nDisks := 1
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
@@ -198,10 +203,33 @@ func prepareFS(ctx context.Context) (ObjectLayer, string, error) {
 		return nil, "", err
 	}
 
+	wrapTestDisks(obj, wrapDisk)
 	initAllSubsystems(ctx)
 
 	globalIAMSys.Init(ctx, obj, globalEtcdClient, 2*time.Second)
 	return obj, fsDirs[0], nil
+}
+
+// wrapTestDisks installs fixture disks before IAM starts reading them. Keep
+// the production getters unchanged and retain the wrappers until shutdown;
+// restoring a getter while an IAM Walk is in flight races that reader.
+func wrapTestDisks(obj ObjectLayer, wrapDisk func(StorageAPI) StorageAPI) {
+	if wrapDisk == nil {
+		return
+	}
+	for _, pool := range obj.(*erasureServerPools).serverPools {
+		pool.erasureDisksMu.Lock()
+		for i, set := range pool.erasureDisks {
+			disks := append([]StorageAPI(nil), set...)
+			for j, disk := range disks {
+				if disk != nil {
+					disks[j] = wrapDisk(disk)
+				}
+			}
+			pool.erasureDisks[i] = disks
+		}
+		pool.erasureDisksMu.Unlock()
+	}
 }
 
 func prepareErasureSets32(ctx context.Context) (ObjectLayer, []string, error) {
@@ -505,6 +533,9 @@ func resetTestGlobals() {
 	resetGlobalIAMSys()
 	// Object-layer fixtures must not reuse the preceding IAM suite's etcd store.
 	globalEtcdClient = nil
+	storageclass.ConfigLock.Lock()
+	globalStorageClass = storageclass.Config{}
+	storageclass.ConfigLock.Unlock()
 }
 
 // Configure the server for the test run.
@@ -1752,6 +1783,7 @@ type ExecObjectLayerAPITestArgs struct {
 	objAPITest        objAPITestType
 	endpoints         []string
 	init              func()
+	wrapDisk          func(StorageAPI) StorageAPI
 	makeBucketOptions MakeBucketOptions
 }
 
@@ -1765,7 +1797,7 @@ func ExecObjectLayerAPITest(args ExecObjectLayerAPITestArgs) {
 	// this is to make sure that the tests are not affected by modified value.
 	resetTestGlobals()
 
-	objLayer, fsDir, err := prepareFS(ctx)
+	objLayer, fsDir, err := prepareFSWithDisks(ctx, args.wrapDisk)
 	if err != nil {
 		args.t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
 	}
@@ -1800,6 +1832,7 @@ func ExecObjectLayerAPITest(args ExecObjectLayerAPITestArgs) {
 	}
 	defer objLayer.Shutdown(ctx)
 
+	wrapTestDisks(objLayer, args.wrapDisk)
 	bucketErasure, erAPIRouter, err := initAPIHandlerTest(ctx, objLayer, args.endpoints, args.makeBucketOptions)
 	if err != nil {
 		args.t.Fatalf("Initialization of API handler tests failed: <ERROR> %s", err)

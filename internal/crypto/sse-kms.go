@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	xhttp "github.com/minio/minio/internal/http"
@@ -75,14 +76,31 @@ func (ssekms) ParseHTTP(h http.Header) (string, kms.Context, error) {
 
 	var ctx kms.Context
 	if context, ok := h[xhttp.AmzServerSideEncryptionKmsContext]; ok {
+		invalidContext := kms.Error{
+			Code:    http.StatusBadRequest,
+			APICode: "InvalidArgument",
+			Err:     "KMS context must be valid base64-encoded JSON with string values",
+		}
+		if len(context) == 0 {
+			return "", nil, invalidContext
+		}
 		b, err := base64.StdEncoding.DecodeString(context[0])
 		if err != nil {
-			return "", nil, err
+			return "", nil, invalidContext
+		}
+		// Persisting invalid UTF-8 replaces bytes and can collapse distinct
+		// keys, changing the associated data needed to decrypt the object.
+		if !utf8.Valid(b) {
+			return "", nil, kms.Error{
+				Code:    http.StatusBadRequest,
+				APICode: "InvalidArgument",
+				Err:     "KMS context must be valid UTF-8",
+			}
 		}
 
 		json := jsoniter.ConfigCompatibleWithStandardLibrary
 		if err := json.Unmarshal(b, &ctx); err != nil {
-			return "", nil, err
+			return "", nil, invalidContext
 		}
 	}
 

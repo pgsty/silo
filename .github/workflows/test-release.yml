@@ -25,6 +25,9 @@ on:
       - "buildscripts/minio-upgrade.sh"
       - "buildscripts/sign-release-rpms.sh"
       - "buildscripts/verify-build-provenance.sh"
+      - "buildscripts/check-release-commit.sh"
+      - "buildscripts/check-release-commit_test.sh"
+      - "buildscripts/release-dependency-guard/**"
       - "buildscripts/check-release-state.sh"
       - "buildscripts/check-release-state_test.sh"
       - "buildscripts/verify-rebrand.sh"
@@ -97,10 +100,14 @@ jobs:
       - name: GoReleaser config check
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: v2.18.3
+          version: v2.20.1
           args: check --config .github/goreleaser.yml
 
       - name: Validate Helm chart and legacy upgrade identity
+        env:
+          # Compute test variables sets a synthetic GoReleaser fixture tag;
+          # real tag equality is enforced in release.yml.
+          RELEASE_TAG: ""
         run: buildscripts/verify-helm-migration.sh
 
       - name: Install Syft
@@ -111,7 +118,7 @@ jobs:
       - name: Build snapshot artifacts
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: v2.18.3
+          version: v2.20.1
           # A pull-request snapshot has no trusted release identity. Exercise
           # the SBOM/checksum pipeline here, and reserve keyless signing for
           # the tag-triggered release workflow with GitHub OIDC.
@@ -482,6 +489,17 @@ jobs:
             fi
           done
 
+          # Both variants must trust the same roots: the UBI bundle with the
+          # RHSB-2026-012 blocklist applied, not Debian's bundle.
+          tar -xOf "${ctx}/rootfs.tar" etc/ssl/certs/ca-certificates.crt > "${ctx}/ca.pem"
+          openssl crl2pkcs7 -nocrl -certfile "${ctx}/ca.pem" \
+            | openssl pkcs7 -print_certs -noout > "${ctx}/ca-subjects.txt"
+          test "$(grep -c '^subject=' "${ctx}/ca-subjects.txt")" -gt 100
+          if grep -E '^subject=.*(AAA Certificate Services|emSign ECC Root CA - G3)' "${ctx}/ca-subjects.txt"; then
+            echo "distroless CA bundle still trusts a blocklisted root"
+            exit 1
+          fi
+
           # The baked-in healthcheck must drive Docker's health state on its
           # own, the probe binary must be directly exec-able without any
           # shell, and SIGTERM must still reach PID 1 (the server binary is
@@ -526,6 +544,8 @@ jobs:
           bash -n buildscripts/minio-upgrade.sh
           bash -n buildscripts/sign-release-rpms.sh
           bash -n buildscripts/verify-build-provenance.sh
+          bash -n buildscripts/check-release-commit.sh
+          bash -n buildscripts/check-release-commit_test.sh
           bash -n buildscripts/check-release-state.sh
           bash -n buildscripts/check-release-state_test.sh
           bash -n buildscripts/verify-rebrand.sh
@@ -542,6 +562,8 @@ jobs:
           test -x buildscripts/package-release.sh
           test -x buildscripts/sign-release-rpms.sh
           test -x buildscripts/verify-build-provenance.sh
+          test -x buildscripts/check-release-commit.sh
+          test -x buildscripts/check-release-commit_test.sh
           test -x buildscripts/check-release-state.sh
           test -x buildscripts/check-release-state_test.sh
           test -x buildscripts/verify-rebrand.sh
@@ -550,4 +572,6 @@ jobs:
           test -x buildscripts/package/preremove.sh
           test -x buildscripts/package/lifecycle_test.sh
           test -x dockerscripts/docker-entrypoint_test.sh
+          buildscripts/check-release-commit_test.sh
+          GOWORK=off go test ./buildscripts/release-dependency-guard
           buildscripts/check-release-state_test.sh

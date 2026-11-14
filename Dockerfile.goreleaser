@@ -1,4 +1,4 @@
-FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS curl-build
+FROM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS curl-build
 ARG TARGETARCH
 COPY dockerscripts/build-static-curl.sh /build/build-static-curl
 RUN /bin/sh /build/build-static-curl
@@ -9,7 +9,7 @@ COPY --from=curl-build /go/bin/curl /curl
 COPY --from=curl-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENTRYPOINT ["/curl"]
 
-FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
+FROM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS build
 
 ARG TARGETARCH
 
@@ -17,9 +17,9 @@ ENV GOPATH=/go
 ENV CGO_ENABLED=0
 
 ARG MC_REPO=pgsty/mc
-ARG MC_VERSION=RELEASE.2026-10-26T00-00-00Z
-ARG MC_AMD64_SHA256=54bd131039dad6677f083a75207b28f82818c067c8e65fae1973f51510d268e1
-ARG MC_ARM64_SHA256=9bb294f1912f8c6b9ac08c9a0b8d2964b86306a7c440b987ee5f0570d18de3c5
+ARG MC_VERSION=RELEASE.2026-11-12T00-00-00Z
+ARG MC_AMD64_SHA256=68875c7fdd06a76af12b74753506df65226d1bec65a405d2617d76448c229ba2
+ARG MC_ARM64_SHA256=4ea59d2f278c96b25e380289fd2ee9bc49faa342687074f031805cb7b34fbe1a
 
 RUN apk add -U --no-cache \
     ca-certificates \
@@ -65,9 +65,11 @@ RUN apk add -U --no-cache \
       echo "No mc or mcli binary found in archive:"; ls -la /tmp/mcli-extract/; exit 1; \
     fi && \
     chmod +x /go/bin/mcli && \
-    ln -sf mcli /go/bin/mc
+    ln -sf mcli /go/bin/mc && \
+    mkdir -p /go/share/mcli && \
+    cp /tmp/mcli-extract/LICENSE /tmp/mcli-extract/NOTICE /tmp/mcli-extract/CREDITS /go/share/mcli/
 
-FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3 AS certs
+FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:8b212f75a0e5a156ac28b1c5c030d2e8a07715254e19d522286118279399af81 AS certs
 # Native root blocklist mitigation: https://access.redhat.com/security/vulnerabilities/RHSB-2026-012
 RUN dnf -y install ca-certificates && \
     if [ -d /etc/pki/ca-trust/source/blocklist ]; then \
@@ -86,7 +88,7 @@ RUN dnf -y install ca-certificates && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:5be877a2a280ae36eb9ab80ca4efb28bbf77c57abbba38137cdc37a03b8465e6
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:b59ac4f291d86027c2681f7a7b1cbf7448972fc55a6cb8e25cab5aa5eef5ce5f
 
 LABEL org.opencontainers.image.title="Silo" \
       org.opencontainers.image.description="S3-Interface Libre Object Storage" \
@@ -107,6 +109,8 @@ ENV MINIO_ACCESS_KEY_FILE=access_key \
 COPY --from=certs /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY silo /usr/bin/silo
 COPY --from=build /go/bin/mcli /usr/bin/mcli
+# mcli's own legal files, from the same verified archive as the binary.
+COPY --from=build /go/share/mcli /licenses/mcli
 COPY --from=curl-build /go/bin/curl /usr/bin/curl
 COPY --from=curl-build /go/share/curl /licenses/curl
 COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh

@@ -340,16 +340,6 @@ func checkRequestAuthType(ctx context.Context, r *http.Request, action policy.Ac
 	return s3Err
 }
 
-func checkRequestAuthTypeWithExistingTags(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName, existingTags string) (s3Err APIErrorCode) {
-	logger.GetReqInfo(ctx).BucketName = bucketName
-	logger.GetReqInfo(ctx).ObjectName = objectName
-
-	if s3Err = authenticateRequest(ctx, r, action); s3Err != ErrNone {
-		return s3Err
-	}
-	return authorizeRequestWithExistingTags(ctx, r, action, existingTags)
-}
-
 func checkRequestAuthTypeWithRequestTags(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName string, requestTags *string) (s3Err APIErrorCode) {
 	logger.GetReqInfo(ctx).BucketName = bucketName
 	logger.GetReqInfo(ctx).ObjectName = objectName
@@ -425,6 +415,19 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 	return authorizeRequestWithExistingTags(ctx, r, action, "")
 }
 
+// authorizeBucketRequest authorizes a bucket action, such as s3:ListBucket,
+// on the bucket of a request made for one of its objects.
+func authorizeBucketRequest(ctx context.Context, r *http.Request, action policy.Action) APIErrorCode {
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	objectName := reqInfo.ObjectName
+	reqInfo.ObjectName = ""
+	defer func() { reqInfo.ObjectName = objectName }()
+	return authorizeRequest(ctx, r, action)
+}
+
 func deleteObjectAction(versionID string) policy.Action {
 	if versionID != "" {
 		return policy.DeleteObjectVersionAction
@@ -435,7 +438,12 @@ func deleteObjectAction(versionID string) policy.Action {
 func actionUsesObjectVersion(action policy.Action) bool {
 	switch action {
 	case policy.DeleteObjectAction, policy.DeleteObjectVersionAction,
-		policy.ReplicateDeleteAction, policy.BypassGovernanceRetentionAction:
+		policy.ReplicateDeleteAction, policy.BypassGovernanceRetentionAction,
+		policy.GetObjectAction, policy.GetObjectVersionAction,
+		policy.GetObjectAttributesAction, policy.GetObjectVersionAttributesAction,
+		policy.GetObjectTaggingAction, policy.GetObjectVersionTaggingAction,
+		policy.PutObjectTaggingAction, policy.PutObjectVersionTaggingAction,
+		policy.DeleteObjectTaggingAction, policy.DeleteObjectVersionTaggingAction:
 		return true
 	default:
 		return false
@@ -676,7 +684,15 @@ func setAuthMiddleware(h http.Handler) http.Handler {
 
 		aType := getRequestAuthType(r)
 		switch aType {
-		case authTypeSigned, authTypeSignedV2, authTypeStreamingSigned, authTypeStreamingSignedTrailer:
+		case authTypeSigned, authTypeSignedV2, authTypeStreamingSigned, authTypeStreamingSignedTrailer, authTypeStreamingUnsignedTrailer:
+			// STREAMING-UNSIGNED-PAYLOAD-TRAILER is valid for a genuinely
+			// anonymous request. Once Authorization is present, it is a
+			// signed REST-HEADER request and must obey the same date/skew
+			// bound as the other SigV4 streaming forms.
+			if aType == authTypeStreamingUnsignedTrailer && r.Header.Get(xhttp.Authorization) == "" {
+				h.ServeHTTP(w, r)
+				return
+			}
 			// Verify if date headers are set, if not reject the request
 			amzDate, errCode := parseAmzDateHeader(r)
 			if errCode != ErrNone {
@@ -774,11 +790,12 @@ func isPutActionAllowedWithRequestTags(ctx context.Context, atype authType, buck
 
 func isPutActionAllowedWithCred(bucketName, objectName string, r *http.Request, action policy.Action, requestTags *string, cred auth.Credentials, owner bool) APIErrorCode {
 	// Do not check for PutObjectRetentionAction permission,
-	// if mode and retain until date are not set.
+	// if neither retention values nor a replica retention revision are set.
 	// Can happen when bucket has default lock config set
 	if action == policy.PutObjectRetentionAction &&
 		r.Header.Get(xhttp.AmzObjectLockMode) == "" &&
-		r.Header.Get(xhttp.AmzObjectLockRetainUntilDate) == "" {
+		r.Header.Get(xhttp.AmzObjectLockRetainUntilDate) == "" &&
+		r.Header.Get(xhttp.MinIOSourceObjectRetentionTimestamp) == "" {
 		return ErrNone
 	}
 

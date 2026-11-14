@@ -246,7 +246,7 @@ func updateDriveIOStats(currentStats madmin.DiskIOStats, latestStats madmin.Disk
 	updateResourceMetrics(driveSubsystem, percUtil, float64(diffStats.TotalTicks)/(diffInSeconds*10), labels, false)
 }
 
-func collectDriveMetrics(m madmin.RealtimeMetrics) {
+func collectDriveMetrics(m realtimeMetrics) {
 	latestDriveStatsMu.Lock()
 	for d, dm := range m.ByDisk {
 		labels := map[string]string{"drive": d}

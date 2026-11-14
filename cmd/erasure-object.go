@@ -45,7 +45,6 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/grid"
-	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
@@ -134,8 +133,25 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	}
 
 	if dstOpts.ReplicaLockReconcile {
-		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(fi.Metadata))
-		reconcileStoredObjectTags(srcInfo.UserDefined, fi.Metadata[xhttp.AmzObjectTagging], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
+		stored := fi.ToObjectInfo(dstBucket, dstObject, dstOpts.Versioned || dstOpts.VersionSuspended)
+		if srcInfo.versionOnly || dstOpts.replicaObjectInfo != nil {
+			// fi describes the source of the new reference, not the version
+			// being replaced. A pooled lookup also preserves protection merged
+			// from another copy, even when this set holds a newer weak revision.
+			getInfo := er.getObjectInfo
+			if dstOpts.replicaObjectInfo != nil {
+				getInfo = dstOpts.replicaObjectInfo
+			}
+			stored, err = replicaStoredObjectInfo(ctx, func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+				opts.NoLock = true
+				return getInfo(ctx, bucket, object, opts)
+			}, dstBucket, dstObject, dstOpts.VersionID)
+			if err != nil {
+				return oi, err
+			}
+		}
+		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(stored.UserDefined))
+		reconcileStoredObjectTags(srcInfo.UserDefined, stored.UserTags, stored.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
 	}
 
 	filterOnlineDisksInplace(fi, metaArr, onlineDisks)
@@ -147,6 +163,17 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		if versionID == "" {
 			versionID = mustGetUUID()
 			fi.IsLatest = true // we are creating a new version so this is latest.
+		}
+	}
+	if srcInfo.versionOnly && (dstOpts.ReplicaLockReconcile || dstOpts.ReplicationRequest) && !dstOpts.DataMovement {
+		candidate := slices.Clone(metaArr)
+		for i := range candidate {
+			candidate[i].VersionID = versionID
+			candidate[i].Metadata = srcInfo.UserDefined
+		}
+		readDisks, readMeta := shuffleDisksAndPartsMetadataByIndex(onlineDisks, candidate, fi)
+		if err := er.checkReplicaContent(ctx, dstBucket, dstObject, srcBucket, srcObject, readMeta, readDisks, dstOpts); err != nil {
+			return oi, err
 		}
 	}
 
@@ -509,6 +536,11 @@ func joinErrs(errs []error) string {
 }
 
 func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object string, metaArr []FileInfo, errs []error, dataErrsByPart map[int][]int, opts ObjectOptions) (FileInfo, error) {
+	// Restore and restored-copy cleanup must preserve the version on read
+	// failure, including lookups and failure cleanup that reread metadata.
+	if opts.Transition.ExpireRestored || opts.Transition.RestoreRequest != nil {
+		return FileInfo{}, errErasureReadQuorum
+	}
 	m, ok := isObjectDangling(metaArr, errs, dataErrsByPart)
 	if !ok {
 		// We only come here if we cannot figure out if the object
@@ -656,9 +688,15 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 	meta := &xlMetaV2{versions: mergeXLV2Versions(readQuorum, false, 1, metadataShallowVersions...)}
 	lfi, err := meta.ToFileInfo(bucket, object, "", inclFreeVers, true)
 	if err != nil {
+		// No version in quorum proves absence only when every drive answered.
+		// Otherwise a drive holding a version keeps the read retryable.
+		partial := errors.Is(err, errFileNotFound) && !allDrivesAnswered(errs)
 		for i := range errs {
 			if errs[i] == nil {
 				errs[i] = err
+				if partial && hasVersion(metadataArray[i], inclFreeVers) {
+					errs[i] = errErasureReadQuorum
+				}
 			}
 		}
 		return metaFileInfos, errs
@@ -700,6 +738,33 @@ func pickLatestQuorumFilesInfo(ctx context.Context, rawFileInfos []RawFileInfo, 
 
 	// Return all the metadata.
 	return metaFileInfos, errs
+}
+
+// allDrivesAnswered reports whether every drive returned its metadata or a
+// definitive answer that it has none. Offline drives keep errDiskOngoingReq
+// in getObjectFileInfo; unreachable ones return errDiskNotFound or a
+// transport error.
+func allDrivesAnswered(errs []error) bool {
+	for _, err := range errs {
+		if err != nil && !IsErr(err, errFileNotFound, errFileVersionNotFound, errFileCorrupt, errVolumeNotFound) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasVersion reports whether a drive's xl.meta holds a version a read can
+// return.
+func hasVersion(xl *xlMetaV2, inclFreeVers bool) bool {
+	if xl == nil {
+		return false
+	}
+	for _, ver := range xl.versions {
+		if inclFreeVers || !ver.header.FreeVersion() {
+			return true
+		}
+	}
+	return false
 }
 
 // Checking if an object is dangling costs some IOPS; hence implementing this function
@@ -898,10 +963,13 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	// to the disks; this value is not accurate because we do
 	// not know the storage class of the object yet
 	minDisks := 0
-	if p := globalStorageClass.GetParityForSC(""); p > -1 {
+	if p := globalStorageClass.GetParityForSC(""); p > -1 && p < er.setDriveCount {
 		minDisks = er.setDriveCount - p
 	} else {
 		minDisks = er.setDriveCount - er.defaultParityCount
+	}
+	if minDisks < 1 {
+		minDisks = 1
 	}
 
 	if minDisks == er.setDriveCount/2 {
@@ -1002,8 +1070,10 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		}
 		// when we have insufficient read quorum and inconsistent metadata return
 		// file not found, since we can't possibly have a way to recover this object
-		// anyway.
-		if v, ok := err.(InsufficientReadQuorum); ok && v.Type == RQInconsistentMeta {
+		// anyway. That holds only when every drive answered: a drive that is
+		// offline or not yet reconnected may hold the copies that make quorum,
+		// and a 404 for an existing object is final to clients.
+		if v, ok := err.(InsufficientReadQuorum); ok && v.Type == RQInconsistentMeta && allDrivesAnswered(errs) {
 			if opts.VersionID != "" {
 				err = errFileVersionNotFound
 			} else {
@@ -1672,8 +1742,20 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 	}
+	if opts.RefuseLockedOverwrite {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if err := checkVersionLockedForOverwrite(ctx, bucket, object, fi.VersionID, getObjectInfo, opts.Transition); err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+	}
 
 	// Rename the successfully written temporary object to final location.
+	if err := er.checkReplicaContent(ctx, bucket, object, minioMetaTmpBucket, tempObj, partsMetadata, onlineDisks, opts); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 	onlineDisks, versions, oldDataDir, err := renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum)
 	if err != nil {
 		if errors.Is(err, errFileNotFound) {
@@ -1769,6 +1851,13 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 // into smaller bulks if some object names are found to be duplicated in the delete list, splitting
 // into smaller bulks will avoid holding twice the write lock of the duplicated object names.
 func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
+	if opts.DeleteAllVersions {
+		errs := make([]error, len(objects))
+		for i := range errs {
+			errs[i] = errDeleteAllUnsupported
+		}
+		return make([]DeletedObject, len(objects)), errs
+	}
 	if !opts.NoAuditLog {
 		for _, obj := range objects {
 			auditObjectErasureSet(ctx, "DeleteObjects", obj.ObjectName, &er)
@@ -2019,6 +2108,9 @@ func (er erasureObjects) deletePrefix(ctx context.Context, bucket, prefix string
 // any error as it is not necessary for the handler to reply back a
 // response to the client request.
 func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	if opts.DeleteAllVersions {
+		return objInfo, errDeleteAllUnsupported
+	}
 	if !opts.NoAuditLog {
 		auditObjectErasureSet(ctx, "DeleteObject", object, &er)
 	}
@@ -2045,6 +2137,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	// expiration attempted on a bucket with no lifecycle
 	// rules shall be rejected.
 	if lc == nil && opts.Expiration.Expire {
+		if !opts.Transition.ExpireRestored {
+			return objInfo, errLifecycleNotApplicable
+		}
 		if opts.VersionID != "" {
 			return objInfo, VersionNotFound{
 				Bucket:    bucket,
@@ -2089,6 +2184,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 					isErr = true
 				}
 				if isErr {
+					if !opts.Transition.ExpireRestored {
+						return goi, errLifecycleNotApplicable
+					}
 					if goi.VersionID != "" {
 						return goi, VersionNotFound{
 							Bucket:    bucket,
@@ -2107,6 +2205,11 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		return ObjectInfo{}, toObjectErr(er.deletePrefix(ctx, bucket, object), bucket, object)
 	}
 
+	// An ILM version expiry that the pools checked with the versions in all
+	// pools; the set still guards the protection it reads, see
+	// checkedExpiryRefused.
+	checkedExpiry := opts.Expiration.Expire && opts.Expiration.CheckedAllPools && opts.VersionID != "" && !opts.Transition.ExpireRestored
+
 	storageDisks := er.getDisks()
 	versionFound := true
 	objInfo = ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
@@ -2114,7 +2217,10 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	tryDel := false
 	if gerr != nil && goi.Name == "" {
 		if _, ok := gerr.(InsufficientReadQuorum); ok {
-			if opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
+			// A restored-copy expiry needs fresh metadata to confirm its target
+			// and deadline, a checked expiry to guard its protection; ordinary
+			// unversioned DELETE may still try a blind delete.
+			if opts.Transition.ExpireRestored || checkedExpiry || opts.Versioned || opts.VersionSuspended || opts.RefuseLockedOverwrite || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
 				// Add an MRF heal for next time.
 				er.addPartial(bucket, object, opts.VersionID)
 				return objInfo, InsufficientWriteQuorum{}
@@ -2134,6 +2240,26 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	// A queued null restore may now address a replacement delete marker.
+	// Such errors carry ObjectInfo, but never authorize cache cleanup.
+	if opts.Transition.ExpireRestored && (gerr != nil || goi.DeleteMarker) {
+		return objInfo, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
+	}
+	// A restored copy expires only by its own reason, decided on the
+	// version's authoritative generation: a drive that missed a renewal or a
+	// later POST must not authorize removing the cache, nor drives that
+	// disagree on the restore status. Another lifecycle deletion falling due,
+	// or the all-pools check of an ordinary expiry, does not stand in for it.
+	if opts.Transition.ExpireRestored {
+		gen, err := er.readRestoreGeneration(ctx, bucket, object, opts.VersionID)
+		if err != nil || gen.split || gen.fi.Deleted || lc == nil {
+			return goi, errLifecycleNotApplicable
+		}
+		if !restoredCopyExpires(ctx, *lc, rcfg, replcfg, gen.fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)) {
+			return goi, errLifecycleNotApplicable
+		}
+	}
+
 	if opts.EvalMetadataFn != nil {
 		dsc, err := opts.EvalMetadataFn(&goi, gerr)
 		if err != nil {
@@ -2145,13 +2271,40 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	// When versioning is disabled or suspended for this key, an unaddressed
+	// delete overwrites or removes the null version even if a newer non-null
+	// version is returned as latest by getObjectInfoAndQuorum above.
+	retOI, retErr := goi, gerr
+	if !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" && (opts.EvalRetentionBypassFn != nil || opts.RefuseLockedOverwrite) {
+		if gerr == nil && goi.VersionID != "" && goi.VersionID != nullVersionID {
+			nullOpts := opts
+			nullOpts.VersionID = nullVersionID
+			retOI, _, retErr = er.getObjectInfoAndQuorum(ctx, bucket, object, nullOpts)
+			if _, ok := retErr.(InsufficientReadQuorum); ok && opts.RefuseLockedOverwrite {
+				er.addPartial(bucket, object, nullVersionID)
+				return objInfo, InsufficientWriteQuorum{}
+			}
+		}
+	}
+
 	if opts.EvalRetentionBypassFn != nil {
-		if err := opts.EvalRetentionBypassFn(goi, gerr); err != nil {
+		if err := opts.EvalRetentionBypassFn(retOI, retErr); err != nil {
+			return ObjectInfo{}, err
+		}
+	} else if opts.RefuseLockedOverwrite && !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+		if err := refuseLockedMarkerOverwrite(ctx, bucket, object, nullVersionID, retOI, retErr); err != nil {
 			return ObjectInfo{}, err
 		}
 	}
 
-	if opts.Expiration.Expire {
+	// A delete marker that names a stored version replaces it.
+	if opts.RefuseLockedOverwrite && opts.DeleteMarker && opts.VersionID != "" {
+		if err := refuseLockedMarkerOverwrite(ctx, bucket, object, opts.VersionID, goi, gerr); err != nil {
+			return ObjectInfo{}, err
+		}
+	}
+
+	if opts.Expiration.Expire && !opts.Expiration.CheckedAllPools {
 		if gerr == nil {
 			evt := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, goi)
 			var isErr bool
@@ -2162,6 +2315,9 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 				isErr = true
 			}
 			if isErr {
+				if !opts.Transition.ExpireRestored {
+					return goi, errLifecycleNotApplicable
+				}
 				if goi.VersionID != "" {
 					return goi, VersionNotFound{
 						Bucket:    bucket,
@@ -2175,6 +2331,8 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 				}
 			}
 		}
+	} else if checkedExpiry && checkedExpiryRefused(*lc, rcfg, replcfg, goi, opts.Expiration.ApprovedProtection) {
+		return goi, errLifecycleNotApplicable
 	}
 
 	//  Determine whether to mark object deleted for replication
@@ -2456,7 +2614,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 
 	fi.Metadata[xhttp.AmzObjectTagging] = tags
 	fi.ReplicationState = opts.PutReplicationState()
-	stamp := monotonicTaggingTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
+	stamp := monotonicMetadataTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
 	maps.Copy(fi.Metadata, opts.UserDefined)
 	if stamp != "" {
 		fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp] = stamp
@@ -2619,107 +2777,6 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 	tags := opts.LifecycleAuditEvent.Tags()
 	auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
 	return err
-}
-
-// RestoreTransitionedObject - restore transitioned object content locally on this cluster.
-// This is similar to PostObjectRestore from AWS GLACIER
-// storage class. When PostObjectRestore API is called, a temporary copy of the object
-// is restored locally to the bucket on source cluster until the restore expiry date.
-// The copy that was transitioned continues to reside in the transitioned tier.
-func (er erasureObjects) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
-	return er.restoreTransitionedObject(ctx, bucket, object, opts)
-}
-
-// update restore status header in the metadata
-func (er erasureObjects) updateRestoreMetadata(ctx context.Context, bucket, object string, objInfo ObjectInfo, opts ObjectOptions) error {
-	oi := objInfo.Clone()
-	oi.metadataOnly = true // Perform only metadata updates.
-
-	// allow retry in the case of failure to restore
-	delete(oi.UserDefined, xhttp.AmzRestore)
-
-	if _, err := er.CopyObject(ctx, bucket, object, bucket, object, oi, ObjectOptions{
-		VersionID: oi.VersionID,
-	}, ObjectOptions{
-		VersionID: oi.VersionID,
-	}); err != nil {
-		storageLogIf(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
-		return err
-	}
-	return nil
-}
-
-// restoreTransitionedObject for multipart object chunks the file stream from remote tier into the same number of parts
-// as in the xl.meta for this version and rehydrates the part.n into the fi.DataDir for this version as in the xl.meta
-func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket string, object string, opts ObjectOptions) error {
-	setRestoreHeaderFn := func(oi ObjectInfo, rerr error) error {
-		if rerr == nil {
-			return nil // nothing to do; restore object was successful
-		}
-		er.updateRestoreMetadata(ctx, bucket, object, oi, opts)
-		return rerr
-	}
-	var oi ObjectInfo
-	// get the file info on disk for transitioned object
-	actualfi, _, _, err := er.getObjectFileInfo(ctx, bucket, object, opts, false)
-	if err != nil {
-		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
-	}
-
-	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
-	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
-	if len(oi.Parts) == 1 {
-		var rs *HTTPRangeSpec
-		gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
-		if err != nil {
-			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
-		}
-		defer gr.Close()
-		hashReader, err := hash.NewReader(ctx, gr, gr.ObjInfo.Size, "", "", gr.ObjInfo.Size)
-		if err != nil {
-			return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
-		}
-		pReader := NewPutObjReader(hashReader)
-		_, err = er.PutObject(ctx, bucket, object, pReader, ropts)
-		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
-	}
-
-	res, err := er.NewMultipartUpload(ctx, bucket, object, ropts)
-	if err != nil {
-		return setRestoreHeaderFn(oi, err)
-	}
-
-	var uploadedParts []CompletePart
-	var rs *HTTPRangeSpec
-	// get reader from the warm backend - note that even in the case of encrypted objects, this stream is still encrypted.
-	gr, err := getTransitionedObjectReader(ctx, bucket, object, rs, http.Header{}, oi, opts)
-	if err != nil {
-		return setRestoreHeaderFn(oi, err)
-	}
-	defer gr.Close()
-
-	// rehydrate the parts back on disk as per the original xl.meta prior to transition
-	for _, partInfo := range oi.Parts {
-		hr, err := hash.NewReader(ctx, io.LimitReader(gr, partInfo.Size), partInfo.Size, "", "", partInfo.Size)
-		if err != nil {
-			return setRestoreHeaderFn(oi, err)
-		}
-		pInfo, err := er.PutObjectPart(ctx, bucket, object, res.UploadID, partInfo.Number, NewPutObjReader(hr), ObjectOptions{})
-		if err != nil {
-			return setRestoreHeaderFn(oi, err)
-		}
-		if pInfo.Size != partInfo.Size {
-			return setRestoreHeaderFn(oi, InvalidObjectState{Bucket: bucket, Object: object})
-		}
-		uploadedParts = append(uploadedParts, CompletePart{
-			PartNumber: pInfo.PartNumber,
-			ETag:       pInfo.ETag,
-		})
-	}
-	_, err = er.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{
-		MTime: oi.ModTime,
-	})
-	return setRestoreHeaderFn(oi, err)
 }
 
 // DecomTieredObject - moves tiered object to another pool during decommissioning.

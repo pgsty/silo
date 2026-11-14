@@ -568,18 +568,15 @@ func generateListVersionsResponse(ctx context.Context, bucket, prefix, marker, v
 		DisplayName: "minio",
 	}
 	data := ListVersionsResponse{}
-	var lastObjMetaName string
 	var tagErr, metaErr APIErrorCode = -1, -1
 
 	for _, object := range resp.Objects {
 		if object.Name == "" {
 			continue
 		}
-		// Cache checks for the same object
-		if metadata != nil && lastObjMetaName != object.Name {
-			tagErr = metadata(object.Name, policy.GetObjectTaggingAction)
-			metaErr = metadata(object.Name, policy.GetObjectAction)
-			lastObjMetaName = object.Name
+		if metadata != nil {
+			tagErr = metadata(object, policy.GetObjectTaggingAction)
+			metaErr = metadata(object, policy.GetObjectAction)
 		}
 		content := ObjectVersion{}
 		content.Key = s3EncodeName(object.Name, encodingType)
@@ -727,10 +724,10 @@ func generateListObjectsV2Response(ctx context.Context, bucket, prefix, token, n
 		}
 		content.Owner = owner
 		if metadata != nil {
-			if metadata(object.Name, policy.GetObjectTaggingAction) == ErrNone {
+			if metadata(object, policy.GetObjectTaggingAction) == ErrNone {
 				content.UserTags = object.UserTags
 			}
-			if metadata(object.Name, policy.GetObjectAction) == ErrNone {
+			if metadata(object, policy.GetObjectAction) == ErrNone {
 				content.UserMetadata = &Metadata{}
 				switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
 				case crypto.S3:
@@ -774,7 +771,7 @@ func generateListObjectsV2Response(ctx context.Context, bucket, prefix, token, n
 	return data
 }
 
-type metaCheckFn = func(name string, action policy.Action) (s3Err APIErrorCode)
+type metaCheckFn = func(object ObjectInfo, action policy.Action) (s3Err APIErrorCode)
 
 // generates CopyObjectResponse from the committed object information.
 func generateCopyObjectResponse(oi ObjectInfo, cs map[string]string) CopyObjectResponse {

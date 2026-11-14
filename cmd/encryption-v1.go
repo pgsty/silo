@@ -260,6 +260,15 @@ func ParseSSECustomerHeader(header http.Header) (key []byte, err error) {
 // This function rotates old to new key.
 func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byte, bucket, object string, metadata map[string]string, cryptoCtx kms.Context) error {
 	kind, _ := crypto.IsEncrypted(metadata)
+	return rotateKeyWithTarget(ctx, oldKey, kind, newKeyID, newKey, bucket, object, metadata, cryptoCtx, len(cryptoCtx) > 0)
+}
+
+func rotateKeyWithTarget(ctx context.Context, oldKey []byte, targetKind crypto.Type, newKeyID string, newKey []byte, bucket, object string, metadata map[string]string, cryptoCtx kms.Context, replaceContext bool) error {
+	kind, _ := crypto.IsEncrypted(metadata)
+	if targetKind == nil {
+		targetKind = kind
+	}
+	var objectKey crypto.ObjectKey
 	switch kind {
 	case crypto.S3:
 		if GlobalKMS == nil {
@@ -269,7 +278,7 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 		if err != nil {
 			return err
 		}
-		oldKey, err := GlobalKMS.Decrypt(ctx, &kms.DecryptRequest{
+		unsealKey, err := GlobalKMS.Decrypt(ctx, &kms.DecryptRequest{
 			Name:           keyID,
 			Ciphertext:     kmsKey,
 			AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
@@ -277,66 +286,30 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 		if err != nil {
 			return err
 		}
-		var objectKey crypto.ObjectKey
-		if err = objectKey.Unseal(oldKey, sealedKey, crypto.S3.String(), bucket, object); err != nil {
+		if err = objectKey.Unseal(unsealKey, sealedKey, crypto.S3.String(), bucket, object); err != nil {
 			return err
 		}
-
-		newKey, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
-			Name:           GlobalKMS.DefaultKey,
-			AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
-		})
-		if err != nil {
-			return err
-		}
-		sealedKey = objectKey.Seal(newKey.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, object)
-		crypto.S3.CreateMetadata(metadata, newKey.KeyID, newKey.Ciphertext, sealedKey)
-		return nil
 	case crypto.S3KMS:
 		if GlobalKMS == nil {
 			return errKMSNotConfigured
 		}
-		objectKey, err := crypto.S3KMS.UnsealObjectKey(GlobalKMS, metadata, bucket, object)
+		var err error
+		objectKey, err = crypto.S3KMS.UnsealObjectKey(GlobalKMS, metadata, bucket, object)
 		if err != nil {
 			return err
 		}
-
-		if len(cryptoCtx) == 0 {
+		if targetKind == crypto.S3KMS && !replaceContext && len(cryptoCtx) == 0 {
 			_, _, _, cryptoCtx, err = crypto.S3KMS.ParseMetadata(metadata)
 			if err != nil {
 				return err
 			}
 		}
-
-		// If the context does not contain the bucket key
-		// we must add it for key generation. However,
-		// the context must be stored exactly like the
-		// client provided it. Therefore, we create a copy
-		// of the client provided context and add the bucket
-		// key, if not present.
-		kmsCtx := kms.Context{}
-		maps.Copy(kmsCtx, cryptoCtx)
-		if _, ok := kmsCtx[bucket]; !ok {
-			kmsCtx[bucket] = path.Join(bucket, object)
-		}
-		newKey, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
-			Name:           newKeyID,
-			AssociatedData: kmsCtx,
-		})
-		if err != nil {
-			return err
-		}
-
-		sealedKey := objectKey.Seal(newKey.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3KMS.String(), bucket, object)
-		crypto.S3KMS.CreateMetadata(metadata, newKey.KeyID, newKey.Ciphertext, sealedKey, cryptoCtx)
-		return nil
 	case crypto.SSEC:
 		sealedKey, err := crypto.SSEC.ParseMetadata(metadata)
 		if err != nil {
 			return err
 		}
 
-		var objectKey crypto.ObjectKey
 		if err = objectKey.Unseal(oldKey, sealedKey, crypto.SSEC.String(), bucket, object); err != nil {
 			if subtle.ConstantTimeCompare(oldKey, newKey) == 1 {
 				return errInvalidSSEParameters // AWS returns special error for equal but invalid keys.
@@ -352,6 +325,55 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 		return nil
 	default:
 		return errObjectTampered
+	}
+
+	switch targetKind {
+	case crypto.S3:
+		genKey, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+			Name:           GlobalKMS.DefaultKey,
+			AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
+		})
+		if err != nil {
+			return err
+		}
+		delete(metadata, crypto.MetaSealedKeyKMS)
+		delete(metadata, crypto.MetaKeyID)
+		delete(metadata, crypto.MetaDataEncryptionKey)
+		delete(metadata, crypto.MetaContext)
+		sealedKey := objectKey.Seal(genKey.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, object)
+		crypto.S3.CreateMetadata(metadata, genKey.KeyID, genKey.Ciphertext, sealedKey)
+		return nil
+	case crypto.S3KMS:
+		// If the context does not contain the bucket key
+		// we must add it for key generation. However,
+		// the context must be stored exactly like the
+		// client provided it. Therefore, we create a copy
+		// of the client provided context and add the bucket
+		// key, if not present.
+		kmsCtx := kms.Context{}
+		maps.Copy(kmsCtx, cryptoCtx)
+		if _, ok := kmsCtx[bucket]; !ok {
+			kmsCtx[bucket] = path.Join(bucket, object)
+		}
+		genKey, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+			Name:           newKeyID,
+			AssociatedData: kmsCtx,
+		})
+		if err != nil {
+			if errors.Is(err, kes.ErrKeyNotFound) {
+				return errKMSKeyNotFound
+			}
+			return err
+		}
+		delete(metadata, crypto.MetaSealedKeyS3)
+		delete(metadata, crypto.MetaKeyID)
+		delete(metadata, crypto.MetaDataEncryptionKey)
+		delete(metadata, crypto.MetaContext)
+		sealedKey := objectKey.Seal(genKey.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3KMS.String(), bucket, object)
+		crypto.S3KMS.CreateMetadata(metadata, genKey.KeyID, genKey.Ciphertext, sealedKey, cryptoCtx)
+		return nil
+	default:
+		return errInvalidEncryptionParameters
 	}
 }
 

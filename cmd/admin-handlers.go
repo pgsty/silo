@@ -791,7 +791,7 @@ func (a adminAPIHandlers) MetricsHandler(w http.ResponseWriter, r *http.Request)
 
 	enc := json.NewEncoder(w)
 	for n > 0 {
-		var m madmin.RealtimeMetrics
+		var m realtimeMetrics
 		mLocal := collectLocalMetrics(types, collectMetricsOpts{
 			hosts: hostMap,
 			disks: diskMap,
@@ -2675,7 +2675,7 @@ func fetchHealthInfo(healthCtx context.Context, objectAPI ObjectLayer, query *ur
 	// collect all realtime metrics except disk
 	// disk metrics are already included under drive info of each server
 	getRealtimeMetrics := func() *madmin.RealtimeMetrics {
-		var m madmin.RealtimeMetrics
+		var m realtimeMetrics
 		types := madmin.MetricsAll &^ madmin.MetricsDisk
 		mLocal := collectLocalMetrics(types, collectMetricsOpts{})
 		m.Merge(&mLocal)
@@ -2690,7 +2690,8 @@ func fetchHealthInfo(healthCtx context.Context, objectAPI ObjectLayer, query *ur
 			m.ByHost[anonAddr(host)] = metrics
 			delete(m.ByHost, host)
 		}
-		return &m
+		legacy := m.legacy()
+		return &legacy
 	}
 
 	anonymizeCmdLine := func(cmdLine string) string {

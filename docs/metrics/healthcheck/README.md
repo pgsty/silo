@@ -1,6 +1,6 @@
 # Silo Healthcheck
 
-Silo server exposes three un-authenticated, healthcheck endpoints liveness probe and a cluster probe at `/minio/health/live` and `/minio/health/cluster` respectively.
+Silo server exposes four unauthenticated healthcheck endpoints: `/minio/health/live`, `/minio/health/ready`, `/minio/health/cluster`, and `/minio/health/cluster/read`.
 
 ## Native CLI probe
 
@@ -29,11 +29,15 @@ healthcheck:
   retries: 5
 ```
 
+`ready` can return success before storage and IAM finish loading. It checks the process and, when configured, KMS and etcd; it does not certify S3 data access. Keep this bootstrap behavior so distributed peers can discover and connect to one another. Kubernetes headless peer services must retain `publishNotReadyAddresses: true`.
+
+`cluster` checks initialization and reported write quorum, but a restarted node can still be reconnecting its remote drives after that check succeeds. Neither endpoint is a sufficient gate for an application that immediately reads or writes S3. Compose `depends_on: condition: service_healthy` inherits the image probe's limited meaning. Keep the node probe, and gate the dependent application with a bounded signed S3 check: write a uniquely named small object through each node, then read every acknowledged object through every node and verify its bytes and version. Retry within a fixed overall deadline with per-request timeouts, and clean up the probe objects. Failure should stop the rollout or dependent startup. This samples the tested keys and erasure sets; it does not prove spare failure capacity or that every drive is online. See the [startup window](#startup-readiness-window) below.
+
 `silo healthcheck --maintenance cluster` answers the pre-drain question documented below: exit `0` when the node can be taken down safely, exit `1` (HTTP 412) when doing so would lose HA. Keep the `cluster` checks out of per-container liveness probes — they reflect cluster-wide quorum, not this process.
 
 ## Liveness probe
 
-This probe always responds with '200 OK'. Only fails if 'etcd' is configured and unreachable. When liveness probe fails, Kubernetes like platforms restart the container.
+This probe returns `200 OK` while the process accepts requests, including before the object layer initializes. It can return `503` under request-queue saturation and does not check KMS or etcd. Kubernetes uses repeated liveness failures to restart the container, so configure its startup budget and failure threshold accordingly.
 
 ```
 livenessProbe:
@@ -50,7 +54,7 @@ livenessProbe:
 
 ## Readiness probe
 
-This probe responds with '200 OK' once the server process is up: it fails only while the request queue is overloaded, or when the health operation against the configured KMS or 'etcd' fails. When readiness probe fails, Kubernetes like platforms turn-off routing to the container.
+This probe responds with '200 OK' once the server process is up: it fails only while the request queue is overloaded, or when the health operation against the configured KMS or 'etcd' fails. It does not wait for storage or IAM to load, because a distributed node must be reachable by its peers before it can load them; the headless service of a StatefulSet should still publish not-ready addresses. When readiness probe fails, Kubernetes like platforms turn-off routing to the container.
 
 ```
 readinessProbe:
@@ -72,7 +76,7 @@ readinessProbe:
 The reply is '200 OK' if cluster has write quorum if not it returns '503 Service Unavailable'.
 
 ```
-curl http://silo1:9001/minio/health/cluster
+curl http://silo1:9000/minio/health/cluster
 HTTP/1.1 503 Service Unavailable
 Accept-Ranges: bytes
 Content-Length: 0
@@ -90,7 +94,7 @@ Date: Tue, 21 Jul 2020 00:36:14 GMT
 The reply is '200 OK' if cluster has read quorum if not it returns '503 Service Unavailable'.
 
 ```
-curl http://silo1:9001/minio/health/cluster/read
+curl http://silo1:9000/minio/health/cluster/read
 HTTP/1.1 503 Service Unavailable
 Accept-Ranges: bytes
 Content-Length: 0
@@ -108,7 +112,7 @@ Date: Tue, 21 Jul 2020 00:36:14 GMT
 You may query the cluster probe endpoint to check if the node which received the request can be taken down for maintenance, if the server replies back '412 Precondition Failed' this means you will lose HA. '200 OK' means you are okay to proceed.
 
 ```
-curl http://silo1:9001/minio/health/cluster?maintenance=true
+curl http://silo1:9000/minio/health/cluster?maintenance=true
 HTTP/1.1 412 Precondition Failed
 Accept-Ranges: bytes
 Content-Length: 0

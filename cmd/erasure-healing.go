@@ -343,6 +343,11 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, partsMetadata, errs, er.defaultParityCount)
 	if err != nil {
+		if dryRun {
+			// A metadata quorum failure must not delete dangling data in dry-run.
+			return er.defaultHealResult(FileInfo{}, storageDisks, storageEndpoints,
+				errs, bucket, object, versionID), err
+		}
 		m, derr := er.deleteIfDangling(ctx, bucket, object, partsMetadata, errs, nil, ObjectOptions{
 			VersionID: versionID,
 		})
@@ -372,6 +377,13 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, quorumModTime, quorumETag, readQuorum)
 	if err != nil {
 		return result, err
+	}
+	// The restore fields fence native restores and restored-copy cleanup.
+	// Heal copies them only as a quorum of the drives holds them; while the
+	// drives disagree, it waits rather than create a quorum for one side.
+	latestMeta, err = restoreHealMeta(partsMetadata, latestMeta, max(len(storageDisks)/2+1, readQuorum))
+	if err != nil {
+		return result, toObjectErr(err, bucket, object, versionID)
 	}
 
 	// No modtime quorum

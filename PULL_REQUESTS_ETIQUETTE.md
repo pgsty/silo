@@ -42,7 +42,8 @@ PRs must flow smoothly through review to reach production. Large PRs should be s
    - Document testing steps in the PR summary if manual testing was performed.
 
 4. **Before Submitting**:
-   - Run `make verify` to check formatting, linting, and tests.
+   - Sign off every commit under the Developer Certificate of Origin (`git commit -s`).
+   - Run `make verifiers` to check formatting, linting, code generation, and `rebrand-guard`.
    - Reference related issues (e.g., “Closes #1234”).
    - Notify team members via GitHub `@mentions` if urgent or complex.
 

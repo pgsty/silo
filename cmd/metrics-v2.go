@@ -2127,7 +2127,7 @@ func getILMNodeMetrics() *MetricsGroupV2 {
 			trActiveTasks.Value = float64(globalTransitionState.ActiveTasks())
 			trMissedTasks.Value = float64(globalTransitionState.MissedImmediateTasks())
 		}
-		return []MetricV2{
+		metrics := []MetricV2{
 			expPendingTasks,
 			expMissedTasks,
 			expMissedFreeVersions,
@@ -2137,6 +2137,20 @@ func getILMNodeMetrics() *MetricsGroupV2 {
 			trActiveTasks,
 			trMissedTasks,
 		}
+		for reason, n := range globalILMIncomplete.snapshot() {
+			metrics = append(metrics, MetricV2{
+				Description: MetricDescription{
+					Namespace: nodeMetricNamespace,
+					Subsystem: ilmSubsystem,
+					Name:      expiryIncompleteTotal,
+					Help:      "Total number of ILM expiry attempts since server start that ended without removing what they addressed, by reason; tier_unsupported_skipped counts the scanner's per-drive observations of an expiry of all versions it did not queue",
+					Type:      counterMetric,
+				},
+				VariableLabels: map[string]string{"reason": reason},
+				Value:          float64(n),
+			})
+		}
+		return metrics
 	})
 	return mg
 }
@@ -3790,7 +3804,7 @@ func getBatchJobsMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
 	}
 
 	mg.RegisterRead(func(ctx context.Context) (metrics []MetricV2) {
-		var m madmin.RealtimeMetrics
+		var m realtimeMetrics
 		mLocal := collectLocalMetrics(madmin.MetricsBatchJobs, collectMetricsOpts{})
 		m.Merge(&mLocal)
 

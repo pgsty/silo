@@ -11,11 +11,11 @@ fullnameOverride: ""
 ##
 clusterDomain: cluster.local
 
-## Set default image, imageTag, and imagePullPolicy. mode is used to indicate the
+## Set default Silo server image repository, tag, and pull policy.
 ##
 image:
   repository: pgsty/silo
-  tag: RELEASE.2026-09-16T00-00-00Z
+  tag: RELEASE.2026-11-12T00-00-00Z
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -25,7 +25,7 @@ imagePullSecrets: []
 ##
 mcImage:
   repository: pgsty/mc
-  tag: RELEASE.2026-10-26T00-00-00Z
+  tag: RELEASE.2026-11-12T00-00-00Z
   pullPolicy: IfNotPresent
 
 ## Silo mode, i.e. standalone or distributed.
@@ -517,7 +517,7 @@ postJob:
 ## Add environment variables for Silo. The MINIO_* names remain the stable
 ## configuration interface and are passed to the Silo container(s).
 environment:
-  ## Please refer for comprehensive list https://silo.pgsty.com/reference/minio-server/minio-server/
+  ## See https://silo.pgsty.com/reference/minio-server/settings/ for available settings.
   ## MINIO_BROWSER: "off"
 
 ## The name of a secret in the same kubernetes namespace which contain secret values

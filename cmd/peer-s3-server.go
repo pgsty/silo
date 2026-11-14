@@ -29,6 +29,7 @@ import (
 const (
 	peerS3Bucket            = "bucket"
 	peerS3BucketDeleted     = "bucket-deleted"
+	peerS3BucketDryRun      = "dry-run"
 	peerS3BucketForceCreate = "force-create"
 	peerS3BucketForceDelete = "force-delete"
 )

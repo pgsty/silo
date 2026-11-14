@@ -165,8 +165,11 @@ license grant to SILO or upstream MinIO maintainers is required.
 
 ### How does Silo manage dependencies?
 
-Silo uses Go modules. Preserve the compatibility module and import paths in
-`go.mod`; downstream forks are selected with explicit `replace` directives.
+Silo uses Go modules. Shared packages in `github.com/pgsty/silo-pkg/v3` are
+required and imported directly under their own module path, upstream
+`github.com/minio/minio-go/v7` is pinned to a verified commit, and Console
+(`github.com/minio/console`) and MC (`github.com/minio/mc`) are selected with
+explicit `replace` directives in `go.mod`.
 
 - Run `go get foo/bar` in the source folder to add the dependency to `go.mod` file.
 

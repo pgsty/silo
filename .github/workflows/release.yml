@@ -20,6 +20,7 @@ permissions:
   id-token: write
   attestations: write
   artifact-metadata: write
+  actions: read
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -74,7 +75,7 @@ jobs:
       - name: Gate release on Object Lock authorization and overwrite tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
-        run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
+        run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|ReplicaDeleteObjectLock|PoolsReplicaDeleteObjectLock|BulkDeleteDirectoryObjectLock|BulkDeleteObjectLock|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
 
       - name: Compute release variables
         env:
@@ -102,6 +103,12 @@ jobs:
             echo "Release tag ${TAG} resolves to ${TAG_COMMIT}, checkout is ${HEAD_COMMIT}" >&2
             exit 1
           fi
+          CHART_APP_VERSION="$(sed -n 's/^appVersion: *//p' helm/silo/Chart.yaml)"
+          CHART_IMAGE_TAG="$(sed -n '/^image:/,/^[^ ]/s/^  tag: *//p' helm/silo/values.yaml)"
+          if [ "${CHART_APP_VERSION}" != "${TAG}" ] || [ "${CHART_IMAGE_TAG}" != "${TAG}" ]; then
+            echo "helm/silo Chart.yaml appVersion (${CHART_APP_VERSION}) and values.yaml image.tag (${CHART_IMAGE_TAG}) must match release tag ${TAG}" >&2
+            exit 1
+          fi
           VERSION_HYPHEN="${TAG#RELEASE.}"
           PKG_VERSION="$(echo "${VERSION_HYPHEN}" | sed -E 's/^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/\1\2\3\4\5\6.0.0/')"
           VERSION_COLON="$(echo "${VERSION_HYPHEN}" | sed -E 's/T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/T\1:\2:\3Z/')"
@@ -109,13 +116,28 @@ jobs:
 
           {
             echo "RELEASE_TAG=${TAG}"
+            echo "RELEASE_COMMIT=${HEAD_COMMIT}"
             echo "PKG_VERSION=${PKG_VERSION}"
             echo "LDFLAGS=${LDFLAGS}"
           } >> "${GITHUB_ENV}"
 
           echo "Release tag: ${TAG}"
+          echo "Release commit: ${HEAD_COMMIT}"
           echo "Package version: ${PKG_VERSION}"
           echo "LDFLAGS: ${LDFLAGS}"
+
+      - name: Check release commit is the tip of main with green CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          buildscripts/check-release-commit.sh "${RELEASE_COMMIT}"
+
+      - name: Verify coordinated release dependencies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOWORK: "off"
+        run: go run ./buildscripts/release-dependency-guard
 
       - name: Check existing release state
         env:
@@ -140,7 +162,7 @@ jobs:
       - name: Build Draft release with GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: v2.18.3
+          version: v2.20.1
           args: release --clean --skip=validate --config .github/goreleaser.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

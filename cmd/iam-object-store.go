@@ -87,6 +87,10 @@ func (iamOS *IAMObjectStore) getUsersSysType() UsersSysType {
 }
 
 func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item any, objPath string, opts ...options) error {
+	if iamConfigNameUnstorable(objPath) {
+		// What a single drive reports for the same key.
+		return ObjectNameInvalid{Bucket: minioMetaBucket, Object: objPath}
+	}
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	data, err := json.Marshal(item)
 	if err != nil {
@@ -141,15 +145,15 @@ func decryptData(ctx context.Context, data []byte, objPath string) ([]byte, erro
 	return nil, err
 }
 
-// iamConfigNameTooLong identifies length errors for valid keys with an ASCII
-// component that cannot be stored. Normalized LDAP DNs escape non-ASCII bytes.
-// Byte length alone is insufficient for Unicode filenames on macOS/Windows,
-// and a total-path limit can make an existing record unreadable after a move.
-func iamConfigNameTooLong(objPath string, err error) bool {
-	var invalid ObjectNameInvalid
-	if !errors.Is(err, errFileNameTooLong) && !errors.As(err, &invalid) {
-		return false
-	}
+// iamConfigNameUnstorable identifies valid keys with an ASCII component that
+// cannot be stored. Normalized LDAP DNs escape non-ASCII bytes. Byte length
+// alone is insufficient for Unicode filenames on macOS/Windows, and a
+// total-path limit can make an existing record unreadable after a move.
+//
+// The drives must not be asked about such a key: on an erasure set each one
+// fails with its own ENAMETOOLONG path error, the errors never agree, and the
+// object layer reports a read or write quorum failure instead of the length.
+func iamConfigNameUnstorable(objPath string) bool {
 	if checkBucketAndObjectNames(context.Background(), minioMetaBucket, objPath) != nil {
 		return false
 	}
@@ -161,14 +165,23 @@ func iamConfigNameTooLong(objPath string, err error) bool {
 	return false
 }
 
+// iamConfigNameTooLong identifies length errors for unstorable keys.
+func iamConfigNameTooLong(objPath string, err error) bool {
+	var invalid ObjectNameInvalid
+	if !errors.Is(err, errFileNameTooLong) && !errors.As(err, &invalid) {
+		return false
+	}
+	return iamConfigNameUnstorable(objPath)
+}
+
 func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context, objPath string) ([]byte, ObjectInfo, error) {
+	if iamConfigNameUnstorable(objPath) {
+		// A missing record, not a storage failure: lookups of the
+		// identity proceed, while saving its record still fails.
+		return nil, ObjectInfo{}, errConfigNotFound
+	}
 	data, meta, err := readConfigWithMetadata(ctx, iamOS.objAPI, objPath, ObjectOptions{})
 	if err != nil {
-		if iamConfigNameTooLong(objPath, err) {
-			// A missing record, not a storage failure: lookups of the
-			// identity proceed, while saving its record still fails.
-			err = errConfigNotFound
-		}
 		return nil, meta, err
 	}
 	data, err = decryptData(ctx, data, objPath)

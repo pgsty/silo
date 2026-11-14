@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand"
@@ -28,13 +29,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/etag"
+	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/pgsty/silo-pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/pgsty/silo-pkg/v3/workers"
 )
 
@@ -81,43 +86,67 @@ const (
 
 // BatchJobKeyRotateEncryption defines key rotation encryption options passed
 type BatchJobKeyRotateEncryption struct {
-	Type       BatchKeyRotationType `yaml:"type" json:"type"`
-	Key        string               `yaml:"key" json:"key"`
-	Context    string               `yaml:"context" json:"context"`
-	kmsContext kms.Context          `msg:"-"`
+	Type    BatchKeyRotationType `yaml:"type" json:"type"`
+	Key     string               `yaml:"key" json:"key"`
+	Context string               `yaml:"context" json:"context"`
+}
+
+// batchKeyRotateContext decodes the persisted configuration on every run. It
+// must not depend on unpersisted derived state or mutate shared job options.
+func batchKeyRotateContext(encoded string) (kms.Context, error) {
+	ctx := kms.Context{}
+	if encoded == "" {
+		return ctx, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	// Saving the context replaces invalid UTF-8 and can collapse distinct
+	// keys, changing the associated data required to decrypt the object.
+	if !utf8.Valid(b) {
+		return nil, fmt.Errorf("KMS context must be valid UTF-8: %w", errInvalidArgument)
+	}
+	if err = jsoniter.ConfigCompatibleWithStandardLibrary.Unmarshal(b, &ctx); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = kms.Context{}
+	}
+	return ctx, nil
 }
 
 // Validate validates input key rotation encryption options.
 func (e BatchJobKeyRotateEncryption) Validate() error {
+	_, err := e.validate()
+	return err
+}
+
+// validate also returns a fresh context for the actual rotation. Validation's
+// probe entry is added to a separate map, never to the object's context.
+func (e BatchJobKeyRotateEncryption) validate() (kms.Context, error) {
 	if e.Type != sses3 && e.Type != ssekms {
-		return errInvalidArgument
+		return nil, errInvalidArgument
 	}
 	spaces := strings.HasPrefix(e.Key, " ") || strings.HasSuffix(e.Key, " ")
 	if e.Type == ssekms && spaces {
-		return crypto.ErrInvalidEncryptionKeyID
+		return nil, crypto.ErrInvalidEncryptionKeyID
 	}
-
-	if e.Type == ssekms && GlobalKMS != nil {
-		ctx := kms.Context{}
-		if e.Context != "" {
-			b, err := base64.StdEncoding.DecodeString(e.Context)
-			if err != nil {
-				return err
-			}
-
-			json := jsoniter.ConfigCompatibleWithStandardLibrary
-			if err := json.Unmarshal(b, &ctx); err != nil {
-				return err
-			}
-		}
-		e.kmsContext = kms.Context{}
-		maps.Copy(e.kmsContext, ctx)
-		ctx["MinIO batch API"] = "batchrotate" // Context for a test key operation
-		if _, err := GlobalKMS.GenerateKey(GlobalContext, &kms.GenerateKeyRequest{Name: e.Key, AssociatedData: ctx}); err != nil {
-			return err
+	if e.Type != ssekms {
+		return nil, nil
+	}
+	ctx, err := batchKeyRotateContext(e.Context)
+	if err != nil {
+		return nil, err
+	}
+	if GlobalKMS != nil {
+		probe := maps.Clone(ctx)
+		probe["MinIO batch API"] = "batchrotate" // Context for a test key operation
+		if _, err := GlobalKMS.GenerateKey(GlobalContext, &kms.GenerateKeyRequest{Name: e.Key, AssociatedData: probe}); err != nil {
+			return nil, err
 		}
 	}
-	return nil
+	return ctx, nil
 }
 
 // BatchKeyRotateFilter holds all the filters currently supported for batch replication
@@ -161,8 +190,68 @@ func (r BatchJobKeyRotateV1) Notify(ctx context.Context, ri *batchJobInfo) error
 	return notifyEndpoint(ctx, ri, r.Flags.Notify.Endpoint, r.Flags.Notify.Token)
 }
 
-// KeyRotate rotates encryption key of an object
-func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, objInfo ObjectInfo) error {
+// batchAuthoritativeVersion returns the version obj as all its copies
+// describe it. With several pools a version can have copies in more than one
+// pool, and a read returns one of them; the merged copy carries the newest
+// Object Lock and tag state. The caller holds the object's write lock.
+func batchAuthoritativeVersion(ctx context.Context, api ObjectLayer, bucket, object string, obj ObjectInfo) (ObjectInfo, error) {
+	z, ok := api.(*erasureServerPools)
+	if !ok || z.SinglePool() {
+		return obj, nil
+	}
+	versionID := obj.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	return z.replicaObjectInfo(ctx, bucket, encodeDirObject(object), ObjectOptions{VersionID: versionID, NoLock: true, NoAuditLog: true})
+}
+
+// batchAuthoritativeRead is batchAuthoritativeVersion for a version that has
+// been opened for reading. It takes the object's read lock itself, since an
+// opened reader may hold none.
+func batchAuthoritativeRead(ctx context.Context, api ObjectLayer, bucket, object string, obj ObjectInfo) (ObjectInfo, error) {
+	z, ok := api.(*erasureServerPools)
+	if !ok || z.SinglePool() {
+		return obj, nil
+	}
+	lk := z.NewNSLock(bucket, encodeDirObject(object))
+	lkctx, err := lk.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer lk.RUnlock(lkctx)
+	return batchAuthoritativeVersion(lkctx.Context(), api, bucket, object, obj)
+}
+
+// rotateAuthzRequests are the actions of rotating one version: it is read and
+// written again in place with the new key.
+func (r *BatchJobKeyRotateV1) rotateAuthzRequests(oi ObjectInfo) []batchAuthzRequest {
+	versionID := oi.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	// The encryption the rewrite leaves: SSE-KMS takes the requested key,
+	// including when migrating an SSE-S3 version to SSE-KMS.
+	values := map[string][]string{}
+	switch {
+	case crypto.S3KMS.IsEncrypted(oi.UserDefined) || r.Encryption.Type == ssekms:
+		values[strings.ToLower(xhttp.AmzServerSideEncryption)] = []string{xhttp.AmzEncryptionKMS}
+		if r.Encryption.Type == ssekms && r.Encryption.Key != "" {
+			values[strings.ToLower(xhttp.AmzServerSideEncryptionKmsID)] = []string{r.Encryption.Key}
+		}
+	case crypto.S3.IsEncrypted(oi.UserDefined):
+		values[strings.ToLower(xhttp.AmzServerSideEncryption)] = []string{xhttp.AmzEncryptionAES}
+	}
+	return []batchAuthzRequest{
+		{action: policy.GetObjectAction, bucket: r.Bucket, object: oi.Name, versionID: versionID, tags: oi.UserTags},
+		{action: policy.GetObjectVersionAction, bucket: r.Bucket, object: oi.Name, versionID: versionID, tags: oi.UserTags},
+		{action: policy.PutObjectAction, bucket: r.Bucket, object: oi.Name, versionID: versionID, tags: oi.UserTags, values: values},
+	}
+}
+
+// KeyRotate rotates encryption key of an object. A version that Object Lock
+// protects is not rewritten: it returns ObjectLocked.
+func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, objInfo ObjectInfo, sub *batchJobSubmitter) error {
 	srcBucket := r.Bucket
 	srcObject := objInfo.Name
 
@@ -180,7 +269,8 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 	versioned := globalBucketVersioningSys.PrefixEnabled(srcBucket, srcObject)
 	versionSuspended := globalBucketVersioningSys.PrefixSuspended(srcBucket, srcObject)
 
-	lock := api.NewNSLock(r.Bucket, objInfo.Name)
+	// Lock the name writers lock: the stored name of a directory object.
+	lock := api.NewObjectNSLock(r.Bucket, encodeDirObject(objInfo.Name))
 	lkctx, err := lock.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return err
@@ -194,47 +284,194 @@ func (r *BatchJobKeyRotateV1) KeyRotate(ctx context.Context, api ObjectLayer, ob
 		VersionSuspended: versionSuspended,
 		NoLock:           true,
 	}
-	obj, err := api.GetObjectInfo(ctx, r.Bucket, objInfo.Name, opts)
+	obj, pool, err := batchRotateRead(ctx, api, r.Bucket, objInfo.Name, opts)
 	if err != nil {
 		return err
 	}
-	oi := obj.Clone()
-	var (
-		newKeyID      string
-		newKeyContext kms.Context
-	)
-	encMetadata := make(map[string]string)
-	for k, v := range oi.UserDefined {
-		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
-			encMetadata[k] = v
+	// Decide on the version as it is under the lock that the rewrite holds,
+	// before any key is requested, with the metadata of all its copies.
+	logical, err := batchAuthoritativeVersion(ctx, api, r.Bucket, objInfo.Name, obj)
+	if err != nil {
+		return err
+	}
+	if enforceRetentionForDeletion(ctx, logical) {
+		return ObjectLocked{Bucket: r.Bucket, Object: obj.Name, VersionID: obj.VersionID}
+	}
+	p, err := sub.principal(ctx)
+	if err != nil {
+		return err
+	}
+	// Authorize the copy that is read and rewritten, and the version as all
+	// its copies describe it.
+	for _, v := range []ObjectInfo{obj, logical} {
+		for _, req := range r.rotateAuthzRequests(v) {
+			if err := p.authorize(req); err != nil {
+				return err
+			}
 		}
 	}
-
+	oi := obj.Clone()
+	var (
+		newKeyID       string
+		newKeyContext  kms.Context
+		replaceContext bool
+		targetKind     crypto.Type = crypto.S3
+	)
+	if sseKMS || r.Encryption.Type == ssekms {
+		targetKind = crypto.S3KMS
+	}
 	if (sseKMS || sseS3) && r.Encryption.Type == ssekms {
-		if err = r.Encryption.Validate(); err != nil {
+		newKeyContext, err = r.Encryption.validate()
+		if err != nil {
 			return err
 		}
 		newKeyID = strings.TrimPrefix(r.Encryption.Key, crypto.ARNPrefix)
-		newKeyContext = r.Encryption.kmsContext
-	}
-	if err = rotateKey(ctx, []byte{}, newKeyID, []byte{}, r.Bucket, oi.Name, encMetadata, newKeyContext); err != nil {
-		return err
+		replaceContext = r.Encryption.Context != ""
 	}
 
-	// Since we are rotating the keys, make sure to update the metadata.
-	oi.metadataOnly = true
-	oi.keyRotation = true
-	maps.Copy(oi.UserDefined, encMetadata)
-	if _, err := api.CopyObject(ctx, r.Bucket, oi.Name, r.Bucket, oi.Name, oi, ObjectOptions{
-		VersionID: oi.VersionID,
-	}, ObjectOptions{
-		VersionID: oi.VersionID,
-		NoLock:    true,
-	}); err != nil {
-		return err
+	srcOpts := ObjectOptions{VersionID: oi.VersionID}
+	dstOpts := ObjectOptions{
+		VersionID:        oi.VersionID,
+		Versioned:        versioned,
+		VersionSuspended: versionSuspended,
+		NoLock:           true,
 	}
 
-	return nil
+	if oi.Legacy {
+		if targetKind == crypto.S3KMS && !replaceContext && len(newKeyContext) == 0 && sseKMS {
+			_, _, _, newKeyContext, err = crypto.S3KMS.ParseMetadata(oi.UserDefined)
+			if err != nil {
+				return err
+			}
+		}
+		readOpts := ObjectOptions{
+			VersionID:        oi.VersionID,
+			Versioned:        versioned,
+			VersionSuspended: versionSuspended,
+			NoLock:           true,
+			NoAuditLog:       true,
+		}
+		var gr *GetObjectReader
+		if z, ok := api.(*erasureServerPools); ok && pool >= 0 {
+			gr, err = z.serverPools[pool].GetObjectNInfo(ctx, r.Bucket, encodeDirObject(oi.Name), nil, http.Header{}, readOpts)
+		} else {
+			gr, err = api.GetObjectNInfo(ctx, r.Bucket, oi.Name, nil, http.Header{}, readOpts)
+		}
+		if err != nil {
+			return err
+		}
+		defer gr.Close()
+
+		actualSize, err := gr.ObjInfo.GetActualSize()
+		if err != nil {
+			return err
+		}
+		rawReader, err := hash.NewReader(ctx, gr, actualSize, "", "", actualSize)
+		if err != nil {
+			return err
+		}
+		pReader := NewPutObjReader(rawReader)
+		encMetadata := make(map[string]string)
+		encReader, objEncKey, err := newEncryptReader(ctx, rawReader, targetKind, newKeyID, nil, r.Bucket, oi.Name, encMetadata, newKeyContext)
+		if err != nil {
+			return err
+		}
+		crypto.RemoveInternalEntries(oi.UserDefined)
+		delete(oi.UserDefined, crypto.MetaContext)
+		delete(oi.UserDefined, ReservedMetadataPrefix+"compression")
+		delete(oi.UserDefined, ReservedMetadataPrefix+"actual-size")
+		maps.Copy(oi.UserDefined, encMetadata)
+
+		targetSize := (&ObjectInfo{Size: actualSize}).EncryptedSize()
+		wrapped := etag.Wrap(encReader, rawReader)
+		hReader, err := hash.NewReader(ctx, wrapped, targetSize, "", "", actualSize)
+		if err != nil {
+			return err
+		}
+		pReader, err = pReader.WithEncryption(hReader, &objEncKey)
+		if err != nil {
+			return err
+		}
+		oi.PutObjReader = pReader
+		oi.metadataOnly = false
+		oi.keyRotation = true
+		dstOpts.EncryptFn = metadataEncrypter(objEncKey)
+		if dstOpts.VersionID == "" && (versioned || versionSuspended) {
+			dstOpts.VersionID = nullVersionID
+		}
+	} else {
+		encMetadata := make(map[string]string)
+		for k, v := range oi.UserDefined {
+			if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
+				encMetadata[k] = v
+			}
+		}
+		if err = rotateKeyWithTarget(ctx, []byte{}, targetKind, newKeyID, []byte{}, r.Bucket, oi.Name, encMetadata, newKeyContext, replaceContext); err != nil {
+			return err
+		}
+		// Since we are rotating the keys, make sure to update the metadata.
+		oi.metadataOnly = true
+		oi.keyRotation = true
+		delete(oi.UserDefined, crypto.MetaSealedKeyS3)
+		delete(oi.UserDefined, crypto.MetaSealedKeyKMS)
+		delete(oi.UserDefined, crypto.MetaKeyID)
+		delete(oi.UserDefined, crypto.MetaDataEncryptionKey)
+		delete(oi.UserDefined, crypto.MetaContext)
+		maps.Copy(oi.UserDefined, encMetadata)
+	}
+	// The rewrite replaces the stored metadata with UserDefined, which a
+	// read returns without the tags and the expiry: keep them.
+	if oi.UserTags != "" {
+		oi.UserDefined[xhttp.AmzObjectTagging] = oi.UserTags
+	}
+	if !oi.Expires.IsZero() {
+		oi.UserDefined["expires"] = oi.ExpiresStr()
+	}
+	if z, ok := api.(*erasureServerPools); ok && pool >= 0 {
+		// Rewrite the copy that was read and authorized. The pools layer
+		// would route the rewrite by the latest version of the key, which
+		// can be in a pool that holds another write of this version ID.
+		//
+		// Check the pool's state again where the pools layer checks it,
+		// right before the write: a move can have started since the read.
+		if z.IsSuspended(pool) || z.IsPoolRebalancing(pool) {
+			return errBatchRotateMoving
+		}
+		dstOpts.replicaObjectInfo = z.replicaObjectInfo
+		name := encodeDirObject(oi.Name)
+		_, err = z.serverPools[pool].CopyObject(ctx, r.Bucket, name, r.Bucket, name, oi, srcOpts, dstOpts)
+	} else {
+		_, err = api.CopyObject(ctx, r.Bucket, oi.Name, r.Bucket, oi.Name, oi, srcOpts, dstOpts)
+	}
+	return err
+}
+
+// errBatchRotateMoving: the version is read from a pool that a decommission
+// or a rebalance is moving.
+var errBatchRotateMoving = errors.New("the version is being moved to another pool; rotate it once the move is done")
+
+// batchRotateRead reads the version that a rotation rewrites, as
+// GetObjectInfo does. With several pools it also returns the pool of the
+// copy it read, otherwise -1. The caller holds the object lock.
+//
+// A copy in a pool that a decommission or a rebalance is moving is the
+// source of that move, which must not change under it, and rewriting a copy
+// in another pool would change which copy the version's metadata comes
+// from. Such a version is left to a later run (errBatchRotateMoving).
+func batchRotateRead(ctx context.Context, api ObjectLayer, bucket, object string, opts ObjectOptions) (ObjectInfo, int, error) {
+	z, ok := api.(*erasureServerPools)
+	if !ok || z.SinglePool() {
+		oi, err := api.GetObjectInfo(ctx, bucket, object, opts)
+		return oi, -1, err
+	}
+	if err := checkGetObjArgs(ctx, bucket, object); err != nil {
+		return ObjectInfo{}, -1, err
+	}
+	oi, idx, err := z.getLatestObjectInfoWithIdx(ctx, bucket, object, opts)
+	if err == nil && (z.IsSuspended(idx) || z.IsPoolRebalancing(idx)) {
+		return ObjectInfo{}, -1, errBatchRotateMoving
+	}
+	return oi, idx, err
 }
 
 const (
@@ -255,10 +492,13 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		StartTime: job.Started,
 	}
 	if err := ri.loadOrInit(ctx, api, job); err != nil {
-		return err
+		return batchUnavailable("loading job progress", err)
 	}
 	if ri.Complete {
 		return nil
+	}
+	if done, err := ri.startAuthorized(ctx, api, job); done || err != nil {
+		return err
 	}
 
 	globalBatchJobsMetrics.save(job.ID, ri)
@@ -272,8 +512,6 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	if delay <= 0 {
 		delay = batchKeyRotateJobDefaultRetryDelay
 	}
-
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	selectObj := func(info FileInfo) (ok bool) {
 		if r.Flags.Filter.OlderThan > 0 && time.Since(info.ModTime) < r.Flags.Filter.OlderThan {
@@ -355,65 +593,103 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		return err
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancelCause := context.WithCancelCause(ctx)
+	defer cancelCause(nil)
+	// refuse ends the job for its submitter: record why before stopping.
+	refuse := func(err error) {
+		if isBatchJobUnavailable(err) {
+			ri.pause(err)
+		} else {
+			ri.refuse(err)
+		}
+		cancelCause(err)
+	}
+	progress := newBatchProgress(ri, r.Bucket)
 
 	results := make(chan itemOrErr[ObjectInfo], 100)
 	if err := api.Walk(ctx, r.Bucket, r.Prefix, results, WalkOptions{
 		Marker: lastObject,
 		Filter: selectObj,
 	}); err != nil {
-		cancel()
-		// Do not need to retry if we can't list objects on source.
-		return err
+		cause := batchListingError(err)
+		if isBatchJobUnavailable(cause) {
+			return ri.savePaused(ctx, api, job, cause)
+		}
+		return cause
 	}
 	failed := false
 	for res := range results {
+		if context.Cause(ctx) != nil {
+			// Refused or canceled: schedule nothing more.
+			continue
+		}
 		if res.Err != nil {
 			failed = true
+			cancelCause(batchListingError(res.Err))
 			batchLogIf(ctx, res.Err)
-			break
+			continue
 		}
 		result := res.Item
+		if !batchResumeAfter(lastObject, result.Name) {
+			// Completed by the run that set the cursor.
+			continue
+		}
 		sseKMS := crypto.S3KMS.IsEncrypted(result.UserDefined)
 		sseS3 := crypto.S3.IsEncrypted(result.UserDefined)
 		if !sseKMS && !sseS3 { // neither sse-s3 nor sse-kms disallowed
 			continue
 		}
+		seq := progress.begin()
 		wk.Take()
 		go func() {
 			defer wk.Give()
+			var counts batchCounts
 			for attempts := 1; attempts <= retryAttempts; attempts++ {
 				stopFn := globalBatchJobsMetrics.trace(batchJobMetricKeyRotation, job.ID, attempts)
-				success := true
-				if err := r.KeyRotate(ctx, api, result); err != nil {
-					stopFn(result, err)
-					batchLogIf(ctx, err)
-					success = false
-					if attempts >= retryAttempts {
-						auditOptions := AuditLogOptions{
-							Event:     "KeyRotate",
-							APIName:   "StartBatchJob",
-							Bucket:    result.Bucket,
-							Object:    result.Name,
-							VersionID: result.VersionID,
-							Error:     err.Error(),
-						}
-						auditLogInternal(ctx, auditOptions)
-					}
-				} else {
-					stopFn(result, nil)
+				err := r.KeyRotate(ctx, api, result, job.Submitter)
+				if errors.Is(err, errBatchRotateMoving) {
+					err = batchUnavailable("object is being moved", err)
 				}
-				ri.trackCurrentBucketObject(r.Bucket, result, success, attempts)
-				globalBatchJobsMetrics.save(job.ID, ri)
-				// persist in-memory state to disk after every 10secs.
-				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
-				if success {
+				stopFn(result, err)
+				if err == nil {
+					counts.objects = 1
+					break
+				}
+				if isBatchJobStopped(err) {
+					refuse(err)
+					return
+				}
+				if isErrObjectLocked(err) {
+					// Left as it is, not retried and not a failure.
+					counts.versionsSkipped = 1
+					break
+				}
+				if ctx.Err() != nil {
+					// Not done; a later run rotates it.
+					return
+				}
+				batchLogIf(ctx, err)
+				if attempts >= retryAttempts {
+					auditOptions := AuditLogOptions{
+						Event:     "KeyRotate",
+						APIName:   "StartBatchJob",
+						Bucket:    result.Bucket,
+						Object:    result.Name,
+						VersionID: result.VersionID,
+						Error:     err.Error(),
+					}
+					auditLogInternal(ctx, auditOptions)
+					counts.objectsFailed = 1
 					break
 				}
 				if delay > 0 {
-					time.Sleep(delay + time.Duration(rnd.Float64()*float64(delay)))
+					time.Sleep(delay + time.Duration(rand.Float64()*float64(delay)))
 				}
 			}
+			progress.done(seq, result.Name, counts)
+			globalBatchJobsMetrics.save(job.ID, ri)
+			// persist in-memory state to disk after every 10secs.
+			batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
 
 			if wait := globalBatchConfig.KeyRotationWait(); wait > 0 {
 				time.Sleep(wait)
@@ -421,18 +697,34 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		}()
 	}
 	wk.Wait()
-
-	ri.Complete = !failed && ri.ObjectsFailed == 0
-	ri.Failed = failed || ri.ObjectsFailed > 0
-	globalBatchJobsMetrics.save(job.ID, ri)
-	// persist in-memory state to disk.
-	batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
-
-	if err := r.Notify(ctx, ri); err != nil {
-		batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
+	cause := context.Cause(ctx)
+	if !failed && cause == nil {
+		// The walk ended: its last key is done.
+		progress.finish()
+	}
+	if cause != nil && !ri.refused() {
+		if isBatchJobUnavailable(cause) {
+			return ri.savePaused(ctx, api, job, cause)
+		}
+		// Stopped before the end: keep the work after the cursor pending.
+		globalBatchJobsMetrics.save(job.ID, ri)
+		batchLogIf(ctx, ri.updateAfter(GlobalContext, api, 0, job))
+		return cause
 	}
 
-	cancel()
+	if !ri.refused() {
+		ri.mu.Lock()
+		ri.Complete = !failed && ri.ObjectsFailed == 0
+		ri.Failed = failed || ri.ObjectsFailed > 0
+		ri.mu.Unlock()
+	}
+	globalBatchJobsMetrics.save(job.ID, ri)
+	// persist in-memory state to disk.
+	batchLogIf(ctx, ri.updateAfter(GlobalContext, api, 0, job))
+
+	if err := r.Notify(GlobalContext, ri); err != nil {
+		batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
+	}
 	return nil
 }
 

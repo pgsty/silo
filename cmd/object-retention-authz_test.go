@@ -544,6 +544,18 @@ func (p *hookBeforeWrite) CompleteMultipartUpload(ctx context.Context, bucket, k
 	return p.ObjectLayer.CompleteMultipartUpload(ctx, bucket, key, uploadID, parts, opts)
 }
 
+// The COPY handler checks Object Lock under its destination's write lock, so
+// no writer can land between that check and the copy. The latest a writer can
+// land is just before the handler takes its locks.
+func (p *hookBeforeWrite) lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error) {
+	for _, r := range reqs {
+		if r.write {
+			p.fire(r.object)
+		}
+	}
+	return p.ObjectLayer.lockObjects(ctx, reqs...)
+}
+
 func TestDirectoryObjectLockAfterPreflight(t *testing.T) {
 	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
 		t:                 t,

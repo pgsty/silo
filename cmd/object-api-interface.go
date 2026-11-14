@@ -71,6 +71,7 @@ type ObjectOptions struct {
 	DeleteMarker            bool // Is only set in DELETE operations for delete marker replication
 	CheckDMReplicationReady bool // Is delete marker ready to be replicated - set only during HEAD
 	Tagging                 bool // Is only in GET/HEAD operations to return tagging metadata along with regular metadata and body.
+	TaggingCount            bool // GET/HEAD caller is authorized to receive object tag metadata.
 
 	UserDefined         map[string]string   // only set in case of POST/PUT operations
 	ObjectAttributes    map[string]struct{} // Attribute tags defined by the users for the GetObjectAttributes request
@@ -103,8 +104,35 @@ type ObjectOptions struct {
 	DeletePrefix                        bool      // set true to enforce a prefix deletion, only application for DeleteObject API,
 	DeletePrefixObject                  bool      // set true when object's erasure set is resolvable by object name (using getHashedSetIndex)
 
+	// DeleteAllVersions asks DeleteObject to purge every version of exactly
+	// this key by version ID, for an ILM or batch expiry of all versions;
+	// see erasureServerPools.deleteAllVersions. In memory only.
+	DeleteAllVersions bool
+	// DeleteAllLatest is the latest version that a batch expiry matched.
+	// The purge of all versions only runs while it is still the latest.
+	DeleteAllLatest *deleteAllMatch
+	// DeleteAllResult, when set, receives what a purge of all versions
+	// confirmed, also when it fails part way.
+	DeleteAllResult *deleteAllResult
+	// deleteAllAuthorize authorizes a batch purge of all versions, which
+	// needs it, on every copy of every version the purge approved and every
+	// revision of one that a drive holds, one of each distinct version ID
+	// and tags, before it deletes any; its error refuses the key and is
+	// returned. Set by batch expiration only, never from a request.
+	deleteAllAuthorize func(versions []ObjectInfo) error
+
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn
+	// Verifies protected content in every pool before a replica commits.
+	replicaContentGuard replicaContentGuardFn
+	// Selected under the object locks, before copy encryption/compression.
+	copyPlan *copyObjectPlan
+
+	// RefuseLockedOverwrite refuses, under the destination's write lock, a
+	// write that would replace a stored version Object Lock protects: the
+	// version it writes, or the version a delete marker it writes names.
+	// It returns ObjectLocked. Set by batch replication pulls.
+	RefuseLockedOverwrite bool
 
 	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
@@ -159,6 +187,14 @@ type WalkOptions struct {
 // ExpirationOptions represents object options for object expiration at objectLayer.
 type ExpirationOptions struct {
 	Expire bool
+	// CheckedAllPools: the expiry was checked with the versions of the
+	// object in all pools (checkExpiryAllPools). A set does not check it
+	// again with the versions it holds alone.
+	CheckedAllPools bool
+	// ApprovedProtection: the Object Lock state of the version with which
+	// the check approved its expiry. The set compares it with the state it
+	// reads (checkedExpiryRefused). In memory only.
+	ApprovedProtection objectLockState `msg:"-"`
 }
 
 // TransitionOptions represents object options for transition ObjectLayer operation
@@ -169,6 +205,15 @@ type TransitionOptions struct {
 	RestoreRequest *RestoreObjectRequest
 	RestoreExpiry  time.Time
 	ExpireRestored bool
+
+	// attempt is the native restore a call belongs to: the attempt that
+	// POST marked on the version, see restoreRequest.
+	attempt *restoreAttempt
+	// owner is the restore lock of the version, which POST hands to the
+	// worker that runs attempt, see erasureServerPools.RestoreTransitionedObject.
+	owner *restoreOwner
+	// restoreDate is the request date POST recorded with attempt.
+	restoreDate string
 }
 
 // MakeBucketOptions represents bucket options for ObjectLayer bucket operations
@@ -250,7 +295,14 @@ func (o *ObjectOptions) SetEvalRetentionBypassFn(f EvalRetentionBypassFn) {
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
 	// Locking operations on object.
+	// NewNSLock locks names in one stable domain. It is for names that are
+	// not objects, such as bucket and IAM metadata locks.
 	NewNSLock(bucket string, objects ...string) RWLocker
+	// NewObjectNSLock locks one object in the lock domain of its writes.
+	NewObjectNSLock(bucket, object string) RWLocker
+	// lockObjects locks several objects together, see erasureServerPools.
+	lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error)
+	prepareCopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (copyObjectPlan, error)
 
 	// Storage operations.
 	Shutdown(context.Context) error
@@ -287,6 +339,8 @@ type ObjectLayer interface {
 	DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error)
 	TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error
 	RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error
+	// restoreRequest records a POST restore on a version, see erasureServerPools.
+	restoreRequest(ctx context.Context, bucket, object string, opts ObjectOptions, target ObjectInfo) (restoreRequestStatus, error)
 
 	// Multipart operations.
 	ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error)

@@ -354,16 +354,23 @@ func (client *remotePeerS3Client) HealBucket(ctx context.Context, bucket string,
 		return madmin.HealResultItem{}, nil
 	}
 
-	mss := grid.NewMSSWith(map[string]string{
-		peerS3Bucket:        bucket,
-		peerS3BucketDeleted: strconv.FormatBool(opts.Remove),
-	})
+	mss := healBucketPeerMSS(bucket, opts)
 
 	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
 	defer cancel()
 
 	resp, err := healBucketRPC.Call(ctx, conn, mss)
 	return resp.ValueOrZero(), toStorageErr(err)
+}
+
+// healBucketPeerMSS encodes the bucket heal options a peer applies to its
+// local drives. Peers that predate the dry-run key ignore it.
+func healBucketPeerMSS(bucket string, opts madmin.HealOpts) *grid.MSS {
+	return grid.NewMSSWith(map[string]string{
+		peerS3Bucket:        bucket,
+		peerS3BucketDeleted: strconv.FormatBool(opts.Remove),
+		peerS3BucketDryRun:  strconv.FormatBool(opts.DryRun),
+	})
 }
 
 // GetBucketInfo returns bucket stat info from a peer

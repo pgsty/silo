@@ -763,13 +763,13 @@ func (sys *IAMSys) DeleteUser(ctx context.Context, accessKey string, notifyPeers
 // CurrentPolicies - returns comma separated policy string, from
 // an input policy after validating if there are any current
 // policies which exist on MinIO corresponding to the input.
-func (sys *IAMSys) CurrentPolicies(policyName string) string {
+func (sys *IAMSys) CurrentPolicies(policyName string) (string, error) {
 	if !sys.Initialized() {
-		return ""
+		return "", errServerNotInitialized
 	}
 
-	policies, _ := sys.store.MergePolicies(policyName)
-	return policies
+	policies, _, err := sys.store.MergePolicies(policyName)
+	return policies, err
 }
 
 func (sys *IAMSys) notifyForUser(ctx context.Context, accessKey string, isTemp bool) {
@@ -1087,15 +1087,50 @@ func (sys *IAMSys) notifyForServiceAccount(ctx context.Context, accessKey string
 }
 
 type newServiceAccountOpts struct {
-	sessionPolicy              *policy.Policy
-	accessKey                  string
-	secretKey                  string
-	status                     string // Used by replication snapshots; local creates default to enabled.
-	name, description          string
-	expiration                 *time.Time
-	allowSiteReplicatorAccount bool // allow creating internal service account for site-replication.
+	sessionPolicy               *policy.Policy
+	accessKey                   string
+	secretKey                   string
+	status                      string // Used by replication snapshots; local creates default to enabled.
+	name, description           string
+	expiration                  *time.Time
+	allowSiteReplicatorAccount  bool // allow creating internal service account for site-replication.
+	preserveEmptyEmbeddedPolicy bool // preserve historical deny-all empty embedded policies on snapshot import/replication.
 
 	claims map[string]any
+}
+
+func svcAcctClaimsHaveEmbeddedPolicy(claims map[string]any) bool {
+	if claims == nil {
+		return false
+	}
+	pt, _ := claims[iamPolicyClaimNameSA()].(string)
+	return pt == embeddedPolicyType
+}
+
+// marshalServiceAccountPolicy validates a supplied policy and normalizes its
+// version without changing the caller's policy. An empty policy means inheritance.
+func marshalServiceAccountPolicy(sp *policy.Policy) ([]byte, error) {
+	if sp == nil {
+		return nil, nil
+	}
+	p := *sp
+	if p.Version == "" {
+		p.Version = policy.DefaultVersion
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	if p.IsEmpty() {
+		return nil, nil
+	}
+	buf, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) > maxSVCSessionPolicySize {
+		return nil, errSessionPolicyTooLarge
+	}
+	return buf, nil
 }
 
 // NewServiceAccount - create a new service account
@@ -1115,19 +1150,9 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		return auth.Credentials{}, time.Time{}, auth.ErrNoAccessKeyWithSecretKey
 	}
 
-	var policyBuf []byte
-	if opts.sessionPolicy != nil {
-		err := opts.sessionPolicy.Validate()
-		if err != nil {
-			return auth.Credentials{}, time.Time{}, err
-		}
-		policyBuf, err = json.Marshal(opts.sessionPolicy)
-		if err != nil {
-			return auth.Credentials{}, time.Time{}, err
-		}
-		if len(policyBuf) > maxSVCSessionPolicySize {
-			return auth.Credentials{}, time.Time{}, errSessionPolicyTooLarge
-		}
+	policyBuf, err := marshalServiceAccountPolicy(opts.sessionPolicy)
+	if err != nil {
+		return auth.Credentials{}, time.Time{}, err
 	}
 
 	// found newly requested service account, to be same as
@@ -1141,15 +1166,45 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	m := make(map[string]any)
 	m[parentClaim] = parentUser
 
-	if len(policyBuf) > 0 {
+	switch {
+	case len(policyBuf) > 0:
 		m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf)
 		m[iamPolicyClaimNameSA()] = embeddedPolicyType
-	} else {
+	case opts.preserveEmptyEmbeddedPolicy:
+		switch {
+		case opts.sessionPolicy != nil:
+			p := *opts.sessionPolicy
+			if p.Version == "" {
+				p.Version = policy.DefaultVersion
+			}
+			buf, merr := json.Marshal(p)
+			if merr != nil {
+				return auth.Credentials{}, time.Time{}, merr
+			}
+			m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(buf)
+			m[iamPolicyClaimNameSA()] = embeddedPolicyType
+		default:
+			if raw, ok := opts.claims[policy.SessionPolicyName].(string); ok && raw != "" {
+				m[policy.SessionPolicyName] = raw
+				m[iamPolicyClaimNameSA()] = embeddedPolicyType
+			} else {
+				m[iamPolicyClaimNameSA()] = inheritedPolicyType
+			}
+		}
+	default:
 		m[iamPolicyClaimNameSA()] = inheritedPolicyType
 	}
 
 	// Add all the necessary claims for the service account.
 	for k, v := range opts.claims {
+		// Older snapshots may carry this cache-only, decoded policy claim.
+		if k == sessionPolicyNameExtracted {
+			continue
+		}
+		// An explicit policy, including an empty one, owns this claim.
+		if k == policy.SessionPolicyName && opts.sessionPolicy != nil {
+			continue
+		}
 		_, ok := m[k]
 		if !ok {
 			m[k] = v
@@ -1162,7 +1217,6 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	}
 
 	var accessKey, secretKey string
-	var err error
 	if len(opts.accessKey) > 0 || len(opts.secretKey) > 0 {
 		accessKey, secretKey = opts.accessKey, opts.secretKey
 	} else {
@@ -1211,6 +1265,9 @@ type updateServiceAccountOpts struct {
 	status            string
 	name, description string
 	expiration        *time.Time
+	// parentUser, when set, is the parent the caller was authorized for; an
+	// account stored under another parent is refused as absent.
+	parentUser string
 }
 
 // UpdateServiceAccount - edit a service account
@@ -1308,22 +1365,65 @@ func (sys *IAMSys) getServiceAccount(ctx context.Context, accessKey string) (Use
 		return UserIdentity{}, nil, errNoSuchServiceAccount
 	}
 
-	var embeddedPolicy *policy.Policy
+	embeddedPolicy, err := embeddedServiceAccountPolicy(jwtClaims)
+	if err != nil {
+		return UserIdentity{}, nil, err
+	}
+	return sa, embeddedPolicy, nil
+}
 
+// embeddedServiceAccountPolicy returns the policy embedded in the token of a
+// service account, or nil when the account has the policies of its parent.
+func embeddedServiceAccountPolicy(jwtClaims *jwt.MapClaims) (*policy.Policy, error) {
 	pt, ptok := jwtClaims.Lookup(iamPolicyClaimNameSA())
 	sp, spok := jwtClaims.Lookup(policy.SessionPolicyName)
-	if ptok && spok && pt == embeddedPolicyType {
-		policyBytes, err := base64.StdEncoding.DecodeString(sp)
-		if err != nil {
-			return UserIdentity{}, nil, err
-		}
-		embeddedPolicy, err = policy.ParseConfig(bytes.NewReader(policyBytes))
-		if err != nil {
-			return UserIdentity{}, nil, err
+	if !ptok || !spok || pt != embeddedPolicyType {
+		return nil, nil
+	}
+	policyBytes, err := base64.StdEncoding.DecodeString(sp)
+	if err != nil {
+		return nil, err
+	}
+	return policy.ParseConfig(bytes.NewReader(policyBytes))
+}
+
+// serviceAccountSnapshot returns service account u, a record loaded from
+// storage, as the create that replication, the first sync, heal and export
+// carry. Its claims and its embedded policy are read from the token of that
+// record, so that every part of the snapshot is of one revision: a server's
+// cache may hold the account as it was before an edit made through another
+// server.
+func serviceAccountSnapshot(u UserIdentity) (madmin.SRSvcAccCreate, error) {
+	jwtClaims, err := extractJWTClaims(u)
+	if err != nil {
+		return madmin.SRSvcAccCreate{}, err
+	}
+	// Extraction adds a decoded policy for local authorization. Transport only
+	// the token's claims, so peers and imports do not sign this derived value.
+	jwtClaims.Delete(sessionPolicyNameExtracted)
+	embeddedPolicy, err := embeddedServiceAccountPolicy(jwtClaims)
+	if err != nil {
+		return madmin.SRSvcAccCreate{}, err
+	}
+	var policyJSON []byte
+	if embeddedPolicy != nil {
+		if policyJSON, err = json.Marshal(embeddedPolicy); err != nil {
+			return madmin.SRSvcAccCreate{}, err
 		}
 	}
-
-	return sa, embeddedPolicy, nil
+	cr := u.Credentials
+	return madmin.SRSvcAccCreate{
+		Parent:        cr.ParentUser,
+		AccessKey:     cr.AccessKey,
+		SecretKey:     cr.SecretKey,
+		Groups:        cr.Groups,
+		Claims:        jwtClaims.Map(),
+		SessionPolicy: policyJSON,
+		Status:        cr.Status,
+		Name:          cr.Name,
+		Description:   cr.Description,
+		Expiration:    &cr.Expiration,
+	}, nil
 }
 
 // GetTemporaryAccount - wrapper method to get information about a temporary account
@@ -1393,25 +1493,6 @@ func (sys *IAMSys) getAccountWithClaims(ctx context.Context, accessKey string) (
 	}
 
 	return acc, jwtClaims, nil
-}
-
-// GetClaimsForSvcAcc - gets the claims associated with the service account.
-func (sys *IAMSys) GetClaimsForSvcAcc(ctx context.Context, accessKey string) (map[string]any, error) {
-	if !sys.Initialized() {
-		return nil, errServerNotInitialized
-	}
-
-	sa, ok := sys.store.GetUser(accessKey)
-	if !ok || !sa.Credentials.IsServiceAccount() {
-		return nil, errNoSuchServiceAccount
-	}
-
-	jwtClaims, err := extractJWTClaims(sa)
-	if err != nil {
-		return nil, err
-	}
-
-	return jwtClaims.Map(), nil
 }
 
 // DeleteServiceAccount - delete a service account
@@ -1658,8 +1739,10 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 				continue
 			}
 
-			cred.Groups = currGroups
-			if err := sys.store.UpdateUserIdentity(ctx, cred); err != nil {
+			// Only the groups change, on the credential as it is stored now:
+			// cred is a snapshot from before the lookup, and a rotation, an
+			// edit or a deletion since then must stand.
+			if _, err := sys.store.RefreshUserGroups(ctx, cred, currGroups); err != nil {
 				// Log and continue error - perhaps it'll work the next time.
 				iamLogIf(GlobalContext, err)
 			}
@@ -2304,7 +2387,11 @@ func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string) 
 	var combinedPolicy policy.Policy
 	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(svcPolicies, ","))
+		availablePoliciesStr, c, err := sys.store.MergePolicies(strings.Join(svcPolicies, ","))
+		if err != nil {
+			iamLogIf(GlobalContext, err)
+			return false
+		}
 		if availablePoliciesStr == "" {
 			return false
 		}
@@ -2397,7 +2484,11 @@ func (sys *IAMSys) IsAllowedSTS(args policy.Args, parentUser string) bool {
 	var combinedPolicy policy.Policy
 	// Policies were found, evaluate all of them.
 	if !isOwnerDerived {
-		availablePoliciesStr, c := sys.store.MergePolicies(strings.Join(policies, ","))
+		availablePoliciesStr, c, err := sys.store.MergePolicies(strings.Join(policies, ","))
+		if err != nil {
+			iamLogIf(GlobalContext, err)
+			return false
+		}
 		if availablePoliciesStr == "" {
 			// all policies presented in the claim should exist
 			iamLogIf(GlobalContext, fmt.Errorf("expected policy (%s) missing from the JWT claim %s, rejecting the request", policies, iamPolicyClaimNameOpenID()))
@@ -2527,16 +2618,21 @@ func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowe
 }
 
 // GetCombinedPolicy returns a combined policy combining all policies
-func (sys *IAMSys) GetCombinedPolicy(policies ...string) policy.Policy {
-	_, policy := sys.store.MergePolicies(strings.Join(policies, ","))
-	return policy
+func (sys *IAMSys) GetCombinedPolicy(policies ...string) (policy.Policy, error) {
+	_, combined, err := sys.store.MergePolicies(strings.Join(policies, ","))
+	return combined, err
 }
 
 // doesPolicyAllow - checks if the given policy allows the passed action with given args. This is rarely needed.
 // Notice there is no account name involved, so this is a dangerous function.
 func (sys *IAMSys) doesPolicyAllow(policy string, args policy.Args) bool {
 	// Policies were found, evaluate all of them.
-	return sys.GetCombinedPolicy(policy).IsAllowed(args)
+	combined, err := sys.GetCombinedPolicy(policy)
+	if err != nil {
+		iamLogIf(GlobalContext, err)
+		return false
+	}
+	return combined.IsAllowed(args)
 }
 
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
@@ -2549,7 +2645,12 @@ func (sys *IAMSys) IsAllowed(args policy.Args) bool {
 		}
 		return ok
 	}
+	return sys.isAllowedLocally(args)
+}
 
+// isAllowedLocally evaluates args with the local policies only, as IsAllowed
+// does when no authorization plugin is configured.
+func (sys *IAMSys) isAllowedLocally(args policy.Args) bool {
 	// Policies don't apply to the owner.
 	if args.IsOwner {
 		return true
@@ -2585,7 +2686,12 @@ func (sys *IAMSys) IsAllowed(args policy.Args) bool {
 	}
 
 	// Policies were found, evaluate all of them.
-	return sys.GetCombinedPolicy(policies...).IsAllowed(args)
+	combined, err := sys.GetCombinedPolicy(policies...)
+	if err != nil {
+		iamLogIf(GlobalContext, err)
+		return false
+	}
+	return combined.IsAllowed(args)
 }
 
 // SetUsersSysType - sets the users system type, regular or LDAP.

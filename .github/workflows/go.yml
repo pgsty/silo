@@ -35,7 +35,8 @@ jobs:
       - name: Check gofmt
         run: |
           mapfile -t unformatted < <(gofmt -l main.go cmd internal \
-            buildscripts/rebrand-guard buildscripts/helm-migration-guard)
+            buildscripts/rebrand-guard buildscripts/helm-migration-guard \
+            buildscripts/release-dependency-guard)
           if [ "${#unformatted[@]}" -ne 0 ]; then
             echo "The following files are not gofmt-formatted:"
             printf '%s\n' "${unformatted[@]}"
@@ -78,7 +79,7 @@ jobs:
   race-s3select:
     name: Race, S3 Select
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
@@ -90,16 +91,27 @@ jobs:
       - name: Run S3 Select tests under race detector
         run: go test -race ./internal/s3select/... -count=1
 
-      - name: Run conditional PUT tests under race detector
-        run: go test -race ./cmd -run '^Test(PoolsConditionalPut|SinglePoolConditionalPutHTTP)' -count=1 -timeout=5m
+      - name: Run conditional PUT and multipart tests under race detector
+        run: go test -race ./cmd -run '^Test(PoolsConditionalPut|SinglePoolConditionalPutHTTP|PoolsMultipartCondition)' -count=1 -timeout=5m
 
       - name: Run multi-pool delete consistency tests under race detector
         run: go test -race ./cmd -run '^Test(Pools(Delete|BulkDelete|RetiringCopyPreservesSharedTierObject)|BulkDeleteQuorumEvidence)' -count=1 -timeout=5m
 
+      # Build tags: kqueue selects the kqueue backend of rjeczalik/notify on
+      # BSD and macOS and changes nothing on Linux. dev came with upstream's
+      # 2024-06 Makefile change for development builds; no file in this
+      # repository or its dependencies carries a dev build constraint, so it
+      # selects nothing and is kept only so that the documented command
+      # lines (make test, make install-race) stay valid.
+      - name: Run lifecycle expiry and native restore tests under race detector
+        env:
+          MINIO_API_REQUESTS_MAX: "10000"
+        run: go test -race -tags kqueue,dev ./cmd -run '^Test(PoolsLifecycle|PoolsMigrationLifecycle|ExpireRestored|NativeRestore)' -count=1 -timeout=10m
+
       - name: Run multipart listing, cancellation and cleanup tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
-        run: go test -race ./cmd -run '^Test(Multipart|PaginateMultipartUploads|ListMultipartUploads|CleanupStaleUploads|ExtractModTime)' -count=1 -timeout=5m
+        run: go test -race ./cmd -run '^Test(ObjectCompleteMultipartUpload|Multipart|PaginateMultipartUploads|ListMultipartUploads|CleanupStaleUploads|ExtractModTime)' -count=1 -timeout=5m
 
       - name: Run listing metadata recovery, pagination and cancellation tests under race detector
         run: go test -race ./cmd -run '^Test(ListFallback|ListingCache|ListingMerge|ListingRecovery|ListingPending|ListingEntry|ListingSecondLock|StreamMetadataParts|LocalLockerListing|DistributedListing|MergeXLV2LatestNullCrossParity|CountXLV2MixedECGroups|ListCrossParity|ListObjectVersionsCrossParityNull|MigrationCrossParity)' -count=1 -timeout=5m
@@ -116,12 +128,15 @@ jobs:
       - name: Run Object Lock authorization and overwrite tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
-        run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
+        run: go test -race -tags kqueue,dev ./cmd -run '^Test(APIPutObjectRetention|APIVersionAddressedWrite|PutObjectRetention|DirectoryObjectLock|ObjectLockOverwrite|APICopyObjectPreservesVersionAfterSuspension|MultipartNullObjectLock|PoolsObjectLockOverwrite|ReplicaDeleteObjectLock|PoolsReplicaDeleteObjectLock|BulkDeleteDirectoryObjectLock|BulkDeleteObjectLock|MultipartVersioningTransitions|PlanReview|RecoveredMultipartUpload)' -count=1 -timeout=5m
 
       - name: Run maintenance storage timeout and compatibility tests under race detector
         env:
           MINIO_API_REQUESTS_MAX: "10000"
         run: go test -race -tags kqueue,dev ./cmd ./internal/grid ./internal/ioutil -run '^Test(StorageTimeout|StorageRollback|StoragePrerelease|MaintenancePartialFailedOverwriteAvailability|SingleRequest|WithDeadline)' -count=1 -timeout=5m
+
+      - name: Run logger target lifecycle tests under race detector
+        run: go test -race ./cmd -run '^TestDynamicWebhookOutlivesConfigContext' -count=1 -timeout=5m
 
       - name: Compile deferred consistency diagnostics
         run: go test -tags kqueue,dev,consistency_strict ./cmd -run '^$'

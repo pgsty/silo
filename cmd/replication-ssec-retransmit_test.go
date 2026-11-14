@@ -1850,6 +1850,12 @@ func testReplicaLockReconcileNullVersion(obj ObjectLayer, instanceType, bucketNa
 	_ http.Handler, _ auth.Credentials, t *testing.T,
 ) {
 	ctx := t.Context()
+	// A protected retransmit must preserve both the source ciphertext and
+	// its seal. Generate it once for the stored null version and its retry.
+	var ciphertext bytes.Buffer
+	if _, err := sio.Encrypt(&ciphertext, bytes.NewReader([]byte("data")), sio.Config{Key: bytes.Repeat([]byte{1}, 32)}); err != nil {
+		t.Fatal(err)
+	}
 
 	// completeNullMPU runs an SSE-C replica multipart upload addressing the null
 	// version (VersionSuspended) carrying uploadLock, through the reconcile.
@@ -1859,13 +1865,6 @@ func testReplicaLockReconcileNullVersion(obj ObjectLayer, instanceType, bucketNa
 		maps.Copy(meta, uploadLock)
 		res, err := obj.NewMultipartUpload(ctx, bucketName, object, ObjectOptions{VersionSuspended: true, UserDefined: meta})
 		if err != nil {
-			t.Fatal(err)
-		}
-		// PutObjectPart now validates the DARE stream length (#119). This
-		// object-layer fixture needs an encrypted body before it can exercise
-		// the completion-time null-version metadata reconciliation.
-		var ciphertext bytes.Buffer
-		if _, err := sio.Encrypt(&ciphertext, bytes.NewReader([]byte("data")), sio.Config{Key: bytes.Repeat([]byte{1}, 32)}); err != nil {
 			t.Fatal(err)
 		}
 		part, err := obj.PutObjectPart(ctx, bucketName, object, res.UploadID, 1,
@@ -1884,8 +1883,9 @@ func testReplicaLockReconcileNullVersion(obj ObjectLayer, instanceType, bucketNa
 		object := "reconcile/null-vs-uuid"
 		// The null version holds a newer legal hold ON@10:00.
 		if _, err := obj.PutObject(ctx, bucketName, object,
-			mustGetPutObjReader(t, bytes.NewReader([]byte("data")), 4, "", ""),
+			mustGetPutObjReader(t, bytes.NewReader(ciphertext.Bytes()), int64(ciphertext.Len()), "", ""),
 			ObjectOptions{VersionSuspended: true, MTime: time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC), UserDefined: map[string]string{
+				crypto.MetaSealedKeySSEC:                                   "dummy-sealed-key",
 				strings.ToLower(xhttp.AmzObjectLockLegalHold):              "ON",
 				ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp: objectLockTestStamp1000,
 			}}); err != nil {

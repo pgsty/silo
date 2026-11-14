@@ -19,7 +19,9 @@ package plugin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -180,6 +182,14 @@ func New(args Args) *AuthZPlugin {
 
 // IsAllowed - checks given policy args is allowed to continue the REST API.
 func (o *AuthZPlugin) IsAllowed(args policy.Args) (bool, error) {
+	return o.IsAllowedContext(context.Background(), args)
+}
+
+// IsAllowedContext requires an explicit decision from a successful response.
+// The timeout also bounds a server that accepts a connection but never replies.
+func (o *AuthZPlugin) IsAllowedContext(ctx context.Context, args policy.Args) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
 	if o == nil {
 		return false, nil
 	}
@@ -193,7 +203,7 @@ func (o *AuthZPlugin) IsAllowed(args policy.Args) (bool, error) {
 		return false, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, o.args.URL.String(), bytes.NewReader(inputBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.args.URL.String(), bytes.NewReader(inputBytes))
 	if err != nil {
 		return false, err
 	}
@@ -209,37 +219,32 @@ func (o *AuthZPlugin) IsAllowed(args policy.Args) (bool, error) {
 	}
 	defer o.args.CloseRespFn(resp.Body)
 
-	// Read the body to be saved later.
-	opaRespBytes, err := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("authorization plugin returned HTTP %d", resp.StatusCode)
+	}
+	// Bound input and reject trailing data as well as absent/null decisions.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
 	if err != nil {
 		return false, err
 	}
-
-	// Handle large OPA responses when OPA URL is of
-	// form http://localhost:8181/v1/data/httpapi/authz
-	type opaResultAllow struct {
-		Result struct {
-			Allow bool `json:"allow"`
-		} `json:"result"`
+	if len(data) > 1<<20 {
+		return false, fmt.Errorf("authorization plugin response is too large")
 	}
-
-	// Handle simpler OPA responses when OPA URL is of
-	// form http://localhost:8181/v1/data/httpapi/authz/allow
-	type opaResult struct {
-		Result bool `json:"result"`
+	var result struct {
+		Result json.RawMessage `json:"result"`
 	}
-
-	respBody := bytes.NewReader(opaRespBytes)
-
-	var result opaResult
-	if err = json.NewDecoder(respBody).Decode(&result); err != nil {
-		respBody.Seek(0, 0)
-		var resultAllow opaResultAllow
-		if err = json.NewDecoder(respBody).Decode(&resultAllow); err != nil {
-			return false, err
-		}
-		return resultAllow.Result.Allow, nil
+	if err := json.Unmarshal(data, &result); err != nil {
+		return false, err
 	}
-
-	return result.Result, nil
+	var allowed *bool
+	if err := json.Unmarshal(result.Result, &allowed); err == nil && allowed != nil {
+		return *allowed, nil
+	}
+	var nested struct {
+		Allow *bool `json:"allow"`
+	}
+	if err := json.Unmarshal(result.Result, &nested); err == nil && nested.Allow != nil {
+		return *nested.Allow, nil
+	}
+	return false, fmt.Errorf("authorization plugin response has no boolean decision")
 }

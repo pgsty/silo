@@ -522,10 +522,20 @@ func TestPoolsDeleteVersionSpecialCalls(t *testing.T) {
 			opts := ObjectOptions{Versioned: true, VersionID: oi.VersionID, InclFreeVersions: !expiration, Expiration: ExpirationOptions{Expire: expiration}}
 			_, err := z.DeleteObject(t.Context(), bucket, object, opts)
 			if expiration {
-				// No lifecycle rule authorizes expiration. Preserve its existing
-				// version-not-found result, even with an unrelated unreadable pool.
-				if !isErrVersionNotFound(err) {
-					t.Errorf("expiration changed its scanner contract: %v", err)
+				// No rule authorizes expiration. Distinguish refusal from real
+				// absence, even with an unrelated unreadable pool, so a worker
+				// cannot acknowledge or replicate a purge that never happened.
+				if !errors.Is(err, errLifecycleNotApplicable) {
+					t.Errorf("expiration did not preserve its rejection: %v", err)
+				}
+				gr, err := z.serverPools[0].GetObjectNInfo(t.Context(), bucket, object, nil, nil, ObjectOptions{VersionID: oi.VersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(gr)
+				gr.Close()
+				if err != nil || string(data) != "payload" || gr.ObjInfo.VersionID != oi.VersionID {
+					t.Errorf("rejected expiration changed the stored version: %v", err)
 				}
 			} else if err != nil {
 				t.Errorf("free-version cleanup was forced through all-pool resolution: %v", err)

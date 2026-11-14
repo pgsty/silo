@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
@@ -101,7 +100,10 @@ const (
 )
 
 var (
-	errLDAPAuthenticationFailed   = errors.New("LDAP authentication failed")
+	// One message for unknown users and wrong passwords. The console tries
+	// the built-in login (root, access keys) only when the LDAP error says
+	// "not found", so the message keeps those words.
+	errLDAPAuthenticationFailed   = errors.New("LDAP authentication failed: user not found or invalid password")
 	globalSTSLDAPLoginRateLimiter = newSTSLDAPLoginRateLimiter(time.Minute/time.Duration(stsLDAPLoginBurst), stsLDAPLoginBurst, stsLDAPLoginEntryTTL)
 )
 
@@ -117,7 +119,7 @@ func (c stsClaims) populateSessionPolicy(form url.Values) error {
 		return nil
 	}
 
-	sessionPolicy, err := policy.ParseConfig(bytes.NewReader([]byte(sessionPolicyStr)))
+	sessionPolicy, err := parseSessionPolicyStrictBytes([]byte(sessionPolicyStr))
 	if err != nil {
 		return err
 	}
@@ -794,7 +796,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		policySet, ok := policy.GetPoliciesFromClaims(claims, iamPolicyClaimNameOpenID())
 		policies := strings.Join(policySet.ToSlice(), ",")
 		if ok {
-			policyName = globalIAMSys.CurrentPolicies(policies)
+			current, err := globalIAMSys.CurrentPolicies(policies)
+			if err != nil {
+				writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+				return
+			}
+			policyName = current
 		}
 
 		if newGlobalAuthZPluginFn() == nil {
@@ -878,7 +885,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			}
 			if newGlobalAuthZPluginFn() == nil {
 				// if authZ is not set - we expect the policies to be present.
-				if globalIAMSys.CurrentPolicies(p) == "" {
+				current, err := globalIAMSys.CurrentPolicies(p)
+				if err != nil {
+					writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+					return
+				}
+				if current == "" {
 					writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 						fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", p))
 					return
@@ -1363,7 +1375,12 @@ func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *h
 	}
 
 	if newGlobalAuthZPluginFn() == nil { // if authZ is not set - we expect the policyname to be present.
-		if globalIAMSys.CurrentPolicies(policyName) == "" {
+		current, err := globalIAMSys.CurrentPolicies(policyName)
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+			return
+		}
+		if current == "" {
 			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
 				fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", policyName))
 			return

@@ -228,7 +228,7 @@ func (client *peerRESTClient) GetMemInfo(ctx context.Context) (info madmin.MemIn
 }
 
 // GetMetrics - fetch metrics from a remote node.
-func (client *peerRESTClient) GetMetrics(ctx context.Context, t madmin.MetricType, opts collectMetricsOpts) (info madmin.RealtimeMetrics, err error) {
+func (client *peerRESTClient) GetMetrics(ctx context.Context, t madmin.MetricType, opts collectMetricsOpts) (info realtimeMetrics, err error) {
 	values := make(url.Values)
 	values.Set(peerRESTMetricsTypes, strconv.FormatUint(uint64(t), 10))
 	for disk := range opts.disks {

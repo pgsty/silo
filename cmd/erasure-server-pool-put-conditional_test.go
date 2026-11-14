@@ -590,9 +590,9 @@ func TestSinglePoolConditionalPutHTTP(t *testing.T) {
 	}
 }
 
-// An internal replica callback without an addressed version is not a public
-// condition. Preserve its availability when another pool is unreadable. An
-// addressed replica already requires all pools for lock/tag reconciliation.
+// Replica overwrites must establish protection across every pool, including
+// the null version of an unversioned request. An unreadable pool may hold a
+// protected copy, so neither addressed nor unaddressed writes may replace it.
 func TestPoolsConditionalPutReplicaAvailability(t *testing.T) {
 	for _, addressed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("addressed=%t", addressed), func(t *testing.T) {
@@ -615,10 +615,9 @@ func TestPoolsConditionalPutReplicaAvailability(t *testing.T) {
 				xhttp.MinIOSourceETag:               fmt.Sprintf("%x", md5.Sum([]byte("replacement"))),
 			}
 			url := getPutObjectURL("", bucket, object)
-			wantStatus, wantBody := http.StatusOK, "replacement"
+			wantStatus, wantBody := http.StatusServiceUnavailable, "old"
 			if addressed {
 				url += "?versionId=" + oi.VersionID
-				wantStatus, wantBody = http.StatusServiceUnavailable, "old"
 			}
 			put := multipartConditionRequest(t, router, http.MethodPut, url, "replacement", headers)
 			if put.Code != wantStatus {

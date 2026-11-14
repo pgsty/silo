@@ -28,10 +28,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
+	"github.com/minio/minio/internal/logger"
 	"github.com/minio/zipindex"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
@@ -82,35 +82,9 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	getObjectInfo := objectAPI.GetObjectInfo
 
-	// Check for auth type to return S3 compatible error.
-	// type to return the correct error (NoSuchKey vs AccessDenied)
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, zipPath); s3Error != ErrNone {
-		if getRequestAuthType(r) == authTypeAnonymous {
-			// As per "Permission" section in
-			// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html
-			// If the object you request does not exist,
-			// the error Amazon S3 returns depends on
-			// whether you also have the s3:ListBucket
-			// permission.
-			// * If you have the s3:ListBucket permission
-			//   on the bucket, Amazon S3 will return an
-			//   HTTP status code 404 ("no such key")
-			//   error.
-			// * if you don’t have the s3:ListBucket
-			//   permission, Amazon S3 will return an HTTP
-			//   status code 403 ("access denied") error.`
-			if globalPolicySys.IsAllowed(policy.BucketPolicyArgs{
-				Action:          policy.ListBucketAction,
-				BucketName:      bucket,
-				ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
-				IsOwner:         false,
-			}) {
-				_, err = getObjectInfo(ctx, bucket, zipPath, opts)
-				if toAPIError(ctx, err).Code == "NoSuchKey" {
-					s3Error = ErrNoSuchKey
-				}
-			}
-		}
+	logger.GetReqInfo(ctx).BucketName = bucket
+	logger.GetReqInfo(ctx).ObjectName = zipPath
+	if s3Error := authenticateRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -128,6 +102,10 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+		if s3Error := authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, opts.VersionID, oi.UserTags); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return true
+		}
 		if _, err := DecryptObjectInfo(&oi, r); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return true
@@ -138,19 +116,20 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
 	if err != nil {
+		err = archiveReadError(ctx, r, bucket, zipPath, opts.VersionID, err)
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	if opts.CheckPrecondFn(zipObjInfo) {
 		return
 	}
 
 	zipInfo := zipObjInfo.ArchiveInfo(r.Header)
 	if len(zipInfo) == 0 {
-		opts.EncryptFn, err = zipObjInfo.metadataEncryptFn(r.Header)
-		if err != nil {
-			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-			return
-		}
-
-		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
+		zipInfo, _, err = readObjectZIPInfo(ctx, objectAPI, bucket, zipPath, opts)
+	}
+	if isErrPreconditionFailed(err) {
+		return
 	}
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -183,6 +162,9 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 		end := min(file.Offset+int64(file.CompressedSize64)+64<<10, zipObjInfo.Size)
 		rs := &HTTPRangeSpec{Start: file.Offset, End: end}
 		gr, err := objectAPI.GetObjectNInfo(ctx, bucket, zipPath, rs, nil, opts)
+		if isErrPreconditionFailed(err) {
+			return
+		}
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -199,6 +181,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	defer rc.Close()
 
+	opts.Tagging = false
 	if err = setObjectHeaders(ctx, w, fileObjInfo, nil, opts); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -230,23 +213,40 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 }
 
 // listObjectsV2InArchive generates S3 listing result ListObjectsV2Info from zip file, all parameters are already validated by the caller.
-func listObjectsV2InArchive(ctx context.Context, objectAPI ObjectLayer, bucket, prefix, token, delimiter string, maxKeys int, startAfter string, h http.Header) (ListObjectsV2Info, error) {
+func listObjectsV2InArchive(ctx context.Context, objectAPI ObjectLayer, bucket, prefix, token, delimiter string, maxKeys int, startAfter string, r *http.Request) (ListObjectsV2Info, error) {
 	zipPath, _, err := splitZipExtensionPath(prefix)
 	if err != nil {
 		// Return empty listing
 		return ListObjectsV2Info{}, nil
 	}
 
-	zipObjInfo, err := objectAPI.GetObjectInfo(ctx, bucket, zipPath, ObjectOptions{})
+	// The bucket listing permission does not grant access to ZIP contents.
+	logger.GetReqInfo(ctx).ObjectName = zipPath
+	opts := ObjectOptions{}
+	zipObjInfo, err := objectAPI.GetObjectInfo(ctx, bucket, zipPath, opts)
 	if err != nil {
-		// Return empty listing
-		return ListObjectsV2Info{}, nil
+		if s3Error := authorizeVersionedRequestWithUnreadTags(ctx, r, policy.GetObjectAction, "", err); s3Error != ErrNone {
+			return ListObjectsV2Info{}, PrefixAccessDenied{Bucket: bucket, Object: zipPath}
+		}
+		if isErrObjectNotFound(err) {
+			return ListObjectsV2Info{}, nil
+		}
+		return ListObjectsV2Info{}, err
 	}
-
-	zipInfo := zipObjInfo.ArchiveInfo(h)
+	if s3Error := authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, "", zipObjInfo.UserTags); s3Error != ErrNone {
+		return ListObjectsV2Info{}, PrefixAccessDenied{Bucket: bucket, Object: zipPath}
+	}
+	var denied bool
+	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+		denied = authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, "", oi.UserTags) != ErrNone
+		return denied
+	}
+	zipInfo := zipObjInfo.ArchiveInfo(r.Header)
 	if len(zipInfo) == 0 {
-		// Always update the latest version
-		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, ObjectOptions{})
+		zipInfo, _, err = readObjectZIPInfo(ctx, objectAPI, bucket, zipPath, opts)
+	}
+	if denied {
+		return ListObjectsV2Info{}, PrefixAccessDenied{Bucket: bucket, Object: zipPath}
 	}
 	if err != nil {
 		return ListObjectsV2Info{}, err
@@ -379,42 +379,19 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, zipPath); s3Error != ErrNone {
-		if getRequestAuthType(r) == authTypeAnonymous {
-			// As per "Permission" section in
-			// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html
-			// If the object you request does not exist,
-			// the error Amazon S3 returns depends on
-			// whether you also have the s3:ListBucket
-			// permission.
-			// * If you have the s3:ListBucket permission
-			//   on the bucket, Amazon S3 will return an
-			//   HTTP status code 404 ("no such key")
-			//   error.
-			// * if you don’t have the s3:ListBucket
-			//   permission, Amazon S3 will return an HTTP
-			//   status code 403 ("access denied") error.`
-			if globalPolicySys.IsAllowed(policy.BucketPolicyArgs{
-				Action:          policy.ListBucketAction,
-				BucketName:      bucket,
-				ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
-				IsOwner:         false,
-			}) {
-				_, err = getObjectInfo(ctx, bucket, zipPath, opts)
-				if toAPIError(ctx, err).Code == "NoSuchKey" {
-					s3Error = ErrNoSuchKey
-				}
-			}
-		}
-		errCode := errorCodes.ToAPIErr(s3Error)
-		w.Header().Set(xMinIOErrCodeHeader, errCode.Code)
-		w.Header().Set(xMinIOErrDescHeader, "\""+errCode.Description+"\"")
-		writeErrorResponseHeadersOnly(w, errCode)
+	logger.GetReqInfo(ctx).BucketName = bucket
+	logger.GetReqInfo(ctx).ObjectName = zipPath
+	if s3Error := authenticateRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
 		return
 	}
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+		if s3Error := authorizeVersionedRequestWithExistingTags(ctx, r, policy.GetObjectAction, opts.VersionID, oi.UserTags); s3Error != ErrNone {
+			writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
+			return true
+		}
 		return checkPreconditions(ctx, w, r, oi, opts)
 	}
 
@@ -431,18 +408,20 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
 	if err != nil {
+		err = archiveReadError(ctx, r, bucket, zipPath, opts.VersionID, err)
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
+		return
+	}
+	if opts.CheckPrecondFn(zipObjInfo) {
 		return
 	}
 
 	zipInfo := zipObjInfo.ArchiveInfo(r.Header)
 	if len(zipInfo) == 0 {
-		opts.EncryptFn, err = zipObjInfo.metadataEncryptFn(r.Header)
-		if err != nil {
-			writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
-			return
-		}
-		zipInfo, err = updateObjectMetadataWithZipInfo(ctx, objectAPI, bucket, zipPath, opts)
+		zipInfo, _, err = readObjectZIPInfo(ctx, objectAPI, bucket, zipPath, opts)
+	}
+	if isErrPreconditionFailed(err) {
+		return
 	}
 	if err != nil {
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
@@ -466,6 +445,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 		ModTime: zipObjInfo.ModTime,
 	}
 
+	opts.Tagging = false
 	// Set standard object headers.
 	if err = setObjectHeaders(ctx, w, objInfo, nil, opts); err != nil {
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
@@ -482,15 +462,35 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 	w.WriteHeader(http.StatusOK)
 }
 
-// Update the passed zip object metadata with the zip contents info, file name, modtime, size, etc.
-// The returned zip index will de decrypted.
-func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, error) {
+// archiveReadError preserves the anonymous ListBucket missing-object response.
+// All other failures are disclosed only to callers authorized to read the ZIP.
+func archiveReadError(ctx context.Context, r *http.Request, bucket, object, versionID string, err error) error {
+	if getRequestAuthType(r) == authTypeAnonymous && isErrObjectNotFound(err) &&
+		authorizeBucketRequest(ctx, r, policy.ListBucketAction) == ErrNone {
+		return err
+	}
+	if authorizeVersionedRequestWithUnreadTags(ctx, r, policy.GetObjectAction, versionID, err) != ErrNone {
+		return PrefixAccessDenied{Bucket: bucket, Object: object}
+	}
+	return err
+}
+
+// readObjectZIPInfo builds an index without modifying the object. A GET, HEAD
+// or archive listing must remain read-only even when no index was stored.
+func readObjectZIPInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, ObjectInfo, error) {
 	files, srcInfo, err := getFilesListFromZIPObject(ctx, objectAPI, bucket, object, opts)
 	if err != nil {
-		return nil, err
+		return nil, srcInfo, err
 	}
 	files.OptimizeSize()
 	zipInfo, err := files.Serialize()
+	return zipInfo, srcInfo, err
+}
+
+// updateObjectMetadataWithZipInfo persists an index only for upload operations
+// that explicitly request extraction. The returned index is decrypted.
+func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer, bucket, object string, opts ObjectOptions) ([]byte, error) {
+	zipInfo, srcInfo, err := readObjectZIPInfo(ctx, objectAPI, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +500,6 @@ func updateObjectMetadataWithZipInfo(ctx context.Context, objectAPI ObjectLayer,
 		at = archiveTypeEnc
 		zipInfoStr = string(opts.EncryptFn(archiveTypeEnc, zipInfo))
 	}
-	srcInfo.UserDefined[archiveTypeMetadataKey] = at
 	popts := ObjectOptions{
 		MTime:     srcInfo.ModTime,
 		VersionID: srcInfo.VersionID,

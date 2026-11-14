@@ -376,6 +376,9 @@ func (z *erasureServerPools) IsPoolRebalancing(poolIndex int) bool {
 }
 
 func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	doneCh := make(chan error, 1)
 	defer xioutil.SafeClose(doneCh)
 
@@ -450,7 +453,7 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 		select {
 		case <-ctx.Done():
 			doneCh <- ctx.Err()
-			return err
+			return ctx.Err()
 		default:
 		}
 
@@ -474,6 +477,10 @@ func (z *erasureServerPools) rebalanceBuckets(ctx context.Context, poolIdx int) 
 		z.bucketRebalanceDone(bucket, poolIdx)
 	}
 
+	if err := ctx.Err(); err != nil {
+		doneCh <- err
+		return err
+	}
 	rebalanceLogEvent(GlobalContext, "Pool %d rebalancing is done", poolIdx+1)
 
 	return err
@@ -538,10 +545,14 @@ func (set *erasureObjects) listObjectsToRebalance(ctx context.Context, bucketNam
 
 // rebalanceBucket rebalances objects under bucket in poolIdx pool
 func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string, poolIdx int) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ctx = logger.SetReqInfo(ctx, &logger.ReqInfo{})
 
 	var vc *versioning.Versioning
 	var lc *lifecycle.Lifecycle
+	var lifecycleUpdatedAt time.Time
 	var lr objectlock.Retention
 	var rcfg *replication.Config
 	if bucket != minioMetaBucket {
@@ -551,7 +562,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 		}
 
 		// Check if the current bucket has a configured lifecycle policy
-		lc, err = globalLifecycleSys.Get(bucket)
+		lc, lifecycleUpdatedAt, err = globalBucketMetadataSys.GetLifecycleConfig(bucket)
 		if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
 			return err
 		}
@@ -587,19 +598,38 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 	}
 
 	for setIdx, set := range pool.sets {
-		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
+		// filterLifecycle returns an ILM deletion that migration must handle
+		// before retiring the source copy, or NoneAction.
+		filterLifecycle := func(bucket, object string, fi FileInfo, history *migrationHistory) lifecycle.Action {
 			if lc == nil {
-				return false
+				return lifecycle.NoneAction
 			}
+			history.loadTier(ctx, z, bucket, object)
 			versioned := vc != nil && vc.Versioned(object)
 			objInfo := fi.ToObjectInfo(bucket, object, versioned)
 
 			evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
-			if evt.Action.Delete() {
-				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Rebal)
-				return true
+			switch {
+			case evt.Action.DeleteRestored():
+				// A restored copy expires by its own deadline, in the pool
+				// that holds the version; a rebalance does not remove it.
+				// Such a version reads as remote and the walk leaves it, as
+				// the decommission walk moves it: neither counts it as deleted.
+				return lifecycle.NoneAction
+			case evt.Action == lifecycle.DeleteAction && versioned:
+				// Expiring the latest version of a versioned bucket only puts
+				// a delete marker on top of it. The version itself survives as
+				// a noncurrent version and has to be moved like any other. The
+				// scanner applies the expiry once it lives in another pool.
+				return lifecycle.NoneAction
+			case evt.Action.Delete() && !z.migrationExpiryApplies(ctx, objInfo, evt, history):
+				// Another pool holds versions with which the rule does not
+				// apply. The version moves like any other.
+				return lifecycle.NoneAction
+			case evt.Action.Delete():
+				return evt.Action
 			}
-			return false
+			return lifecycle.NoneAction
 		}
 
 		rebalanceEntry := func(entry metaCacheEntry) {
@@ -623,7 +653,10 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
-			var rebalanced int
+			var candidates []FileInfo
+			var expired []migrationExpiredVersion
+			// The key's history in all pools, read once for its versions.
+			var history migrationHistory
 			for _, version := range fivs.Versions {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 
@@ -634,7 +667,16 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				}
 
 				// Apply lifecycle rules on the objects that are expired.
-				if filterLifecycle(bucket, version.Name, version) {
+				if action := filterLifecycle(bucket, version.Name, version, &history); action.Delete() {
+					if ilmDeletesVersionOnly(action) || action.DeleteAll() {
+						candidates = append(candidates, version)
+						expired = append(expired, migrationExpiredVersion{
+							version:            version,
+							event:              lifecycle.Event{Action: action},
+							lifecycleUpdatedAt: lifecycleUpdatedAt,
+							source:             lcEventSrc_Rebal,
+						})
+					}
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
@@ -670,7 +712,6 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 						// This can happen when rebalance stop races with ongoing rebalance workers.
 						// These rebalance failures can be ignored.
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
-							ignore = true
 							stopFn(0, nil)
 							continue
 						}
@@ -680,7 +721,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					failure = err != nil
 					if !failure {
 						z.updatePoolStats(poolIdx, bucket, version)
-						rebalanced++
+						candidates = append(candidates, version)
 					}
 					auditLogRebalance(ctx, "Rebalance:DeleteMarker", bucket, version.Name, versionID, err)
 					continue
@@ -737,13 +778,14 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 					break // break out on first error
 				}
 				z.updatePoolStats(poolIdx, bucket, version)
-				rebalanced++
+				candidates = append(candidates, version)
 			}
 
-			// if all versions were rebalanced, we can delete the object versions.
-			if rebalanced == len(fivs.Versions) {
+			// A skipped or failed sibling does not prevent retiring successful
+			// moves. Cleanup still rechecks each candidate and its destination.
+			if len(candidates) > 0 {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceRemoveObject, poolIdx, bucket, entry.name)
-				err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions)
+				_, err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, candidates, expired)
 				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {
@@ -770,7 +812,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 	}
 
 	wk.Wait()
-	return nil
+	return ctx.Err()
 }
 
 type rebalSaveOpts uint8
@@ -803,6 +845,10 @@ func (z *erasureServerPools) saveRebalanceStats(ctx context.Context, poolIdx int
 	// if not found, we store the memory metadata back
 	// when rebalance status changed, will notify all nodes update status to memory, we can treat the memory metadata is the latest status
 	if errors.Is(err, errConfigNotFound) {
+		if z.rebalMeta == nil {
+			// No rebalance has run, e.g. a rebalance stop without one.
+			return errRebalanceNotStarted
+		}
 		r = z.rebalMeta
 	}
 

@@ -1687,6 +1687,15 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		defer lk.Unlock(lkctx)
 	}
 
+	if opts.RefuseLockedOverwrite {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if err := checkVersionLockedForOverwrite(ctx, bucket, object, fi.VersionID, getObjectInfo, opts.Transition); err != nil {
+			return oi, toObjectErr(err, bucket, object)
+		}
+	}
 	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement {
 		getObjectInfo := er.getObjectInfo
 		if opts.replicaObjectInfo != nil {
@@ -1713,6 +1722,9 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		}
 	}
 
+	if err := er.checkReplicaContent(ctx, bucket, object, minioMetaMultipartBucket, uploadIDPath, partsMetadata, onlineDisks, opts); err != nil {
+		return oi, toObjectErr(err, bucket, object)
+	}
 	er.cleanupMultipartPath(ctx, paths...) // cleanup all part.N.meta, and skipped part.N's before final rename().
 
 	defer func() {

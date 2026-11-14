@@ -1,6 +1,9 @@
 name: DCO
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -17,18 +20,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Every non-merge commit in the pull request must carry a Signed-off-by
+      # Every non-merge commit in the pull request or push must carry a Signed-off-by
       # trailer matching the commit author's email, certifying the Developer
       # Certificate of Origin 1.1 (https://developercertificate.org/).
       # Only commits authored from a GitHub-issued bot address are exempt; a
       # display name is attacker-controlled and must never grant the exemption.
       - name: Check Signed-off-by trailers
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
         run: |
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            rev_range="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+          elif [ -n "${PUSH_BEFORE_SHA}" ] && [ "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            rev_range="${PUSH_BEFORE_SHA}..${PUSH_AFTER_SHA}"
+          else
+            rev_range="${PUSH_AFTER_SHA}^..${PUSH_AFTER_SHA}"
+          fi
           fail=0
           while read -r sha; do
+            [ -n "${sha}" ] || continue
             author_name="$(git log -1 --format='%an' "${sha}")"
             author_email="$(git log -1 --format='%ae' "${sha}")"
             case "${author_email}" in
@@ -39,5 +53,5 @@ jobs:
               echo "::error::commit ${sha} by ${author_name} <${author_email}> lacks a matching Signed-off-by trailer; sign with 'git commit -s', repair with 'git rebase --signoff'"
               fail=1
             fi
-          done < <(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}")
+          done < <(git rev-list --no-merges "${rev_range}")
           exit "${fail}"

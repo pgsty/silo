@@ -140,10 +140,6 @@ func scannerLogOnceIf(ctx context.Context, err error, id string, errKind ...any)
 	logger.LogOnceIf(ctx, "scanner", err, id, errKind...)
 }
 
-func ilmLogIf(ctx context.Context, err error, errKind ...any) {
-	logger.LogIf(ctx, "ilm", err, errKind...)
-}
-
 func ilmLogOnceIf(ctx context.Context, err error, id string, errKind ...any) {
 	logger.LogOnceIf(ctx, "ilm", err, id, errKind...)
 }

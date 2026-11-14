@@ -28,6 +28,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -182,7 +184,9 @@ func (p *poolMeta) returnResumablePools() []PoolStatus {
 }
 
 func (p *poolMeta) DecommissionComplete(idx int) bool {
-	if p.Pools[idx].Decommission != nil && !p.Pools[idx].Decommission.Complete {
+	if p.Pools[idx].Decommission != nil &&
+		!p.Pools[idx].Decommission.Complete &&
+		!p.Pools[idx].Decommission.Canceled {
 		p.Pools[idx].LastUpdate = UTCNow()
 		p.Pools[idx].Decommission.Complete = true
 		p.Pools[idx].Decommission.Failed = false
@@ -193,7 +197,9 @@ func (p *poolMeta) DecommissionComplete(idx int) bool {
 }
 
 func (p *poolMeta) DecommissionFailed(idx int) bool {
-	if p.Pools[idx].Decommission != nil && !p.Pools[idx].Decommission.Failed {
+	if p.Pools[idx].Decommission != nil &&
+		!p.Pools[idx].Decommission.Failed &&
+		!p.Pools[idx].Decommission.Canceled {
 		p.Pools[idx].LastUpdate = UTCNow()
 		p.Pools[idx].Decommission.StartTime = time.Time{}
 		p.Pools[idx].Decommission.Complete = false
@@ -748,7 +754,34 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 	return err
 }
 
+// decommissionPool moves bucket bi out of pool idx. A key below another key
+// ("k/b" under "k") is a directory inside the directory of that key, and the
+// listing does not descend into the directory of an object: a walk sees "k/b"
+// only once "k" has left the pool. The walk is repeated while it removes
+// source versions, so each pass moves the keys that the previous one
+// uncovered. Each repeat needs a version removed from the pool, which takes
+// no new writes, so the repeats end.
 func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		removed, err := z.decommissionPoolWalk(ctx, idx, pool, bi)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil || removed == 0 {
+			return err
+		}
+	}
+}
+
+// decommissionPoolWalk walks bucket bi of pool idx once and returns the number
+// of snapshot versions verified absent from every online source drive afterwards.
+func (z *erasureServerPools) decommissionPoolWalk(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	ctx = logger.SetReqInfo(ctx, &logger.ReqInfo{})
 
 	const envDecomWorkers = "_MINIO_DECOMMISSION_WORKERS"
@@ -762,57 +795,80 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 	// add that many extra workers.
 	workerSize += len(pool.sets)
 
+	var removed atomic.Int64
+	var verifyErr error
+	var verifyOnce sync.Once
+
 	wk, err := workers.New(workerSize)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	var vc *versioning.Versioning
 	var lc *lifecycle.Lifecycle
+	var lifecycleUpdatedAt time.Time
 	var lr objectlock.Retention
 	var rcfg *replication.Config
 	if bi.Name != minioMetaBucket {
 		vc, err = globalBucketVersioningSys.Get(bi.Name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		// Check if the current bucket has a configured lifecycle policy
-		lc, err = globalLifecycleSys.Get(bi.Name)
+		lc, lifecycleUpdatedAt, err = globalBucketMetadataSys.GetLifecycleConfig(bi.Name)
 		if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bi.Name}) {
-			return err
+			return 0, err
 		}
 
 		// Check if bucket is object locked.
 		lr, err = globalBucketObjectLockSys.Get(bi.Name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		rcfg, err = getReplicationConfig(ctx, bi.Name)
 		if err != nil {
-			return err
+			return 0, err
 		}
 	}
 
 	for setIdx, set := range pool.sets {
-		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
+		// filterLifecycle returns an ILM deletion that migration must handle
+		// before retiring the source copy, or NoneAction.
+		filterLifecycle := func(bucket, object string, fi FileInfo, history *migrationHistory) lifecycle.Action {
 			if lc == nil {
-				return false
+				return lifecycle.NoneAction
 			}
+			history.loadTier(ctx, z, bucket, object)
 			versioned := vc != nil && vc.Versioned(object)
 			objInfo := fi.ToObjectInfo(bucket, object, versioned)
 
 			evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
 			switch {
-			case evt.Action.DeleteRestored(): // if restored copy has expired, delete it synchronously
+			case evt.Action.DeleteRestored():
+				// A restored copy past its deadline is removed now, before the
+				// version moves, as the scanner would. When that removal is
+				// refused, the version moves like any other, with its tier
+				// metadata and its deadline, and the scanner of the pool that
+				// holds it then removes the copy. A version the walk neither
+				// moves nor expires leaves the key behind, and fails it.
 				applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
-				return false
+				return lifecycle.NoneAction
+			case evt.Action == lifecycle.DeleteAction && versioned:
+				// Expiring the latest version of a versioned bucket only puts
+				// a delete marker on top of it. The version itself survives as
+				// a noncurrent version and has to be moved like any other. The
+				// scanner applies the expiry once it lives in another pool.
+				return lifecycle.NoneAction
+			case evt.Action.Delete() && !z.migrationExpiryApplies(ctx, objInfo, evt, history):
+				// Another pool holds versions with which the rule does not
+				// apply. The version moves like any other.
+				return lifecycle.NoneAction
 			case evt.Action.Delete():
-				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Decom)
-				return true
+				return evt.Action
 			default:
-				return false
+				return lifecycle.NoneAction
 			}
 		}
 
@@ -832,12 +888,27 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
-			var decommissioned int
+			var candidates []FileInfo
+			var expired []migrationExpiredVersion
+			// The key's history in all pools, read once for its versions.
+			var history migrationHistory
 			for _, version := range fivs.Versions {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionObject, idx, bi.Name, version.Name, version.VersionID)
 				// Apply lifecycle rules on the objects that are expired.
-				if filterLifecycle(bi.Name, version.Name, version) {
-					decommissioned++
+				if action := filterLifecycle(bi.Name, version.Name, version, &history); action.Delete() {
+					if ilmDeletesVersionOnly(action) || (action.DeleteAll() && !version.IsRemote()) {
+						candidates = append(candidates, version)
+						// Run the logical expiry before retiring the source.
+						// A full-object expiry is safe here only for hot-tier
+						// metadata; transitioned objects retain their tier cleanup
+						// ownership in the ordinary expiry worker.
+						expired = append(expired, migrationExpiredVersion{
+							version:            version,
+							event:              lifecycle.Event{Action: action},
+							lifecycleUpdatedAt: lifecycleUpdatedAt,
+							source:             lcEventSrc_Decom,
+						})
+					}
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
@@ -874,7 +945,6 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 						// This can happen when rebalance stop races with ongoing rebalance workers.
 						// These rebalance failures can be ignored.
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
-							ignore = true
 							stopFn(0, nil)
 							continue
 						}
@@ -888,8 +958,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					z.poolMeta.CountItem(idx, 0, failure)
 					z.poolMetaMutex.Unlock()
 					if !failure {
-						// Success keep a count.
-						decommissioned++
+						candidates = append(candidates, version)
 					}
 					auditLogDecom(ctx, "DecomCopyDeleteMarker", bi.Name, version.Name, versionID, err)
 					continue
@@ -975,15 +1044,31 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				if failure {
 					break // break out on first error
 				}
-				decommissioned++
+				candidates = append(candidates, version)
 			}
 
-			// if all versions were decommissioned, then we can delete the object versions.
-			if decommissioned == len(fivs.Versions) {
+			// Retire only successful moves and eligible expiries. A concurrently
+			// deleted or failed sibling must not strand the successful copies.
+			// Skipped versions are checked for absence, never purged here.
+			{
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionRemoveObject, idx, bi.Name, entry.name)
-				err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions)
+				err := z.retireMovedVersions(ctx, bi.Name, entry.name, idx, candidates, expired)
 				if err == nil {
 					err = z.removeFreeVersions(ctx, bi.Name, entry.name, idx, fivs.FreeVersions)
+				}
+				// One metadata-only read of each source drive per entry, regardless
+				// of its version count. No read error can become progress or trigger
+				// another walk; leave the bucket queued for an explicit retry.
+				snapshot := slices.Concat(fivs.Versions, fivs.FreeVersions)
+				n, countErr := z.countAbsentMigrationVersions(ctx, bi.Name, entry.name, idx, snapshot)
+				removed.Add(int64(n))
+				// The disposable usage cache is also excluded by the final
+				// verification. Its unreadability still never counts as progress.
+				if countErr != nil && (bi.Name != minioMetaBucket || !strings.Contains(entry.name, dataUsageCacheName)) {
+					verifyOnce.Do(func() { verifyErr = countErr })
+					if err == nil {
+						err = countErr
+					}
 				}
 				stopFn(0, err)
 				auditLogDecom(ctx, "DecomDeleteObject", bi.Name, entry.name, "", err)
@@ -1019,12 +1104,19 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				setN := humanize.Ordinal(setIdx + 1)
 				retryDur := time.Duration(rand.Float64() * float64(5*time.Second))
 				decomLogOnceIf(ctx, fmt.Errorf("listing objects from %s set failed with %v, retrying in %v", setN, err, retryDur), "decom-listing-failed"+setN)
-				time.Sleep(retryDur)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(retryDur):
+				}
 			}
 		}(setIdx)
 	}
 	wk.Wait()
-	return nil
+	if err := ctx.Err(); err != nil {
+		return removed.Load(), err
+	}
+	return removed.Load(), verifyErr
 }
 
 //msgp:ignore decomMetrics
@@ -1069,12 +1161,29 @@ func (m *decomMetrics) log(d decomMetric, poolIdx int, paths ...string) func(z i
 	}
 }
 
+// decommissionInBackground decommissions the pending buckets of pool idx. A
+// bucket that cannot be finished stays queued and does not stop the others:
+// the first such error is returned after the last bucket, so the
+// decommission fails and a retry resumes with what is left. A canceled
+// context returns at once.
 func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	pool := z.serverPools[idx]
 	z.poolMetaMutex.RLock()
 	pending := z.poolMeta.PendingBuckets(idx)
 	z.poolMetaMutex.RUnlock()
 
+	var firstErr error
+	failed := func(bucket decomBucketInfo, err error) {
+		if firstErr == nil {
+			firstErr = err
+			return
+		}
+		// Only the first error is returned; log the others.
+		decomLogIf(ctx, fmt.Errorf("decommission of bucket %s: %w", bucket, err))
+	}
 	for _, bucket := range pending {
 		z.poolMetaMutex.RLock()
 		isDecommissioned := z.poolMeta.isBucketDecommissioned(idx, bucket.String())
@@ -1098,7 +1207,24 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 		stopFn := globalDecommissionMetrics.log(decomMetricDecommissionBucket, idx, bucket.Name)
 		if err := z.decommissionPool(ctx, idx, pool, bucket); err != nil {
 			stopFn(0, err)
-			return err
+			if contextCanceled(ctx) {
+				return ctx.Err()
+			}
+			failed(bucket, err)
+			continue
+		}
+		// Do not retire the bucket from the resumable queue until every
+		// source version and free version is gone. In particular, an ILM
+		// action queued during the walk may still be pending; marking the
+		// bucket complete here would allow the source pool to be removed
+		// before that action performs its logical and tier cleanup.
+		if err := z.checkAfterDecomBucket(ctx, idx, bucket); err != nil {
+			stopFn(0, err)
+			if contextCanceled(ctx) {
+				return ctx.Err()
+			}
+			failed(bucket, err)
+			continue
 		}
 		stopFn(0, nil)
 
@@ -1108,7 +1234,10 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 		}
 		z.poolMetaMutex.Unlock()
 	}
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return firstErr
 }
 
 // removeFreeVersions removes the free versions fvs of object from the pool
@@ -1122,32 +1251,94 @@ func (z *erasureServerPools) removeFreeVersions(ctx context.Context, bucket, obj
 		return nil
 	}
 	for _, fv := range fvs {
-		err := deleteObjectFromRemoteTier(ctx, fv.TransitionedObjName, fv.TransitionVersionID, fv.TransitionTier)
+		err := z.deleteTierTuple(ctx, bucket, object, tierRemoteTuple{
+			Tier:      fv.TransitionTier,
+			Object:    fv.TransitionedObjName,
+			VersionID: fv.TransitionVersionID,
+		})
+		if errors.Is(err, errTierNotFound) {
+			// The free version is the only record of its remote object. It
+			// stays until the tier can be reached again.
+			return fmt.Errorf("unable to remove the free version %s of %s/%s: its remote object %s is in tier %s, which is not configured; "+
+				"configure tier %s again under the same name so that the remote object and the free version can be removed: %w",
+				fv.VersionID, bucket, object, fv.TransitionedObjName, fv.TransitionTier, fv.TransitionTier, err)
+		}
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			return fmt.Errorf("unable to remove the remote object %s of a free version of %s/%s from tier %s: %w",
 				fv.TransitionedObjName, bucket, object, fv.TransitionTier, err)
 		}
 	}
-	object = encodeDirObject(object)
-	lk := z.NewNSLock(bucket, object)
-	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
+	return nil
+}
+
+// checkAfterDecomBucket verifies that a source bucket's online drives are empty
+// before it is removed from the resumable decommission queue. ILM decisions
+// are deliberately not treated as an exemption: an expired version remains
+// until the expiry path has performed its logical delete, replication, and
+// tier cleanup.
+func (z *erasureServerPools) checkAfterDecomBucket(ctx context.Context, idx int, bi decomBucketInfo) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	ctx = lkctx.Context()
-	defer lk.Unlock(lkctx)
-	for _, fv := range fvs {
-		_, err := z.serverPools[idx].DeleteObject(ctx, bucket, object, ObjectOptions{
-			VersionID:        fv.VersionID,
-			InclFreeVersions: true,
-			NoLock:           true,
-			NoAuditLog:       true,
-		})
-		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			return err
+	for _, set := range z.serverPools[idx].sets {
+		disks := set.getDisks()
+		if len(disks) == 0 {
+			return toObjectErr(errErasureReadQuorum, bi.Name)
+		}
+		readQuorum := set.migrationReadQuorum(len(disks))
+		onlineCount := 0
+		for _, disk := range disks {
+			if disk == nil {
+				continue
+			}
+			// Quorum listings omit minority versions, and WalkDir can skip
+			// unreadable metadata. Inspect physical directory entries instead:
+			// even a corrupt or truncated xl.meta must keep this pool queued.
+			pending := []string{bi.Prefix}
+			diskOffline := false
+			for len(pending) > 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				dir := pending[len(pending)-1]
+				pending = pending[:len(pending)-1]
+				entries, err := disk.ListDir(ctx, "", bi.Name, dir, -1)
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if errors.Is(err, errFileNotFound) || errors.Is(err, errVolumeNotFound) {
+					continue // A concurrent deletion can remove the directory.
+				}
+				if errors.Is(err, errDiskNotFound) {
+					diskOffline = true
+					break
+				}
+				if err != nil {
+					return err
+				}
+				for _, entry := range entries {
+					name := pathJoin(dir, entry)
+					if bi.Name == minioMetaBucket && strings.Contains(name, dataUsageCacheName) {
+						continue
+					}
+					if entry == xlStorageFormatFile || entry == xlStorageFormatFileV1 {
+						return fmt.Errorf("object metadata %s remains in bucket %s after decommissioning", name, bi.Name)
+					}
+					if strings.HasSuffix(entry, SlashSeparator) {
+						pending = append(pending, name)
+					}
+				}
+			}
+			if diskOffline {
+				continue
+			}
+			onlineCount++
+		}
+		if onlineCount < readQuorum {
+			return toObjectErr(errErasureReadQuorum, bi.Name)
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (z *erasureServerPools) checkAfterDecom(ctx context.Context, idx int) error {
@@ -1155,98 +1346,11 @@ func (z *erasureServerPools) checkAfterDecom(ctx context.Context, idx int) error
 	if err != nil {
 		return err
 	}
-
-	pool := z.serverPools[idx]
-	for _, set := range pool.sets {
-		for _, bi := range buckets {
-			var vc *versioning.Versioning
-			var lc *lifecycle.Lifecycle
-			var lr objectlock.Retention
-			var rcfg *replication.Config
-			if bi.Name != minioMetaBucket {
-				vc, err = globalBucketVersioningSys.Get(bi.Name)
-				if err != nil {
-					return err
-				}
-
-				// Check if the current bucket has a configured lifecycle policy
-				lc, err = globalLifecycleSys.Get(bi.Name)
-				if err != nil && !errors.Is(err, BucketLifecycleNotFound{Bucket: bi.Name}) {
-					return err
-				}
-
-				// Check if bucket is object locked.
-				lr, err = globalBucketObjectLockSys.Get(bi.Name)
-				if err != nil {
-					return err
-				}
-
-				rcfg, err = getReplicationConfig(ctx, bi.Name)
-				if err != nil {
-					return err
-				}
-			}
-
-			filterLifecycle := func(bucket, object string, fi FileInfo) bool {
-				if lc == nil {
-					return false
-				}
-				versioned := vc != nil && vc.Versioned(object)
-				objInfo := fi.ToObjectInfo(bucket, object, versioned)
-
-				evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
-				switch {
-				case evt.Action.DeleteRestored(): // if restored copy has expired,delete it synchronously
-					applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
-					return false
-				case evt.Action.Delete():
-					globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Decom)
-					return true
-				default:
-					return false
-				}
-			}
-
-			var versionsFound int
-			if err = set.listObjectsToDecommission(ctx, bi, func(entry metaCacheEntry) {
-				if !entry.isObject() {
-					return
-				}
-
-				// `.usage-cache.bin` still exists, must be not readable ignore it.
-				if bi.Name == minioMetaBucket && strings.Contains(entry.name, dataUsageCacheName) {
-					// skipping bucket usage cache name, as its autogenerated.
-					return
-				}
-
-				fivs, err := entry.fileInfoVersions(bi.Name)
-				if err != nil {
-					return
-				}
-
-				var ignored int
-
-				for _, version := range fivs.Versions {
-					// Apply lifecycle rules on the objects that are expired.
-					if filterLifecycle(bi.Name, version.Name, version) {
-						ignored++
-						continue
-					}
-				}
-
-				// A free version left behind keeps a remote object that
-				// nothing removes once the pool is gone.
-				versionsFound += len(fivs.Versions) - ignored + len(fivs.FreeVersions)
-			}); err != nil {
-				return err
-			}
-
-			if versionsFound > 0 {
-				return fmt.Errorf("at least %d object(s)/version(s) were found in bucket `%s` after decommissioning", versionsFound, bi.Name)
-			}
+	for _, bi := range buckets {
+		if err := z.checkAfterDecomBucket(ctx, idx, bi); err != nil {
+			return err
 		}
 	}
-
 	return nil
 }
 

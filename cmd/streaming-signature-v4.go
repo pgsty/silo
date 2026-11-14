@@ -127,6 +127,9 @@ func calculateSeedSignature(r *http.Request, trailers bool) (cred auth.Credentia
 	if errCode != ErrNone {
 		return cred, "", "", time.Time{}, errCode
 	}
+	if errCode := checkUnsignedHeaders(extractedSignedHeaders, r); errCode != ErrNone {
+		return cred, "", "", time.Time{}, errCode
+	}
 
 	cred, _, errCode = checkKeyValid(r, signV4Values.Credential.accessKey)
 	if errCode != ErrNone {
@@ -149,6 +152,9 @@ func calculateSeedSignature(r *http.Request, trailers bool) (cred auth.Credentia
 	date, err = time.Parse(iso8601Format, dateStr)
 	if err != nil {
 		return cred, "", "", time.Time{}, ErrMalformedDate
+	}
+	if signV4Values.Credential.scope.date.Format(yyyymmdd) != date.UTC().Format(yyyymmdd) {
+		return cred, "", "", time.Time{}, ErrSignatureDoesNotMatch
 	}
 
 	// Query string.
@@ -441,6 +447,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 	return n, err
 }
 
+const maxTrailerSize = 64 * 1024
+
 // readTrailers will read all trailers and populate cr.trailers with actual values.
 func (cr *s3ChunkedReader) readTrailers() error {
 	if cr.debug {
@@ -454,8 +462,12 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\r' {
+			if valueBuffer.Len() >= maxTrailerSize {
+				return errMalformedEncoding
+			}
 			valueBuffer.WriteByte(v)
 			continue
 		}
@@ -465,6 +477,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\n' {
 			return errMalformedEncoding
@@ -480,8 +493,12 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\r' {
+			if signatureBuffer.Len() >= maxTrailerSize {
+				return errMalformedEncoding
+			}
 			signatureBuffer.WriteByte(v)
 			continue
 		}
@@ -491,6 +508,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if string(tmp[:]) != "\n\r\n" {
 			if cr.debug {

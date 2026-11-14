@@ -121,9 +121,11 @@ func (os *objSweeper) shouldRemoveRemoteObject() (jentry, bool) {
 	}
 	if delTier {
 		return jentry{
-			ObjName:   os.RemoteObject,
-			VersionID: os.TransitionVersionID,
-			TierName:  os.TransitionTier,
+			Bucket:          os.Bucket,
+			Object:          os.Object,
+			RemoteObject:    os.RemoteObject,
+			RemoteVersionID: os.TransitionVersionID,
+			TierName:        os.TransitionTier,
 		}, true
 	}
 	return jentry{}, false
@@ -137,9 +139,11 @@ func (os *objSweeper) Sweep() {
 }
 
 type jentry struct {
-	ObjName   string
-	VersionID string
-	TierName  string
+	Bucket          string
+	Object          string
+	RemoteObject    string
+	RemoteVersionID string
+	TierName        string
 }
 
 func deleteObjectFromRemoteTier(ctx context.Context, objName, rvID, tierName string) error {

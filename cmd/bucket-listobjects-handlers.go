@@ -90,8 +90,14 @@ func (api objectAPIHandlers) listObjectVersionsHandler(w http.ResponseWriter, r 
 	}
 	var checkObjMeta metaCheckFn
 	if metadata {
-		checkObjMeta = func(name string, action policy.Action) (s3Err APIErrorCode) {
-			return checkRequestAuthType(ctx, r, action, bucket, name)
+		checkObjMeta = func(obj ObjectInfo, action policy.Action) (s3Err APIErrorCode) {
+			vid := obj.VersionID
+			if vid == "" {
+				vid = nullVersionID
+			}
+			return withScopedReqObject(ctx, bucket, obj.Name, vid, func() APIErrorCode {
+				return authorizeVersionedRequestWithExistingTags(ctx, r, action, vid, obj.UserTags)
+			})
 		}
 	}
 	urlValues := r.Form
@@ -176,8 +182,10 @@ func (api objectAPIHandlers) listObjectsV2Handler(ctx context.Context, w http.Re
 
 	var checkObjMeta metaCheckFn
 	if metadata {
-		checkObjMeta = func(name string, action policy.Action) (s3Err APIErrorCode) {
-			return checkRequestAuthType(ctx, r, action, bucket, name)
+		checkObjMeta = func(obj ObjectInfo, action policy.Action) (s3Err APIErrorCode) {
+			return withScopedReqObject(ctx, bucket, obj.Name, "", func() APIErrorCode {
+				return authorizeVersionedRequestWithExistingTags(ctx, r, action, "", obj.UserTags)
+			})
 		}
 	}
 	urlValues := r.Form
@@ -202,7 +210,7 @@ func (api objectAPIHandlers) listObjectsV2Handler(ctx context.Context, w http.Re
 
 	if r.Header.Get(xMinIOExtract) == "true" && strings.Contains(prefix, archivePattern) {
 		// Initiate a list objects operation inside a zip file based in the input params
-		listObjectsV2Info, err = listObjectsV2InArchive(ctx, objectAPI, bucket, prefix, token, delimiter, maxKeys, startAfter, r.Header)
+		listObjectsV2Info, err = listObjectsV2InArchive(ctx, objectAPI, bucket, prefix, token, delimiter, maxKeys, startAfter, r)
 	} else {
 		// Initiate a list objects operation based on the input params.
 		// On success would return back ListObjectsInfo object to be

@@ -24,10 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math"
 	"math/rand"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1118,8 +1120,31 @@ eventLoop:
 		size := actualSz
 		switch event.Action {
 		case lifecycle.DeleteAllVersionsAction, lifecycle.DelMarkerDeleteAllVersionsAction:
-			remainingVersions = 0
-			applyExpiryRule(event, lcEventSrc_Scanner, oi)
+			// An expiry of a hot latest version purges the key, which refuses
+			// a key with a version in a remote tier: do not queue it when this
+			// pool holds one. A tiered version only another pool holds is
+			// not known here; the purge decides on it. A transitioned latest
+			// version takes the transitioned expiry, as before.
+			refused := oi.TransitionedObject.Status == "" && slices.ContainsFunc(objInfos, ObjectInfo.deleteAllTierRefuses)
+			if refused {
+				globalILMIncomplete.add(ilmIncompleteTierSkipped)
+			} else {
+				remainingVersions = 0
+				applyExpiryRule(event, lcEventSrc_Scanner, oi)
+			}
+			// The versions hold their space until the purge removes them,
+			// which can refuse the key or stop at its budget: account each
+			// at its size, with no other action. The alerts on many or
+			// large versions count those of a key that is not queued.
+			for _, v := range objInfos[idx:] {
+				sz, _ := v.GetActualSize()
+				if fn != nil {
+					fn(v, sz, sz, sizeS)
+				}
+				if refused {
+					cumulativeSize += sz
+				}
+			}
 			break eventLoop
 
 		case lifecycle.DeleteAction, lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
@@ -1130,9 +1155,9 @@ eventLoop:
 			applyExpiryRule(event, lcEventSrc_Scanner, oi)
 
 		case lifecycle.DeleteVersionAction: // noncurrent versions expiration
-			opts := objOpts[idx]
 			remainingVersions--
 			size = 0
+			opts := objOpts[idx]
 			toDel = append(toDel, ObjectToDelete{
 				ObjectV: ObjectV{
 					ObjectName: opts.Name,
@@ -1210,10 +1235,7 @@ func applyTransitionRule(event lifecycle.Event, src lcEventSrc, obj ObjectInfo) 
 func applyExpiryOnTransitionedObject(ctx context.Context, objLayer ObjectLayer, obj ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) (ok bool) {
 	timeILM := globalScannerMetrics.timeILM(lcEvent.Action)
 	if err := expireTransitionedObject(ctx, objLayer, &obj, lcEvent, src); err != nil {
-		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-			return false
-		}
-		ilmLogIf(ctx, fmt.Errorf("expireTransitionedObject(%s, %s): %w", obj.Bucket, obj.Name, err))
+		reportILMExpiryNotDone(ctx, obj, lcEvent, src, err, "transition-expiry"+obj.Name, globalLifecycleSys.trace(obj))
 		return false
 	}
 	timeILM(1)
@@ -1235,11 +1257,18 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(obj.Bucket, obj.Name)
 	opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(obj.Bucket, obj.Name)
 
+	// Purge every version of exactly this key, by version ID and under the
+	// object lock, after the pools approved it on the versions they hold;
+	// see erasureServerPools.deleteAllVersions.
+	var purge deleteAllResult
 	if lcEvent.Action.DeleteAll() {
-		opts.DeletePrefix = true
-		// use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-		opts.DeletePrefixObject = true
+		opts = ObjectOptions{
+			Expiration:        ExpirationOptions{Expire: true},
+			DeleteAllVersions: true,
+			DeleteAllResult:   &purge,
+		}
 	}
+
 	var (
 		dobj ObjectInfo
 		err  error
@@ -1254,22 +1283,21 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		if lcEvent.Action != lifecycle.NoneAction {
 			numVersions := uint64(1)
 			if lcEvent.Action.DeleteAll() {
-				numVersions = uint64(obj.NumVersions)
+				numVersions = uint64(purge.Removed)
 			}
 			timeILM(numVersions)
 		}
 	}()
 
 	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, encodeDirObject(obj.Name), opts)
+	if lcEvent.Action.DeleteAll() && (err != nil || purge.Removed == 0) {
+		return deleteAllNotCompleted(ctx, obj, lcEvent, src, purge, err, traceFn)
+	}
 	if err != nil {
-		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+		// Assume it is still there, unless it is gone already.
+		if !reportILMExpiryNotDone(ctx, obj, lcEvent, src, err, "non-transition-expiry"+obj.Name, traceFn) {
 			traceFn(ILMExpiry, nil, nil)
-			return false
 		}
-		// Assume it is still there.
-		err := fmt.Errorf("DeleteObject(%s, %s): %w", obj.Bucket, obj.Name, err)
-		ilmLogOnceIf(ctx, err, "non-transition-expiry"+obj.Name)
-		traceFn(ILMExpiry, nil, err)
 		return false
 	}
 	if dobj.Name == "" {
@@ -1278,14 +1306,14 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
 	tags["version-id"] = dobj.VersionID
+	if lcEvent.Action.DeleteAll() {
+		tags[ilmVersionsRemoved] = strconv.Itoa(purge.Removed)
+	}
 
 	// Send audit for the lifecycle delete operation
 	auditLogLifecycle(ctx, dobj, ILMExpiry, tags, traceFn)
 
-	eventName := event.ObjectRemovedDelete
-	if obj.DeleteMarker {
-		eventName = event.ObjectRemovedDeleteMarkerCreated
-	}
+	eventName := ilmExpiryEventName(opts.VersionID, dobj)
 	switch lcEvent.Action {
 	case lifecycle.DeleteAllVersionsAction:
 		eventName = event.ObjectRemovedDeleteAllVersions
@@ -1302,6 +1330,65 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	})
 
 	return true
+}
+
+// ilmVersionsRemoved is the audit tag with the number of versions that an
+// expiry of all versions removed; ilmPartial marks one that began to delete
+// and did not finish.
+const (
+	ilmVersionsRemoved = "ilm-versions-removed"
+	ilmPartial         = "ilm-partial"
+)
+
+// deleteAllNotCompleted reports an expiry of all versions of obj that did
+// not remove them all. A purge that had nothing to remove, or that failed
+// before it deleted anything, reports what a rejected expiry does. One that
+// failed or stopped after it began to delete is audited as partial, with the
+// versions it removed, but sends no removal event: the key is still there.
+//
+// Each is counted and traced with its reason, as reportILMExpiryNotDone
+// reports other expiries. A refusal because a version is in a remote tier is
+// also logged, since it lasts until such versions can be purged.
+func deleteAllNotCompleted(ctx context.Context, obj ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc, purge deleteAllResult, err error, traceFn func(event string, metadata map[string]string, err error)) bool {
+	logID := "non-transition-expiry" + obj.Name
+	switch {
+	case err == nil: // there was nothing to remove
+		traceFn(ILMExpiry, nil, nil)
+		return false
+	case purge.Started:
+		reason, _ := ilmExpiryNotDone(err)
+		globalILMIncomplete.add(reason)
+		tags := newLifecycleAuditEvent(src, lcEvent).Tags()
+		tags["version-id"] = purge.Latest.VersionID
+		tags[ilmVersionsRemoved] = strconv.Itoa(purge.Removed)
+		tags[ilmPartial] = "true"
+		tags["ilm-incomplete-reason"] = reason
+		auditLogInternal(ctx, AuditLogOptions{
+			Event:     ILMExpiry,
+			APIName:   "ILMExpiry",
+			Bucket:    obj.Bucket,
+			Object:    obj.Name,
+			VersionID: purge.Latest.VersionID,
+			Error:     err.Error(),
+			Tags:      tags,
+		})
+		trace := maps.Clone(tags)
+		trace["result"], trace["reason"] = "partial", reason
+		traceFn(ILMExpiry, trace, err)
+		if errors.Is(err, errDeleteAllBudget) {
+			return false // a long history; the next expiry continues
+		}
+		// Assume it is still there.
+		ilmLogOnceIf(ctx, fmt.Errorf("ILM expiry of all versions of %s/%s stopped after it removed %d: %w", obj.Bucket, obj.Name, purge.Removed, err), logID)
+		return false
+	case errors.Is(err, errDeleteAllTiered):
+		// Kept until tiered versions can be purged; see deleteAllVersions.
+		ilmLogOnceIf(ctx, fmt.Errorf("ILM expiry of all versions of %s/%s refused: a version is in a remote tier, and a purge of all versions does not remove tiered versions yet", obj.Bucket, obj.Name), logID)
+	}
+	if !reportILMExpiryNotDone(ctx, obj, lcEvent, src, err, logID, traceFn) {
+		traceFn(ILMExpiry, nil, nil) // gone already
+	}
+	return false
 }
 
 // Apply object, object version, restored object or restored object version action on the given object

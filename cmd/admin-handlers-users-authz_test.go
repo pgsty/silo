@@ -169,8 +169,9 @@ func TestIAMAdminEmptyPolicyDelegation(t *testing.T) {
 					{"{}", http.StatusOK, true},
 					{`{"Statement":null}`, http.StatusOK, true},
 					{limitedPolicy, http.StatusOK, false},
-					{`{"Version":"2012-10-17"}`, http.StatusForbidden, false},
-					{`{"Statement":[]}`, http.StatusForbidden, false},
+					{`{"Version":"2012-10-17"}`, http.StatusOK, true},
+					{`{"Statement":[]}`, http.StatusOK, true},
+					{`{"Version":"2012-10-17","Statement":[]}`, http.StatusOK, true},
 				} {
 					expires := UTCNow().Add(time.Hour)
 					req := madmin.AddServiceAccountReq{Expiration: &expires}
