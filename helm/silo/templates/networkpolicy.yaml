@@ -8,6 +8,9 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
 spec:
   podSelector:
     matchLabels:
@@ -19,11 +22,16 @@ spec:
           protocol: TCP
         - port: {{ .Values.minioConsolePort }}
           protocol: TCP
-      {{- if not .Values.networkPolicy.allowExternal }}
+      {{- if or (not .Values.networkPolicy.allowExternal) .Values.networkPolicy.allowFrom }}
       from:
+        {{- if not .Values.networkPolicy.allowExternal }}
         - podSelector:
             matchLabels:
               {{ template "silo.name" . }}-client: "true"
+        {{- end }}
+        {{- with .Values.networkPolicy.allowFrom }}
+          {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
       {{- end }}
   {{- if .Values.networkPolicy.egress.enabled }}
   egress:
