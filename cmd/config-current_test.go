@@ -148,7 +148,8 @@ func TestDynamicConfigAttemptsEverySubsystemAfterFailure(t *testing.T) {
 	webhook.Set(config.Enable, config.EnableOn)
 	webhook.Set(target.WebhookEndpoint, "://invalid")
 	cfg[config.NotifyWebhookSubSys]["broken"] = webhook
-	compression := cfg[config.CompressionSubSys][config.Default]
+	// Clone: config.New shares the process-wide default KVS slice.
+	compression := cfg[config.CompressionSubSys][config.Default].Clone()
 	compression.Set(config.Enable, "invalid")
 	cfg[config.CompressionSubSys][config.Default] = compression
 	err := applyDynamicConfig(t.Context(), notifyWebhookObjectLayer{}, cfg)
