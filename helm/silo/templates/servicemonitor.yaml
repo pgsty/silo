@@ -11,8 +11,11 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
-    {{- if .Values.metrics.serviceMonitor.additionalLabels }}
-      {{- toYaml .Values.metrics.serviceMonitor.additionalLabels | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.additionalLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
   {{- if .Values.metrics.serviceMonitor.annotations }}
   annotations: {{- toYaml .Values.metrics.serviceMonitor.annotations | nindent 4 }}
@@ -39,8 +42,8 @@ spec:
       {{- if .Values.metrics.serviceMonitor.scrapeTimeout }}
       scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
       {{- end }}
-      {{- if .Values.metrics.serviceMonitor.relabelConfigs }}
-        {{- toYaml .Values.metrics.serviceMonitor.relabelConfigs | nindent 6 }}
+      {{- with .Values.metrics.serviceMonitor.relabelConfigs }}
+        {{- tpl (toYaml .) $ | nindent 6 }}
       {{- end }}
       {{- if not .Values.metrics.serviceMonitor.public }}
       bearerTokenSecret:
@@ -55,6 +58,10 @@ spec:
       app: {{ include "silo.name" . }}
       release: {{ .Release.Name }}
       monitoring: "true"
+  {{- with .Values.metrics.serviceMonitor.targetLabels }}
+  targetLabels:
+    {{- tpl (toYaml .) $ | nindent 4 }}
+  {{- end }}
 {{- end }}
 {{- if .Values.metrics.serviceMonitor.enabled }}
 ---
@@ -70,8 +77,8 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
-    {{- if .Values.metrics.serviceMonitor.additionalLabels }}
-      {{- toYaml .Values.metrics.serviceMonitor.additionalLabels | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.additionalLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
 spec:
   jobName: {{ template "silo.fullname" . }}
@@ -91,13 +98,17 @@ spec:
     {{- else }}
     scheme: http
     {{- end }}
-  {{- if .Values.metrics.serviceMonitor.relabelConfigsCluster }}
-    {{- toYaml .Values.metrics.serviceMonitor.relabelConfigsCluster | nindent 2 }}
+  {{- with .Values.metrics.serviceMonitor.relabelConfigsCluster }}
+    {{- tpl (toYaml .) $ | nindent 2 }}
   {{- end }}
   targets:
     staticConfig:
       static:
       - {{ template "silo.fullname" . }}.{{ .Release.Namespace }}
+      {{- with .Values.metrics.serviceMonitor.probeRelabelingConfigs }}
+      relabelingConfigs:
+        {{- tpl (toYaml .) $ | nindent 8 }}
+      {{- end }}
       {{- if not .Values.metrics.serviceMonitor.public }}
       {{- if .Values.metrics.serviceMonitor.interval }}
       interval: {{ .Values.metrics.serviceMonitor.interval }}

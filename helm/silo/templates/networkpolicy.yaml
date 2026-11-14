@@ -8,6 +8,9 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
 spec:
   podSelector:
     matchLabels:
@@ -19,11 +22,16 @@ spec:
           protocol: TCP
         - port: {{ .Values.minioConsolePort }}
           protocol: TCP
-      {{- if not .Values.networkPolicy.allowExternal }}
+      {{- if or (not .Values.networkPolicy.allowExternal) .Values.networkPolicy.allowFrom }}
       from:
+        {{- if not .Values.networkPolicy.allowExternal }}
         - podSelector:
             matchLabels:
               {{ template "silo.name" . }}-client: "true"
+        {{- end }}
+        {{- with .Values.networkPolicy.allowFrom }}
+          {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
       {{- end }}
   {{- if .Values.networkPolicy.egress.enabled }}
   egress:
@@ -34,6 +42,7 @@ spec:
         {{- toYaml . | nindent 12 }}
       {{- end }}
   {{- end }}
+{{- if .Values.networkPolicy.egress.enabled }}
 ---
 kind: NetworkPolicy
 apiVersion: {{ template "silo.networkPolicy.apiVersion" . }}
@@ -55,12 +64,11 @@ spec:
           protocol: TCP
         - port: {{ .Values.minioConsolePort }}
           protocol: TCP
-    {{- if .Values.networkPolicy.egress.enabled }}
     - ports:
         {{ .Values.networkPolicy.egress.ports | toJson }}
       {{- with .Values.networkPolicy.egress.to }}
       to:
         {{- toYaml . | nindent 12 }}
       {{- end }}
-    {{- end }}
+{{- end }}
 {{- end }}

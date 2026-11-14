@@ -8,8 +8,12 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
-  {{- if .Values.consoleService.annotations }}
-  annotations: {{- toYaml .Values.consoleService.annotations | nindent 4 }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+  {{- with .Values.consoleService.annotations }}
+  annotations:
+    {{- tpl (toYaml .) $ | nindent 4 }}
   {{- end }}
 spec:
   type: {{ .Values.consoleService.type }}
