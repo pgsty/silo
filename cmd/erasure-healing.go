@@ -423,6 +423,11 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 		}
 
 		driveState := objectErrToDriveState(reason)
+		// A failed verification is not a clean dry-run, even if no repair is safe.
+		if dryRun && driveState == madmin.DriveStateOk && !partsMetadata[i].Deleted &&
+			!partsMetadata[i].IsRemote() && countPartNotSuccess(dataErrsByDisk[i]) > 0 {
+			driveState = madmin.DriveStateUnknown
+		}
 
 		result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 			UUID:     "",

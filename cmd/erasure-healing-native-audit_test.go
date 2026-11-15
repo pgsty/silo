@@ -319,6 +319,151 @@ func TestNativeAuditDryRunPreservesFaults(t *testing.T) {
 	}
 }
 
+func TestNativeAuditDryRunDoesNotReportFailedVerificationClean(t *testing.T) {
+	for _, fault := range []struct {
+		name string
+		err  error
+	}{
+		{"disk", errDiskNotFound},
+		{"volume", errVolumeNotFound},
+		{"deadline", context.DeadlineExceeded},
+		{"canceled", context.Canceled},
+		{"permission", errFileAccessDenied},
+	} {
+		t.Run(fault.name, func(t *testing.T) {
+			for _, mode := range []struct {
+				name   string
+				dryRun bool
+				scan   madmin.HealScanMode
+				want   string
+			}{
+				{"dry-deep", true, madmin.HealDeepScan, madmin.DriveStateUnknown},
+				{"repair-deep-control", false, madmin.HealDeepScan, madmin.DriveStateOk},
+				{"dry-normal-control", true, madmin.HealNormalScan, madmin.DriveStateOk},
+			} {
+				t.Run(mode.name, func(t *testing.T) {
+					meta := nativeAuditMetadata()
+					disks := make([]StorageAPI, len(meta))
+					var verifies, checks atomic.Int32
+					for i := range disks {
+						disks[i] = &nativeAuditDisk{info: meta[i], verify: func() (*CheckPartsResp, error) {
+							verifies.Add(1)
+							if i == 0 {
+								return nil, fault.err
+							}
+							return &CheckPartsResp{Results: []int{checkPartSuccess, checkPartSuccess}}, nil
+						}, check: func() (*CheckPartsResp, error) {
+							checks.Add(1)
+							return &CheckPartsResp{Results: []int{checkPartSuccess, checkPartSuccess}}, nil
+						}}
+					}
+					er := erasureObjects{
+						setDriveCount: 4, defaultParityCount: 2,
+						getDisks:     func() []StorageAPI { return disks },
+						getEndpoints: nativeAuditEndpoints,
+					}
+					result, err := er.HealObject(t.Context(), "bucket", "object", "version", madmin.HealOpts{
+						DryRun: mode.dryRun, NoLock: true, Remove: true, ScanMode: mode.scan,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(result.Before.Drives) != len(disks) || !reflect.DeepEqual(result.Before, result.After) {
+						t.Fatalf("verification failure changed drive state: %+v", result)
+					}
+					for i, drive := range result.Before.Drives {
+						want := madmin.DriveStateOk
+						if i == 0 {
+							want = mode.want
+						}
+						if drive.State != want {
+							t.Fatalf("disk %d after successful metadata read and %v verification: got %s, want %s", i, fault.err, drive.State, want)
+						}
+						if disks[i].(*nativeAuditDisk).deletes.Load() != 0 {
+							t.Fatal("verification failure unexpectedly deleted data")
+						}
+					}
+					if mode.scan == madmin.HealDeepScan && (verifies.Load() != 4 || checks.Load() != 0) {
+						t.Fatalf("deep verification calls: verifies=%d checks=%d", verifies.Load(), checks.Load())
+					}
+					if mode.scan == madmin.HealNormalScan && (verifies.Load() != 0 || checks.Load() != 4) {
+						t.Fatalf("normal check control: verifies=%d checks=%d", verifies.Load(), checks.Load())
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNativeAuditSkippedPayloadsRemainHealthy(t *testing.T) {
+	for _, kind := range []string{"deleted", "remote"} {
+		t.Run(kind, func(t *testing.T) {
+			meta := nativeAuditMetadata()
+			disks := make([]StorageAPI, len(meta))
+			for i := range disks {
+				if kind == "deleted" {
+					meta[i].Deleted, meta[i].Size = true, 0
+				} else {
+					meta[i].TransitionStatus = "complete"
+				}
+				// Keep Parts populated: these statuses are deliberately unchecked.
+				// Unexpected VerifyFile/CheckParts calls panic through nil callbacks.
+				disks[i] = &nativeAuditDisk{info: meta[i]}
+			}
+			er := erasureObjects{
+				setDriveCount: 4, defaultParityCount: 2,
+				getDisks:     func() []StorageAPI { return disks },
+				getEndpoints: nativeAuditEndpoints,
+			}
+			result, err := er.HealObject(t.Context(), "bucket", "object", "version", madmin.HealOpts{
+				DryRun: true, NoLock: true, Remove: true, ScanMode: madmin.HealDeepScan,
+			})
+			if err != nil || len(result.Before.Drives) != len(disks) || !reflect.DeepEqual(result.Before, result.After) {
+				t.Fatalf("skipped payload dry-run changed results: %+v %v", result, err)
+			}
+			for i, drive := range result.Before.Drives {
+				if drive.State != madmin.DriveStateOk || disks[i].(*nativeAuditDisk).deletes.Load() != 0 {
+					t.Fatalf("skipped %s payload must stay healthy without mutations: %+v", kind, result)
+				}
+			}
+		})
+	}
+}
+
+func TestNativeAuditEmptyObjectRemainsHealthy(t *testing.T) {
+	obj, roots, err := prepareErasure(t.Context(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setObjectLayer(obj)
+	defer removeRoots(roots)
+	defer obj.Shutdown(t.Context())
+	const bucket, object = "native-audit", "empty-object"
+	if err = obj.MakeBucket(t.Context(), bucket, MakeBucketOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = obj.PutObject(t.Context(), bucket, object,
+		mustGetPutObjReader(t, bytes.NewReader(nil), 0, "", ""), ObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	before := nativeAuditSnapshotBucket(t, roots, bucket)
+	result, err := obj.HealObject(t.Context(), bucket, object, "", madmin.HealOpts{DryRun: true, Remove: true, ScanMode: madmin.HealDeepScan})
+	if err != nil || !reflect.DeepEqual(result.Before, result.After) {
+		t.Fatalf("empty-object dry-run changed results: %+v %v", result, err)
+	}
+	if len(result.Before.Drives) != 4 {
+		t.Fatalf("empty-object dry-run lost drive observations: %+v", result)
+	}
+	for _, drive := range result.Before.Drives {
+		if drive.State != madmin.DriveStateOk {
+			t.Fatalf("empty payload was not healthy: %+v", result)
+		}
+	}
+	if after := nativeAuditSnapshotBucket(t, roots, bucket); !reflect.DeepEqual(before, after) {
+		t.Fatal("empty-object dry-run changed bucket files or directories")
+	}
+}
+
 // This control proves the missing-metadata fixture reaches dangling deletion.
 func TestNativeAuditNonDryRunStillDeletesDangling(t *testing.T) {
 	meta := nativeAuditMetadata()
