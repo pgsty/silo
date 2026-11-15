@@ -40,6 +40,7 @@ type nativeAuditDisk struct {
 	info    FileInfo
 	readErr error
 	verify  func() (*CheckPartsResp, error)
+	check   func() (*CheckPartsResp, error)
 	deletes atomic.Int32
 }
 
@@ -49,6 +50,10 @@ func (d *nativeAuditDisk) ReadVersion(context.Context, string, string, string, s
 
 func (d *nativeAuditDisk) VerifyFile(context.Context, string, string, FileInfo) (*CheckPartsResp, error) {
 	return d.verify()
+}
+
+func (d *nativeAuditDisk) CheckParts(context.Context, string, string, FileInfo) (*CheckPartsResp, error) {
+	return d.check()
 }
 
 func (d *nativeAuditDisk) DeleteVersion(context.Context, string, string, FileInfo, bool, DeleteOptions) error {
@@ -77,6 +82,100 @@ func nativeAuditEndpoints() []Endpoint {
 		endpoints[i].URL = &url.URL{Path: fmt.Sprintf("/synthetic/disk%d", i)}
 	}
 	return endpoints
+}
+
+func TestNativeAuditDeepChecksOverlap(t *testing.T) {
+	meta := nativeAuditMetadata()
+	started, release := make(chan int, len(meta)), make(chan struct{})
+	disks := make([]StorageAPI, len(meta))
+	for i := range disks {
+		disks[i] = &nativeAuditDisk{verify: func() (*CheckPartsResp, error) {
+			started <- i
+			<-release
+			if i == 3 {
+				return nil, errDiskNotFound
+			}
+			result := &CheckPartsResp{Results: []int{checkPartSuccess, checkPartSuccess}}
+			if i == 2 {
+				result.Results[1] = checkPartFileCorrupt
+			}
+			return result, nil
+		}}
+	}
+	done := make(chan struct{})
+	var byDisk, byPart map[int][]int
+	go func() {
+		byDisk, byPart = checkObjectWithAllParts(t.Context(), disks, meta, make([]error, 4), meta[0], false, "bucket", "object", madmin.HealDeepScan)
+		close(done)
+	}()
+	// A serial implementation cannot reach all four calls before release.
+	for range disks {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			close(release)
+			<-done
+			t.Fatal("deep drive verification did not overlap")
+		}
+	}
+	close(release)
+	<-done
+	want := map[int][]int{0: {1, 1}, 1: {1, 1}, 2: {1, checkPartFileCorrupt}, 3: {checkPartDiskNotFound, checkPartDiskNotFound}}
+	if !reflect.DeepEqual(byDisk, want) {
+		t.Fatalf("per-drive results: got %v, want %v", byDisk, want)
+	}
+	if !reflect.DeepEqual(byPart[1], []int{1, 1, checkPartFileCorrupt, checkPartDiskNotFound}) {
+		t.Fatalf("per-part transpose lost errors: %v", byPart)
+	}
+}
+
+func TestNativeAuditNormalChecksStaySerial(t *testing.T) {
+	meta := nativeAuditMetadata()
+	var calls, active atomic.Int32
+	disks := make([]StorageAPI, len(meta))
+	for i := range disks {
+		disks[i] = &nativeAuditDisk{check: func() (*CheckPartsResp, error) {
+			if active.Add(1) != 1 {
+				t.Error("normal checks overlapped")
+			}
+			defer active.Add(-1)
+			calls.Add(1)
+			return &CheckPartsResp{Results: []int{checkPartSuccess, checkPartSuccess}}, nil
+		}}
+	}
+	checkObjectWithAllParts(t.Context(), disks, meta, make([]error, 4), meta[0], false, "bucket", "object", madmin.HealNormalScan)
+	if calls.Load() != 4 {
+		t.Fatalf("normal check calls: %d", calls.Load())
+	}
+}
+
+func TestNativeAuditInlineStillUsesNativeBitrot(t *testing.T) {
+	for _, mode := range []madmin.HealScanMode{madmin.HealNormalScan, madmin.HealDeepScan} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			meta := nativeAuditMetadata()
+			disks := make([]StorageAPI, len(meta))
+			for i := range disks {
+				data := []byte("synthetic inline shard")
+				sum := sha256.Sum256(data)
+				meta[i].Data = append([]byte(nil), data...)
+				meta[i].Parts = meta[i].Parts[:1]
+				meta[i].SetInlineData()
+				meta[i].Erasure.Checksums = []ChecksumInfo{{PartNumber: 1, Algorithm: SHA256, Hash: sum[:]}}
+				disks[i] = &nativeAuditDisk{}
+			}
+			meta[2].Data[0] ^= 1
+			results, _ := checkObjectWithAllParts(t.Context(), disks, meta, make([]error, 4), meta[0], false, "bucket", "object", mode)
+			for i := range disks {
+				want := checkPartSuccess
+				if i == 2 {
+					want = checkPartFileCorrupt
+				}
+				if results[i][0] != want {
+					t.Fatalf("inline disk %d: got %v, want %d", i, results[i], want)
+				}
+			}
+		})
+	}
 }
 
 func TestNativeAuditDryRunPreservesFaults(t *testing.T) {
