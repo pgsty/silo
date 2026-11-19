@@ -10,11 +10,15 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
-    {{- if .Values.additionalLabels }}
-      {{- toYaml .Values.additionalLabels | nindent 4 }}
+    {{- with .Values.additionalLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
-  {{- if .Values.additionalAnnotations }}
-  annotations: {{- toYaml .Values.additionalAnnotations | nindent 4 }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- tpl (toYaml .) $ | nindent 4 }}
   {{- end }}
 spec:
   strategy:
@@ -35,8 +39,11 @@ spec:
       labels:
         app: {{ template "silo.name" . }}
         release: {{ .Release.Name }}
-        {{- if .Values.podLabels }}
-          {{- toYaml .Values.podLabels | nindent 8 }}
+        {{- with .Values.podLabels }}
+          {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+        {{- with .Values.commonLabels }}
+          {{- tpl (toYaml .) $ | nindent 8 }}
         {{- end }}
       annotations:
         {{- if not .Values.ignoreChartChecksums }}
@@ -62,7 +69,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ include "silo.name" . }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ tpl .Values.image.repository . }}:{{ tpl .Values.image.tag . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - "/bin/sh"
@@ -111,7 +118,14 @@ spec:
             {{- end }}
             {{- if .Values.oidc.enabled }}
             - name: MINIO_IDENTITY_OPENID_CONFIG_URL
+            {{- if and .Values.oidc.existingConfigMapName .Values.oidc.existingConfigUrlKey }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ .Values.oidc.existingConfigMapName }}
+                  key: {{ .Values.oidc.existingConfigUrlKey }}
+            {{- else }}
               value: {{ .Values.oidc.configUrl }}
+            {{- end }}
             - name: MINIO_IDENTITY_OPENID_CLIENT_ID
             {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientIdKey }}
               valueFrom:
@@ -135,11 +149,11 @@ spec:
             - name: MINIO_IDENTITY_OPENID_CLAIM_PREFIX
               value: {{ .Values.oidc.claimPrefix }}
             - name: MINIO_IDENTITY_OPENID_SCOPES
-              value: {{ .Values.oidc.scopes }}
+              value: {{ tpl .Values.oidc.scopes . }}
             - name: MINIO_IDENTITY_OPENID_COMMENT
               value: {{ .Values.oidc.comment }}
             - name: MINIO_IDENTITY_OPENID_REDIRECT_URI
-              value: {{ .Values.oidc.redirectUri }}
+              value: {{ tpl .Values.oidc.redirectUri . }}
             - name: MINIO_IDENTITY_OPENID_DISPLAY_NAME
               value: {{ .Values.oidc.displayName }}
             {{- end }}
@@ -181,7 +195,7 @@ spec:
           {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
-      nodeSelector: {{- toYaml . | nindent 8 }}
+      nodeSelector: {{- tpl (toYaml .) $ | nindent 8 }}
       {{- end }}
       {{- include "silo.imagePullSecrets" . | indent 6 }}
       {{- with .Values.affinity }}

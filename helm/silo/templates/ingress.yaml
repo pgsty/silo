@@ -12,10 +12,13 @@ metadata:
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
     {{- with .Values.ingress.labels }}
-      {{- toYaml . | nindent 4 }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
   {{- with .Values.ingress.annotations }}
-  annotations: {{- toYaml . | nindent 4 }}
+  annotations: {{- tpl (toYaml .) $ | nindent 4 }}
   {{- end }}
 spec:
   {{- if .Values.ingress.ingressClassName }}
@@ -26,9 +29,9 @@ spec:
     {{- range .Values.ingress.tls }}
     - hosts:
       {{- range .hosts }}
-        - {{ . | quote }}
+        - {{ tpl . $ | quote }}
       {{- end }}
-      secretName: {{ .secretName }}
+      secretName: {{ tpl .secretName $ }}
     {{- end }}
   {{- end }}
   rules:
