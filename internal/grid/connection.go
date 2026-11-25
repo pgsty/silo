@@ -965,7 +965,6 @@ func (c *Connection) readStream(ctx context.Context, conn net.Conn, cancel conte
 		OnIntermediate:  controlHandler,
 	}
 	readDataInto := func(dst []byte, s ws.State, want ws.OpCode) ([]byte, error) {
-		dst = dst[:0]
 		for {
 			hdr, err := wsReader.NextFrame()
 			if err != nil {
@@ -983,13 +982,11 @@ func (c *Connection) readStream(ctx context.Context, conn net.Conn, cancel conte
 				}
 				continue
 			}
-			if int64(cap(dst)) < hdr.Length+1 {
-				dst = make([]byte, 0, hdr.Length+hdr.Length>>3)
-			}
+			dst = frameReadBuffer(dst, hdr.Length)
 			if !hdr.Fin {
 				hdr.Length = -1
 			}
-			return readAllInto(dst[:0], &wsReader, hdr.Length)
+			return readAllInto(dst, &wsReader, hdr.Length)
 		}
 	}
 

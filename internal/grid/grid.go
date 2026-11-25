@@ -122,6 +122,16 @@ var PutByteBuffer = func(b []byte) {
 	}
 }
 
+// frameReadBuffer reserves at most one read buffer from the frame header.
+// readAllInto grows it as the payload arrives.
+func frameReadBuffer(b []byte, length int64) []byte {
+	initial := min(length, int64(readBufferSize))
+	if int64(cap(b)) >= initial {
+		return b[:0]
+	}
+	return make([]byte, 0, initial)
+}
+
 // readAllInto reads from r and appends to b until an error or EOF and returns the data it read.
 // A successful call returns err == nil, not err == EOF. Because readAllInto is
 // defined to read from src until EOF, it does not treat an EOF from Read
