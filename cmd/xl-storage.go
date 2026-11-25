@@ -3366,7 +3366,7 @@ func (s *xlStorage) CleanAbandonedData(ctx context.Context, volume string, path 
 		newBuf, err := xl.AppendTo(metaDataPoolGet())
 		if err == nil {
 			defer metaDataPoolPut(newBuf)
-			return s.WriteAll(ctx, volume, pathJoin(path, xlStorageFormatFile), buf)
+			return s.WriteAll(ctx, volume, pathJoin(path, xlStorageFormatFile), newBuf)
 		}
 	}
 	return nil
