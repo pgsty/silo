@@ -1,0 +1,7 @@
+apiVersion: v2
+name: consumer
+version: 0.1.0
+dependencies:
+  - name: silo
+    alias: objects
+    version: "*"

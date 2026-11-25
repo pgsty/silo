@@ -37,6 +37,7 @@ on:
       - "buildscripts/rebrand-guard/**"
       - "buildscripts/gen-ldflags.go"
       - ".github/workflows/release.yml"
+      - ".github/workflows/release-helm.yml"
       - ".github/workflows/docker-release.yml"
       - ".github/workflows/finalize-release.yml"
       - ".github/workflows/test-release.yml"

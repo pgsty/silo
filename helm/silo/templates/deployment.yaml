@@ -69,7 +69,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ include "silo.name" . }}
-          image: "{{ tpl .Values.image.repository . }}:{{ tpl .Values.image.tag . }}"
+          image: "{{ tpl .Values.image.repository . }}:{{ tpl (.Values.image.tag | toString) . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - "/bin/sh"
@@ -116,51 +116,7 @@ spec:
             - name: MINIO_PROMETHEUS_AUTH_TYPE
               value: "public"
             {{- end }}
-            {{- if .Values.oidc.enabled }}
-            - name: MINIO_IDENTITY_OPENID_CONFIG_URL
-            {{- if and .Values.oidc.existingConfigMapName .Values.oidc.existingConfigUrlKey }}
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ .Values.oidc.existingConfigMapName }}
-                  key: {{ .Values.oidc.existingConfigUrlKey }}
-            {{- else }}
-              value: {{ .Values.oidc.configUrl }}
-            {{- end }}
-            - name: MINIO_IDENTITY_OPENID_CLIENT_ID
-            {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientIdKey }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.oidc.existingClientSecretName }}
-                  key: {{ .Values.oidc.existingClientIdKey }}
-            {{- else }}
-              value: {{ .Values.oidc.clientId }}
-            {{- end }}
-            - name: MINIO_IDENTITY_OPENID_CLIENT_SECRET
-            {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientSecretKey }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.oidc.existingClientSecretName }}
-                  key: {{ .Values.oidc.existingClientSecretKey }}
-            {{- else }}
-              value: {{ .Values.oidc.clientSecret }}
-            {{- end }}
-            - name: MINIO_IDENTITY_OPENID_CLAIM_NAME
-              value: {{ .Values.oidc.claimName }}
-            - name: MINIO_IDENTITY_OPENID_CLAIM_PREFIX
-              value: {{ .Values.oidc.claimPrefix }}
-            - name: MINIO_IDENTITY_OPENID_SCOPES
-              value: {{ tpl .Values.oidc.scopes . }}
-            - name: MINIO_IDENTITY_OPENID_COMMENT
-              value: {{ .Values.oidc.comment }}
-            {{- if .Values.oidc.redirectUri }}
-            - name: MINIO_IDENTITY_OPENID_REDIRECT_URI
-              value: {{ tpl .Values.oidc.redirectUri . }}
-            {{- end }}
-            - name: MINIO_BROWSER_REDIRECT_URL
-              value: {{ tpl .Values.oidc.redirectUrl . }}
-            - name: MINIO_IDENTITY_OPENID_DISPLAY_NAME
-              value: {{ .Values.oidc.displayName }}
-            {{- end }}
+            {{- include "silo.oidcEnv" . | nindent 12 }}
             {{- if .Values.etcd.endpoints }}
             - name: MINIO_ETCD_ENDPOINTS
               value: {{ join "," .Values.etcd.endpoints | quote }}

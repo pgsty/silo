@@ -9,7 +9,6 @@
 {{ $subPath := .Values.persistence.subPath }}
 {{ $penabled := .Values.persistence.enabled }}
 {{ $accessMode := .Values.persistence.accessMode }}
-{{ $storageClass := .Values.persistence.storageClass }}
 {{ $psize := .Values.persistence.size }}
 apiVersion: v1
 kind: Service
@@ -100,7 +99,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ include "silo.name" . }}
-          image: {{ tpl .Values.image.repository . }}:{{ tpl .Values.image.tag . }}
+          image: {{ tpl .Values.image.repository . }}:{{ tpl (.Values.image.tag | toString) . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [
             "/bin/sh",
@@ -157,40 +156,7 @@ spec:
             - name: MINIO_PROMETHEUS_AUTH_TYPE
               value: "public"
             {{- end }}
-            {{- if .Values.oidc.enabled }}
-            - name: MINIO_IDENTITY_OPENID_CONFIG_URL
-              value: {{ .Values.oidc.configUrl }}
-            - name: MINIO_IDENTITY_OPENID_CLIENT_ID
-            {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientIdKey }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.oidc.existingClientSecretName }}
-                  key: {{ .Values.oidc.existingClientIdKey }}
-            {{- else }}
-              value: {{ .Values.oidc.clientId }}
-            {{- end }}
-            - name: MINIO_IDENTITY_OPENID_CLIENT_SECRET
-            {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientSecretKey }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.oidc.existingClientSecretName }}
-                  key: {{ .Values.oidc.existingClientSecretKey }}
-            {{- else }}
-              value: {{ .Values.oidc.clientSecret }}
-            {{- end }}
-            - name: MINIO_IDENTITY_OPENID_CLAIM_NAME
-              value: {{ .Values.oidc.claimName }}
-            - name: MINIO_IDENTITY_OPENID_CLAIM_PREFIX
-              value: {{ .Values.oidc.claimPrefix }}
-            - name: MINIO_IDENTITY_OPENID_SCOPES
-              value: {{ .Values.oidc.scopes }}
-            - name: MINIO_IDENTITY_OPENID_COMMENT
-              value: {{ .Values.oidc.comment }}
-            - name: MINIO_IDENTITY_OPENID_REDIRECT_URI
-              value: {{ .Values.oidc.redirectUri }}
-            - name: MINIO_IDENTITY_OPENID_DISPLAY_NAME
-              value: {{ .Values.oidc.displayName }}
-            {{- end }}
+            {{- include "silo.oidcEnv" . | nindent 12 }}
             {{- range $key, $val := .Values.environment }}
             - name: {{ $key }}
               value: {{ tpl $val $ | quote }}
@@ -209,7 +175,7 @@ spec:
           {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
-      nodeSelector: {{- toYaml . | nindent 8 }}
+      nodeSelector: {{- tpl (toYaml .) $ | nindent 8 }}
       {{- end }}
       {{- include "silo.imagePullSecrets" . | indent 6 }}
       {{- with .Values.affinity }}
@@ -237,6 +203,7 @@ spec:
           {{- toYaml .Values.extraVolumes | nindent 8 }}
         {{- end }}
   {{- if .Values.persistence.enabled }}
+  {{- $storageClass := include "silo.storageClass" . }}
   volumeClaimTemplates:
     {{- if gt $drivesPerNode 1 }}
     {{- range $diskId := until $drivesPerNode}}
@@ -249,8 +216,8 @@ spec:
         {{- end }}
       spec:
         accessModes: [ {{ $accessMode | quote }} ]
-        {{- if $storageClass }}
-        storageClassName: {{ $storageClass }}
+        {{- with $storageClass }}
+          {{- . | nindent 8 }}
         {{- end }}
         resources:
           requests:
@@ -266,8 +233,8 @@ spec:
         {{- end }}
       spec:
         accessModes: [ {{ $accessMode | quote }} ]
-        {{- if $storageClass }}
-        storageClassName: {{ $storageClass }}
+        {{- with $storageClass }}
+          {{- . | nindent 8 }}
         {{- end }}
         resources:
           requests:

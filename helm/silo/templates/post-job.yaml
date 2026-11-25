@@ -24,7 +24,7 @@ spec:
         app: {{ template "silo.name" . }}-job
         release: {{ .Release.Name }}
         {{- if .Values.podLabels }}
-          {{- toYaml .Values.podLabels | nindent 8 }}
+          {{- tpl (toYaml .Values.podLabels) $ | nindent 8 }}
         {{- end }}
         {{- with .Values.commonLabels }}
           {{- tpl (toYaml .) $ | nindent 8 }}
@@ -35,8 +35,8 @@ spec:
     spec:
       restartPolicy: OnFailure
       {{- include "silo.imagePullSecrets" . | indent 6 }}
-      {{- if or .Values.nodeSelector .Values.postJob.nodeSelector }}
-      nodeSelector: {{- tpl (toYaml .Values.postJob.nodeSelector | default .Values.nodeSelector) . | nindent 8 }}
+      {{- with (.Values.postJob.nodeSelector | default .Values.nodeSelector) }}
+      nodeSelector: {{- tpl (toYaml .) $ | nindent 8 }}
       {{- end }}
       {{- with .Values.postJob.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
@@ -94,7 +94,7 @@ spec:
       {{- if .Values.policies }}
       initContainers:
         - name: silo-make-policy
-          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl .Values.mcImage.tag . }}"
+          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl (.Values.mcImage.tag | toString) . }}"
           {{- if .Values.makePolicyJob.securityContext.enabled }}
           {{- with .Values.makePolicyJob.containerSecurityContext | default .Values.postJob.containerSecurityContext }}
           securityContext: {{ toYaml . | nindent 12 }}
@@ -128,7 +128,7 @@ spec:
       containers:
         {{- if .Values.buckets }}
         - name: silo-make-bucket
-          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl .Values.mcImage.tag . }}"
+          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl (.Values.mcImage.tag | toString) . }}"
           {{- if .Values.makeBucketJob.securityContext.enabled }}
           {{- with .Values.makeBucketJob.containerSecurityContext | default .Values.postJob.containerSecurityContext }}
           securityContext: {{ toYaml . | nindent 12 }}
@@ -161,7 +161,7 @@ spec:
         {{- end }}
         {{- if .Values.users }}
         - name: silo-make-user
-          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl .Values.mcImage.tag . }}"
+          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl (.Values.mcImage.tag | toString) . }}"
           {{- if .Values.makeUserJob.securityContext.enabled }}
           {{- with .Values.makeUserJob.containerSecurityContext | default .Values.postJob.containerSecurityContext }}
           securityContext: {{ toYaml . | nindent 12 }}
@@ -194,7 +194,7 @@ spec:
         {{- end }}
         {{- if .Values.customCommands }}
         - name: silo-custom-command
-          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl .Values.mcImage.tag . }}"
+          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl (.Values.mcImage.tag | toString) . }}"
           {{- if .Values.customCommandJob.securityContext.enabled }}
           {{- with .Values.customCommandJob.containerSecurityContext | default .Values.postJob.containerSecurityContext }}
           securityContext: {{ toYaml . | nindent 12 }}
@@ -230,7 +230,7 @@ spec:
         {{- end }}
         {{- if .Values.svcaccts }}
         - name: silo-make-svcacct
-          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl .Values.mcImage.tag . }}"
+          image: "{{ tpl .Values.mcImage.repository . }}:{{ tpl (.Values.mcImage.tag | toString) . }}"
           {{- if .Values.makeServiceAccountJob.securityContext.enabled }}
           {{- with .Values.makeServiceAccountJob.containerSecurityContext | default .Values.postJob.containerSecurityContext }}
           securityContext: {{ toYaml . | nindent 12 }}

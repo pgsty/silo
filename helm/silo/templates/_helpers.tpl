@@ -119,26 +119,34 @@ Properly format optional additional arguments to Silo binary
 {{- end -}}
 {{- end -}}
 
-{{/*
-Return the proper Docker Image Registry Secret Names
-*/}}
 {{- define "silo.imagePullSecrets" -}}
-{{/*
-Helm 2.11 supports the assignment of a value to a variable defined in a different scope,
-but Helm 2.9 and 2.10 does not support it, so we need to implement this if-else logic.
-Also, we can not use a single if because lazy evaluation is not an option
-*/}}
-{{- if .Values.global }}
-{{- if .Values.global.imagePullSecrets }}
-imagePullSecrets:
-  {{ tpl (toYaml .Values.global.imagePullSecrets) $ }}
-{{- else if .Values.imagePullSecrets }}
-imagePullSecrets:
-  {{ tpl (toYaml .Values.imagePullSecrets) $ }}
+{{- with (or (.Values.global | default dict).imagePullSecrets .Values.imagePullSecrets) }}
+imagePullSecrets: {{- tpl (toYaml .) $ | nindent 2 }}
+{{- end }}
 {{- end -}}
-{{- else if .Values.imagePullSecrets }}
-imagePullSecrets:
-  {{ tpl (toYaml .Values.imagePullSecrets) $ }}
+
+{{/* Keep the class already chosen for an existing claim when a parent supplies a default. */}}
+{{- define "silo.storageClass" -}}
+{{- $class := or .Values.persistence.storageClass (.Values.global | default dict).storageClass -}}
+{{- if $class -}}
+  {{- $spec := dict "storageClassName" (ternary "" $class (eq $class "-")) -}}
+  {{- if and .Release.IsUpgrade (not .Values.persistence.storageClass) -}}
+    {{- $name := include "silo.fullname" . -}}
+    {{- if eq .Values.mode "standalone" -}}
+      {{- with (lookup "v1" "PersistentVolumeClaim" .Release.Namespace $name) -}}
+        {{- $spec = .spec -}}
+      {{- end -}}
+    {{- else -}}
+      {{- with (lookup "apps/v1" "StatefulSet" .Release.Namespace $name) -}}
+        {{- with .spec.volumeClaimTemplates -}}
+          {{- $spec = (first .).spec -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if hasKey $spec "storageClassName" -}}
+storageClassName: {{ $spec.storageClassName | quote }}
+  {{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -201,7 +209,11 @@ otherwise it generates a random value.
 
 {{- define "silo.root.username" -}}
   {{- if .Values.rootUser }}
-    {{- tpl .Values.rootUser . | toString }}
+    {{- if .Values.tplRootCredentials }}
+      {{- tpl (.Values.rootUser | toString) . }}
+    {{- else }}
+      {{- .Values.rootUser | toString }}
+    {{- end }}
   {{- else }}
     {{- include "silo.getValueFromSecret" (dict "Namespace" .Release.Namespace "Name" (include "silo.fullname" .) "Length" 20 "Key" "rootUser") }}
   {{- end }}
@@ -209,8 +221,64 @@ otherwise it generates a random value.
 
 {{- define "silo.root.password" -}}
   {{- if .Values.rootPassword }}
-    {{- tpl .Values.rootPassword . | toString }}
+    {{- if .Values.tplRootCredentials }}
+      {{- tpl (.Values.rootPassword | toString) . }}
+    {{- else }}
+      {{- .Values.rootPassword | toString }}
+    {{- end }}
   {{- else }}
     {{- include "silo.getValueFromSecret" (dict "Namespace" .Release.Namespace "Name" (include "silo.fullname" .) "Length" 40 "Key" "rootPassword") }}
   {{- end }}
+{{- end -}}
+
+{{/* OIDC environment shared by the standalone and distributed workloads. */}}
+{{- define "silo.oidcEnv" -}}
+{{- $oidc := .Values.oidc -}}
+{{- if $oidc.enabled -}}
+- name: MINIO_IDENTITY_OPENID_CONFIG_URL
+  {{- if and $oidc.existingConfigMapName $oidc.existingConfigUrlKey }}
+  valueFrom:
+    configMapKeyRef:
+      name: {{ $oidc.existingConfigMapName | quote }}
+      key: {{ $oidc.existingConfigUrlKey | quote }}
+  {{- else }}
+  value: {{ $oidc.configUrl | quote }}
+  {{- end }}
+- name: MINIO_IDENTITY_OPENID_CLIENT_ID
+  {{- if and $oidc.existingClientSecretName $oidc.existingClientIdKey }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $oidc.existingClientSecretName | quote }}
+      key: {{ $oidc.existingClientIdKey | quote }}
+  {{- else }}
+  value: {{ $oidc.clientId | quote }}
+  {{- end }}
+- name: MINIO_IDENTITY_OPENID_CLIENT_SECRET
+  {{- if and $oidc.existingClientSecretName $oidc.existingClientSecretKey }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $oidc.existingClientSecretName | quote }}
+      key: {{ $oidc.existingClientSecretKey | quote }}
+  {{- else }}
+  value: {{ $oidc.clientSecret | quote }}
+  {{- end }}
+- name: MINIO_IDENTITY_OPENID_CLAIM_NAME
+  value: {{ $oidc.claimName | quote }}
+- name: MINIO_IDENTITY_OPENID_CLAIM_PREFIX
+  value: {{ $oidc.claimPrefix | quote }}
+- name: MINIO_IDENTITY_OPENID_SCOPES
+  value: {{ tpl $oidc.scopes . | quote }}
+- name: MINIO_IDENTITY_OPENID_COMMENT
+  value: {{ $oidc.comment | quote }}
+{{- with $oidc.redirectUri }}
+- name: MINIO_IDENTITY_OPENID_REDIRECT_URI
+  value: {{ tpl . $ | quote }}
+{{- end }}
+{{- if and $oidc.redirectUrl (not (hasKey (.Values.environment | default dict) "MINIO_BROWSER_REDIRECT_URL")) }}
+- name: MINIO_BROWSER_REDIRECT_URL
+  value: {{ tpl $oidc.redirectUrl . | quote }}
+{{- end }}
+- name: MINIO_IDENTITY_OPENID_DISPLAY_NAME
+  value: {{ $oidc.displayName | quote }}
+{{- end }}
 {{- end -}}

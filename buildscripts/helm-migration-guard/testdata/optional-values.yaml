@@ -1,0 +1,32 @@
+rootUser: silo-admin
+rootPassword: 'literal-{{ .Release.Name }}'
+buckets:
+  - name: chart-test
+tls:
+  enabled: true
+  certSecret: silo-tls
+trustedCertsSecret: silo-trusted-ca
+ingress:
+  enabled: true
+  tls:
+    - hosts: [s3.example.test]
+consoleIngress:
+  enabled: true
+  tls:
+    - hosts: [console.example.test]
+networkPolicy:
+  enabled: true
+podDisruptionBudget:
+  enabled: true
+metrics:
+  serviceMonitor:
+    enabled: true
+    includeNode: true
+oidc:
+  enabled: true
+  existingConfigMapName: chart-oidc
+  existingConfigUrlKey: discovery
+  redirectUri: https://console.example.test/oauth_callback
+imagePullSecrets:
+  - name: primary-pull
+  - name: '{{ .Release.Name }}-pull'

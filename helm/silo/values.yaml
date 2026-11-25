@@ -95,6 +95,8 @@ runtimeClassName: ""
 ##
 rootUser: ""
 rootPassword: ""
+## Evaluate rootUser and rootPassword as Helm templates when explicitly enabled.
+tplRootCredentials: false
 
 ## Use existing Secret that store following variables:
 ##
@@ -160,8 +162,8 @@ persistence:
   ##   set, choosing the default provisioner.  (gp2 on AWS, standard on
   ##   GKE, AWS & OpenStack)
   ##
-  ## Storage class of PV to bind. By default it looks for standard storage class.
-  ## If the PV uses a different storage class, specify that here.
+  ## An unset value inherits global.storageClass for new claims. During upgrade,
+  ## existing claims retain their provisioned class.
   storageClass: ""
   volumeName: ""
   accessMode: ReadWriteOnce
@@ -552,10 +554,10 @@ oidc:
   existingClientSecretKey: ""
   claimName: "policy"
   scopes: "openid,profile,email"
-  # Deprecated: Use redirectUrl and set this to `false` or an empty string
-  redirectUri: "https://console-endpoint-url/oauth_callback"
-  # Use in favor of `redirectUri` to set `MINIO_BROWSER_REDIRECT_URL`
-  redirectUrl: "https://console-endpoint-url"
+  # Legacy callback URL, including /oauth_callback, for existing installations.
+  redirectUri: ""
+  # Public Console base URL. An explicit environment.MINIO_BROWSER_REDIRECT_URL takes priority.
+  redirectUrl: ""
   # Can leave empty
   claimPrefix: ""
   comment: ""
