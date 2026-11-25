@@ -37,6 +37,9 @@ additionalLabels: {}
 ## Additional annotations to include with deployment or statefulset
 additionalAnnotations: {}
 
+## Common labels applied to all resources
+commonLabels: {}
+
 ## Typically the deployment/statefulset includes checksums of secrets/config,
 ## So that when these change on a subsequent helm install, the deployment/statefulset
 ## is restarted. This can result in unnecessary restarts under GitOps tooling such as
@@ -358,6 +361,7 @@ makePolicyJob:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
+  containerSecurityContext: {}
   resources:
     requests:
       memory: 128Mi
@@ -388,6 +392,7 @@ makeUserJob:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
+  containerSecurityContext: {}
   resources:
     requests:
       memory: 128Mi
@@ -428,6 +433,7 @@ makeServiceAccountJob:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
+  containerSecurityContext: {}
   resources:
     requests:
       memory: 128Mi
@@ -465,6 +471,7 @@ makeBucketJob:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
+  containerSecurityContext: {}
   resources:
     requests:
       memory: 128Mi
@@ -483,6 +490,7 @@ customCommandJob:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
+  containerSecurityContext: {}
   resources:
     requests:
       memory: 128Mi
@@ -510,6 +518,7 @@ postJob:
     runAsUser: 1000
     runAsGroup: 1000
     fsGroup: 1000
+  containerSecurityContext: {}
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -532,6 +541,9 @@ extraSecret: ~
 oidc:
   enabled: false
   configUrl: "https://identity-provider-url/.well-known/openid-configuration"
+  # Provide existing ConfigMap for the Config URL
+  existingConfigMapName: ""
+  existingConfigUrlKey: ""
   clientId: "silo"
   clientSecret: ""
   # Provide existing client secret from the Kubernetes Secret resource, existing secret will have priority over `clientId` and/or `clientSecret``
@@ -540,7 +552,10 @@ oidc:
   existingClientSecretKey: ""
   claimName: "policy"
   scopes: "openid,profile,email"
+  # Deprecated: Use redirectUrl and set this to `false` or an empty string
   redirectUri: "https://console-endpoint-url/oauth_callback"
+  # Use in favor of `redirectUri` to set `MINIO_BROWSER_REDIRECT_URL`
+  redirectUrl: "https://console-endpoint-url"
   # Can leave empty
   claimPrefix: ""
   comment: ""
@@ -553,6 +568,12 @@ networkPolicy:
   flavor: kubernetes
   # Allow external access to the Silo API.
   allowExternal: true
+  # Additional from values to add to the Ingress
+  allowFrom: []
+  ## E.X.
+  # - namespaceSelector:
+  #     matchLabels:
+  #       kubernetes.io/metadata.name: prometheus
   ## @params networkPolicy.egress configuration of the egress traffic
   egress:
     ## @param networkPolicy.egress.enabled When enabled, an egress network policy will be
@@ -604,6 +625,8 @@ metrics:
     public: true
     additionalLabels: {}
     annotations: {}
+    # targetLabels for the ServiceMonitor
+    targetLabels: []
     # for node metrics
     relabelConfigs: {}
     # for cluster metrics
@@ -612,6 +635,8 @@ metrics:
       # metricRelabelings:
       #   - regex: (server|pod)
       #     action: labeldrop
+    # Probe relabelingConfigs added to the probe target
+    probeRelabelingConfigs: []
     namespace: ~
     # Scrape interval, for example `interval: 30s`
     interval: ~

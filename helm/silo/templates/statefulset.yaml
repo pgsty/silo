@@ -20,6 +20,9 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
 spec:
   publishNotReadyAddresses: true
   clusterIP: None
@@ -41,11 +44,15 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
-    {{- if .Values.additionalLabels }}
-      {{- toYaml .Values.additionalLabels | nindent 4 }}
+    {{- with .Values.additionalLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
-  {{- if .Values.additionalAnnotations }}
-  annotations: {{- toYaml .Values.additionalAnnotations | nindent 4 }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- tpl (toYaml .) $ | nindent 4 }}
   {{- end }}
 spec:
   updateStrategy:
@@ -63,8 +70,11 @@ spec:
       labels:
         app: {{ template "silo.name" . }}
         release: {{ .Release.Name }}
-        {{- if .Values.podLabels }}
-          {{- toYaml .Values.podLabels | nindent 8 }}
+        {{- with .Values.podLabels }}
+          {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+        {{- with .Values.commonLabels }}
+          {{- tpl (toYaml .) $ | nindent 8 }}
         {{- end }}
       annotations:
         {{- if not .Values.ignoreChartChecksums }}
@@ -90,7 +100,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ include "silo.name" . }}
-          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          image: {{ tpl .Values.image.repository . }}:{{ tpl .Values.image.tag . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [
             "/bin/sh",

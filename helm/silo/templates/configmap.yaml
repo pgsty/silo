@@ -7,6 +7,9 @@ metadata:
     chart: {{ template "silo.chart" . }}
     release: {{ .Release.Name }}
     heritage: {{ .Release.Service }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
 data:
   initialize: |-
     {{- include (print $.Template.BasePath "/_helper_create_bucket.txt") . | nindent 4 }}
@@ -14,7 +17,11 @@ data:
     {{- include (print $.Template.BasePath "/_helper_create_user.txt") . | nindent 4 }}
   add-policy: |-
     {{- include (print $.Template.BasePath "/_helper_create_policy.txt") . | nindent 4 }}
-  {{- range $idx, $policy := .Values.policies }}
+  {{- $policies := .Values.policies }}
+  {{- if typeIs "string" .Values.policies }}
+    {{- $policies = tpl .Values.policies . | fromYamlArray }}
+  {{- end }}
+  {{- range $idx, $policy := $policies }}
   # Policy: {{ $policy.name }}
   policy_{{ $idx }}.json: |-
     {{- include (print $.Template.BasePath "/_helper_policy.tpl") . | nindent 4 }}

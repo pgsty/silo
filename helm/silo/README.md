@@ -7,15 +7,15 @@ The chart and server are licensed under AGPL-3.0-or-later.
 ## Prerequisites
 
 - Kubernetes 1.19 or later
-- Helm 3
+- Helm 3 or 4
 - A PersistentVolume provisioner unless `persistence.enabled=false`
 
 ## Install
 
-From this repository:
+From GHCR:
 
 ```bash
-helm install silo ./helm/silo \
+helm install silo oci://ghcr.io/pgsty/charts/silo \
   --namespace silo --create-namespace \
   --set rootUser=silo-admin \
   --set rootPassword='replace-with-a-long-random-secret'
@@ -24,7 +24,7 @@ helm install silo ./helm/silo \
 For a disposable standalone installation:
 
 ```bash
-helm install silo ./helm/silo \
+helm install silo oci://ghcr.io/pgsty/charts/silo \
   --namespace silo --create-namespace \
   --set mode=standalone \
   --set replicas=1 \
@@ -64,7 +64,7 @@ helm get values my-release -n my-namespace -a > values.before-silo.yaml
 SILO_TAG='<published-silo-release-tag>'
 MCLI_TAG='<published-mcli-release-tag>'
 
-helm template my-release ./helm/silo \
+helm template my-release oci://ghcr.io/pgsty/charts/silo \
   -n my-namespace \
   -f values.before-silo.yaml \
   --set nameOverride=minio \
@@ -84,7 +84,7 @@ mounts. After review, upgrade the chart and image together:
 ```bash
 SILO_TAG='<published-silo-release-tag>'
 MCLI_TAG='<published-mcli-release-tag>'
-helm upgrade my-release ./helm/silo \
+helm upgrade my-release oci://ghcr.io/pgsty/charts/silo \
   -n my-namespace \
   -f values.before-silo.yaml \
   --set nameOverride=minio \
@@ -126,13 +126,13 @@ The default PersistentVolumeClaim mounts at `/export`. Use an existing claim
 with:
 
 ```bash
-helm install silo ./helm/silo --set persistence.existingClaim=PVC_NAME
+helm install silo oci://ghcr.io/pgsty/charts/silo --set persistence.existingClaim=PVC_NAME
 ```
 
 Create a TLS Secret containing `private.key` and `public.crt`, then set:
 
 ```bash
-helm upgrade --install silo ./helm/silo \
+helm upgrade --install silo oci://ghcr.io/pgsty/charts/silo \
   --set tls.enabled=true \
   --set tls.certSecret=silo-tls
 ```

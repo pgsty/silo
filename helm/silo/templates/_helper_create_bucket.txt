@@ -119,5 +119,5 @@ connectToSilo $scheme
 {{ $global := . }}
 # Create the buckets
 {{- range .Values.buckets }}
-createBucket {{ tpl .name $global }} {{ .policy | default "none" | quote }} {{ .purge | default false }} {{ .versioning | default "" }} {{ .objectlocking | default false }}{{- end }}
+createBucket {{ tpl .name $global }} {{ tpl .policy $global | default "none" | quote }} {{ .purge | default false }} {{ .versioning | default "" }} {{ .objectlocking | default false }}{{- end }}
 {{- end }}

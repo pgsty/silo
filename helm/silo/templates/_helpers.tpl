@@ -131,14 +131,14 @@ Also, we can not use a single if because lazy evaluation is not an option
 {{- if .Values.global }}
 {{- if .Values.global.imagePullSecrets }}
 imagePullSecrets:
-    {{ toYaml .Values.global.imagePullSecrets }}
+  {{ tpl (toYaml .Values.global.imagePullSecrets) $ }}
 {{- else if .Values.imagePullSecrets }}
 imagePullSecrets:
-    {{ toYaml .Values.imagePullSecrets }}
+  {{ tpl (toYaml .Values.imagePullSecrets) $ }}
 {{- end -}}
 {{- else if .Values.imagePullSecrets }}
 imagePullSecrets:
-    {{ toYaml .Values.imagePullSecrets }}
+  {{ tpl (toYaml .Values.imagePullSecrets) $ }}
 {{- end -}}
 {{- end -}}
 
@@ -201,7 +201,7 @@ otherwise it generates a random value.
 
 {{- define "silo.root.username" -}}
   {{- if .Values.rootUser }}
-    {{- .Values.rootUser | toString }}
+    {{- tpl .Values.rootUser . | toString }}
   {{- else }}
     {{- include "silo.getValueFromSecret" (dict "Namespace" .Release.Namespace "Name" (include "silo.fullname" .) "Length" 20 "Key" "rootUser") }}
   {{- end }}
@@ -209,7 +209,7 @@ otherwise it generates a random value.
 
 {{- define "silo.root.password" -}}
   {{- if .Values.rootPassword }}
-    {{- .Values.rootPassword | toString }}
+    {{- tpl .Values.rootPassword . | toString }}
   {{- else }}
     {{- include "silo.getValueFromSecret" (dict "Namespace" .Release.Namespace "Name" (include "silo.fullname" .) "Length" 40 "Key" "rootPassword") }}
   {{- end }}

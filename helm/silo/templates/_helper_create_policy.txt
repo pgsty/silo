@@ -68,8 +68,12 @@ scheme=http
 connectToSilo $scheme
 
 {{ if .Values.policies }}
+{{- $policies := .Values.policies }}
+{{- if typeIs "string" .Values.policies }}
+  {{- $policies = tpl .Values.policies . | fromYamlArray }}
+{{- end }}
 # Create the policies
-{{- range $idx, $policy := .Values.policies }}
+{{- range $idx, $policy := $policies }}
 createPolicy {{ $policy.name }} policy_{{ $idx }}
 {{- end }}
 {{- end }}

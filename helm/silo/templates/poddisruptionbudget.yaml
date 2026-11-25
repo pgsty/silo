@@ -9,6 +9,9 @@ metadata:
   name: {{ template "silo.fullname" . }}
   labels:
     app: {{ template "silo.name" . }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
 spec:
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   selector:
