@@ -772,3 +772,53 @@ func TestCommonParities(t *testing.T) {
 		}
 	}
 }
+
+// checkPartsResultDisk returns a programmed CheckParts/VerifyFile result.
+// All other StorageAPI methods are unimplemented and panic if called.
+type checkPartsResultDisk struct {
+	StorageAPI
+	resp *CheckPartsResp
+	err  error
+}
+
+func (d *checkPartsResultDisk) CheckParts(context.Context, string, string, FileInfo) (*CheckPartsResp, error) {
+	return d.resp, d.err
+}
+
+func (d *checkPartsResultDisk) VerifyFile(context.Context, string, string, FileInfo) (*CheckPartsResp, error) {
+	return d.resp, d.err
+}
+
+// A drive whose CheckParts/VerifyFile returns no error but also no (or a
+// short) per-part result, e.g. a remote stream that ended without a response,
+// must be reported as unreachable instead of crashing the heal.
+func TestCheckObjectWithAllPartsMissingResult(t *testing.T) {
+	for _, scanMode := range []madmin.HealScanMode{madmin.HealNormalScan, madmin.HealDeepScan} {
+		t.Run(fmt.Sprintf("scanMode=%d", scanMode), func(t *testing.T) {
+			meta := nativeAuditMetadata()
+			full := &CheckPartsResp{Results: []int{checkPartSuccess, checkPartSuccess}}
+			disks := []StorageAPI{
+				&checkPartsResultDisk{resp: nil},                                               // (nil, nil)
+				&checkPartsResultDisk{resp: &CheckPartsResp{Results: []int{checkPartSuccess}}}, // short result
+				&checkPartsResultDisk{resp: full},
+				&checkPartsResultDisk{resp: full},
+			}
+			errs := make([]error, len(disks))
+
+			dataErrsByDisk, _ := checkObjectWithAllParts(t.Context(), disks, meta, errs, meta[0],
+				false, "bucket", "object", scanMode)
+
+			for i := range disks {
+				for p, got := range dataErrsByDisk[i] {
+					want := checkPartSuccess
+					if i < 2 {
+						want = checkPartDiskNotFound
+					}
+					if got != want {
+						t.Errorf("disk %d part %d: got %d, want %d", i, p, got, want)
+					}
+				}
+			}
+		})
+	}
+}

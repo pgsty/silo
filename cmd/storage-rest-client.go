@@ -480,6 +480,12 @@ func (client *storageRESTClient) CheckParts(ctx context.Context, volume string, 
 		resp = r
 		return nil
 	})
+	if err == nil && resp == nil {
+		// The stream ended without a response and without an error,
+		// e.g. when the mux was closed during a disconnect. Never
+		// return (nil, nil): callers rely on resp being set on success.
+		err = grid.ErrDisconnected
+	}
 	return resp, toStorageErr(err)
 }
 
