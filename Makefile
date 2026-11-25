@@ -43,6 +43,7 @@ rebrand-guard: ## verify Silo branding and protected compatibility identifiers
 	@env bash $(PWD)/buildscripts/verify-rebrand.sh
 	@env bash $(PWD)/dockerscripts/docker-entrypoint_test.sh
 
+.PHONY: credits
 credits: ## regenerate CREDITS from the licenses of Go modules linked into the binary
 	@env bash $(PWD)/buildscripts/gen-credits.sh
 
