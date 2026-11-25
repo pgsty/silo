@@ -420,6 +420,12 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
 		default:
 			verifyResp, verifyErr = onlineDisk.CheckParts(ctx, bucket, object, meta)
 		}
+		if verifyErr == nil && (verifyResp == nil || len(verifyResp.Results) < len(latestMeta.Parts)) {
+			// A drive that returned no usable per-part result cannot vouch
+			// for its parts; treat it like an unreachable drive instead of
+			// dereferencing a nil or short response.
+			verifyErr = errDiskNotFound
+		}
 
 		for p := range latestMeta.Parts {
 			if verifyErr != nil {
