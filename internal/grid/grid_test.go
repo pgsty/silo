@@ -34,6 +34,20 @@ import (
 	"github.com/minio/minio/internal/logger/target/testlogger"
 )
 
+func TestFrameReadBuffer(t *testing.T) {
+	for _, length := range []int64{0, 128, readBufferSize, 4 * readBufferSize} {
+		buf := frameReadBuffer(nil, length)
+		if len(buf) != 0 || int64(cap(buf)) != min(length, int64(readBufferSize)) {
+			t.Fatalf("length %d: got len %d, cap %d", length, len(buf), cap(buf))
+		}
+	}
+	buf := make([]byte, 128)
+	got := frameReadBuffer(buf, int64(len(buf)))
+	if len(got) != 0 || cap(got) != cap(buf) || &got[:1][0] != &buf[0] {
+		t.Fatal("did not reuse the existing read buffer")
+	}
+}
+
 func TestSingleRoundtrip(t *testing.T) {
 	defer testlogger.T.SetLogTB(t)()
 	errFatal := func(err error) {
