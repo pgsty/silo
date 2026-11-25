@@ -3,7 +3,7 @@ module github.com/minio/minio/docs/debugging/inspect
 go 1.27.3
 
 require (
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.5
 	github.com/klauspost/filepathx v1.1.1
 	github.com/minio/colorjson v1.0.8
 	github.com/minio/madmin-go/v3 v3.0.110
@@ -18,6 +18,6 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/minio/pkg/v3 v3.11.0 // indirect
 	github.com/philhofer/fwd v1.2.1 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )

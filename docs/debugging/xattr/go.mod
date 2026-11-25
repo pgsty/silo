@@ -11,5 +11,5 @@ require (
 	// Preserve Unicode table alignment; v0.0.31 changes Hindi and CJK-locale output.
 	github.com/mattn/go-runewidth v0.0.15 // indirect
 	github.com/rivo/uniseg v0.4.4 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )
