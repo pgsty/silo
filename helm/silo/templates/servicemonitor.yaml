@@ -80,6 +80,9 @@ metadata:
     {{- with .Values.metrics.serviceMonitor.additionalLabels }}
       {{- tpl (toYaml .) $ | nindent 4 }}
     {{- end }}
+    {{- with .Values.commonLabels }}
+      {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
 spec:
   jobName: {{ template "silo.fullname" . }}
   {{- if .Values.tls.enabled }}

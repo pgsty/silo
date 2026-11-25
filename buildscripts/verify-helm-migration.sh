@@ -40,6 +40,17 @@ else
 	}
 fi
 
+expect_rendered() {
+	local render="$1" expected
+	shift
+	for expected in "$@"; do
+		grep -F -- "${expected}" "${render}" >/dev/null || {
+			echo "${render} is missing: ${expected}" >&2
+			exit 1
+		}
+	done
+}
+
 helm_run lint "${new_chart}"
 helm_run template silo "${new_chart}" \
 	--namespace silo \
@@ -53,23 +64,23 @@ helm_run template silo "${new_chart}" \
 	--set rootUser=silo-admin \
 	--set rootPassword=test-password-123456 >/dev/null
 
-# Exercise optional templates that the default render leaves dormant.
-helm_run template silo-all "${new_chart}" \
-	--namespace silo \
-	--set rootUser=silo-admin \
-	--set rootPassword=test-password-123456 \
-	--set tls.enabled=true \
-	--set tls.certSecret=silo-tls \
-	--set trustedCertsSecret=silo-trusted-ca \
-	--set ingress.enabled=true \
-	--set consoleIngress.enabled=true \
-	--set networkPolicy.enabled=true \
-	--set podDisruptionBudget.enabled=true \
-	--set metrics.serviceMonitor.enabled=true \
-	--set metrics.serviceMonitor.includeNode=true \
-	--set 'buckets[0].name=chart-test' \
-	--set 'buckets[0].policy=none' \
-	--set 'buckets[0].purge=false' >/dev/null
+# Exercise the persisted standalone PVC, optional legacy values, and OIDC in both workloads.
+cp buildscripts/helm-migration-guard/testdata/optional-values.yaml "${work_dir}/optional-values.yaml"
+for mode in standalone distributed; do
+	render="${work_dir}/${mode}.yaml"
+	helm_run template silo-all "${new_chart}" --namespace silo \
+		-f "${output_dir}/optional-values.yaml" --set "mode=${mode}" >"${render}"
+	expect_rendered "${render}" \
+		'createBucket chart-test "none" false "" false' \
+		'name: "chart-oidc"' \
+		'key: "discovery"' \
+		'value: "https://console.example.test/oauth_callback"' \
+		"rootPassword: \"$(printf '%s' 'literal-{{ .Release.Name }}' | base64)\""
+	if grep -F -- 'name: MINIO_BROWSER_REDIRECT_URL' "${render}" >/dev/null; then
+		echo "${mode} sets a browser redirect without a configured URL" >&2
+		exit 1
+	fi
+done
 
 # Existing values commonly address the historical myminio target. Render the
 # custom-command path explicitly so both the new and compatibility aliases are
@@ -81,15 +92,10 @@ helm_run template silo-custom "${new_chart}" \
 	--set rootPassword=test-password-123456 \
 	--set-string 'customCommands[0].command=admin info myminio' \
 	--show-only templates/configmap.yaml >"${custom_render}"
-for expected in \
+expect_rendered "${custom_render}" \
 	'alias set mysilo' \
 	'alias set myminio' \
-	'runCommand admin info myminio'; do
-	grep -F -- "${expected}" "${custom_render}" >/dev/null || {
-		echo "rendered custom command is missing: ${expected}" >&2
-		exit 1
-	}
-done
+	'runCommand admin info myminio'
 
 old_render="${work_dir}/legacy.yaml"
 new_render="${work_dir}/candidate.yaml"
@@ -131,5 +137,15 @@ if find "${work_dir}" -maxdepth 1 -type f -name 'minio-*.tgz' | grep -q .; then
 	echo "Helm packaging emitted a legacy MinIO chart name" >&2
 	exit 1
 fi
+
+# Render the packaged chart under an alias, with values inherited from its parent.
+cp -R buildscripts/helm-migration-guard/testdata/parent "${work_dir}/parent"
+mkdir "${work_dir}/parent/charts"
+cp "${work_dir}/silo-${chart_version}.tgz" "${work_dir}/parent/charts/"
+helm_run template consumer "${output_dir}/parent" >"${work_dir}/parent.yaml"
+expect_rendered "${work_dir}/parent.yaml" \
+	'name: consumer-objects' \
+	'storageClassName: "site-storage"' \
+	'createBucket consumer-archive "none" false "" false'
 
 echo "Silo Helm lint, render, legacy-upgrade, and package checks passed"

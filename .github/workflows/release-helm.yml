@@ -3,7 +3,7 @@ name: Publish Helm Chart to GHCR
 on:
   push:
     tags:
-      - "chart-.*"
+      - "chart-*"
 
 permissions:
   contents: read
@@ -14,18 +14,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: v4.3.2
+
+      - name: Validate tag and package chart
+        run: |
+          set -euo pipefail
+          version="$(helm show chart helm/silo | sed -n 's/^version: //p')"
+          if [[ -z "$version" || "$GITHUB_REF_NAME" != "chart-$version" ]]; then
+            echo "Expected chart-$version for helm/silo, got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          helm lint helm/silo
+          helm package helm/silo --destination "$RUNNER_TEMP"
 
       - name: Log in to GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
-            --username ${{ github.actor }} \
-            --password-stdin
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Package and Push Helm Chart
+      - name: Push chart
         run: |
-          helm package helm/silo
-          helm push silo-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          helm push "$RUNNER_TEMP/silo-${GITHUB_REF_NAME#chart-}.tgz" \
+            "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"

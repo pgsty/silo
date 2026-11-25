@@ -1,0 +1,6 @@
+global:
+  storageClass: site-storage
+  bucketSuffix: archive
+objects:
+  buckets:
+    - name: '{{ .Release.Name }}-{{ .Values.global.bucketSuffix }}'

@@ -12,19 +12,22 @@ The chart and server are licensed under AGPL-3.0-or-later.
 
 ## Install
 
-From GHCR:
+From the source checkout:
 
 ```bash
-helm install silo oci://ghcr.io/pgsty/charts/silo \
+helm install silo ./helm/silo \
   --namespace silo --create-namespace \
   --set rootUser=silo-admin \
   --set rootPassword='replace-with-a-long-random-secret'
 ```
 
+For a version published on GHCR, use `oci://ghcr.io/pgsty/charts/silo` in
+place of `./helm/silo` and pass `--version <chart-version>`.
+
 For a disposable standalone installation:
 
 ```bash
-helm install silo oci://ghcr.io/pgsty/charts/silo \
+helm install silo ./helm/silo \
   --namespace silo --create-namespace \
   --set mode=standalone \
   --set replicas=1 \
@@ -64,7 +67,7 @@ helm get values my-release -n my-namespace -a > values.before-silo.yaml
 SILO_TAG='<published-silo-release-tag>'
 MCLI_TAG='<published-mcli-release-tag>'
 
-helm template my-release oci://ghcr.io/pgsty/charts/silo \
+helm template my-release ./helm/silo \
   -n my-namespace \
   -f values.before-silo.yaml \
   --set nameOverride=minio \
@@ -84,7 +87,7 @@ mounts. After review, upgrade the chart and image together:
 ```bash
 SILO_TAG='<published-silo-release-tag>'
 MCLI_TAG='<published-mcli-release-tag>'
-helm upgrade my-release oci://ghcr.io/pgsty/charts/silo \
+helm upgrade my-release ./helm/silo \
   -n my-namespace \
   -f values.before-silo.yaml \
   --set nameOverride=minio \
@@ -122,17 +125,21 @@ When upgrading an existing Silo release to `RELEASE.2026-11-12T00-00-00Z` (chart
 
 ## Persistence and TLS
 
-The default PersistentVolumeClaim mounts at `/export`. Use an existing claim
-with:
+The default PersistentVolumeClaim mounts at `/export`. New claims use
+`persistence.storageClass` or inherit `global.storageClass` from a parent chart.
+Helm preserves the existing storage class during a connected upgrade when only
+the parent supplies a default.
+
+Use an existing claim with:
 
 ```bash
-helm install silo oci://ghcr.io/pgsty/charts/silo --set persistence.existingClaim=PVC_NAME
+helm install silo ./helm/silo --set persistence.existingClaim=PVC_NAME
 ```
 
 Create a TLS Secret containing `private.key` and `public.crt`, then set:
 
 ```bash
-helm upgrade --install silo oci://ghcr.io/pgsty/charts/silo \
+helm upgrade --install silo ./helm/silo \
   --set tls.enabled=true \
   --set tls.certSecret=silo-tls
 ```
@@ -140,6 +147,9 @@ helm upgrade --install silo oci://ghcr.io/pgsty/charts/silo \
 Additional trusted CAs can be supplied through `trustedCertsSecret`.
 
 ## Existing Secrets and post-install resources
+
+The chart treats `rootUser` and `rootPassword` as literal values. A parent chart
+can opt into evaluating both as Helm templates with `tplRootCredentials: true`.
 
 Set `existingSecret` to a Secret containing `rootUser` and `rootPassword`.
 Buckets, users, policies, service accounts, and custom commands can be created
