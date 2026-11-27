@@ -11,6 +11,10 @@ fullnameOverride: ""
 ##
 clusterDomain: cluster.local
 
+## Use full DNS names for peer and provisioning connections. Existing releases
+## retain short names by default; coordinate peer restarts when enabling this.
+useFQDN: false
+
 ## Set default Silo server image repository, tag, and pull policy.
 ##
 image:
@@ -60,6 +64,14 @@ extraVolumeMounts: []
 
 ## Additional sidecar containers
 extraContainers: []
+
+## Optional Kubernetes probe specifications for the server container.
+startupProbe: {}
+readinessProbe: {}
+livenessProbe: {}
+
+## Server Pod shutdown grace period. Null uses the Kubernetes default.
+terminationGracePeriodSeconds: null
 
 ## Internal port number for the Silo S3 API container.
 ## Change service.port to change external port number
@@ -224,6 +236,7 @@ ingress:
   #      - chart-example.local
 
 consoleService:
+  enabled: true
   type: ClusterIP
   clusterIP: ~
   port: "9001"
@@ -511,6 +524,8 @@ customCommandJob:
 
 ## Merge jobs
 postJob:
+  ## Null disables TTL cleanup; zero requests immediate cleanup.
+  ttlSecondsAfterFinished: null
   podAnnotations: {}
   annotations: {}
   securityContext:
