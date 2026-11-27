@@ -118,7 +118,12 @@ func applyDynamic(ctx context.Context, objectAPI ObjectLayer, cfg config.Config,
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
-	globalNotificationSys.SignalConfigReload(subSys)
+	for _, nerr := range globalNotificationSys.SignalConfigReload(subSys) {
+		if nerr.Err != nil {
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			adminLogIf(ctx, nerr.Err)
+		}
+	}
 	// Tell the client that dynamic config was applied.
 	w.Header().Set(madmin.ConfigAppliedHeader, madmin.ConfigAppliedTrue)
 }
