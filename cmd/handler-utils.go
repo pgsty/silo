@@ -370,7 +370,11 @@ func trimAwsChunkedContentEncoding(contentEnc string) (trimmedContentEnc string)
 	}
 	var newEncs []string
 	for enc := range strings.SplitSeq(contentEnc, ",") {
-		if enc != streamingContentEncoding {
+		// Content-Encoding is a comma separated list with optional
+		// whitespace around each coding, and coding names are
+		// case-insensitive, e.g. "gzip, aws-chunked".
+		enc = strings.TrimSpace(enc)
+		if !strings.EqualFold(enc, streamingContentEncoding) {
 			newEncs = append(newEncs, enc)
 		}
 	}

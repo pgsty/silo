@@ -392,3 +392,30 @@ func TestGetResource(t *testing.T) {
 		}
 	}
 }
+
+// Test trimAwsChunkedContentEncoding() removes the aws-chunked coding wherever
+// it appears in the Content-Encoding list, regardless of the optional
+// whitespace after the commas or the case of the coding name.
+func TestTrimAwsChunkedContentEncoding(t *testing.T) {
+	testCases := []struct {
+		in       string
+		expected string
+	}{
+		{"", ""},
+		{"aws-chunked", ""},
+		{"aws-chunked,gzip", "gzip"},
+		{"gzip,aws-chunked", "gzip"},
+		{"aws-chunked, gzip", "gzip"},
+		{"gzip, aws-chunked", "gzip"},
+		{"gzip , aws-chunked", "gzip"},
+		{"AWS-Chunked", ""},
+		{"gzip, AWS-Chunked", "gzip"},
+		{"gzip", "gzip"},
+		{"gzip, br", "gzip,br"},
+	}
+	for i, test := range testCases {
+		if got := trimAwsChunkedContentEncoding(test.in); got != test.expected {
+			t.Errorf("test %d: input %q: expected %q got %q", i+1, test.in, test.expected, got)
+		}
+	}
+}

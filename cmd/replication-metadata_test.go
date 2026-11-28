@@ -26,9 +26,8 @@ func TestExtractReplicationMetadataPreservesNormalizedMetadata(t *testing.T) {
 		{name: "gzip", wire: []string{"gzip"}, want: "gzip"},
 		{name: "transport-last", wire: []string{"gzip,aws-chunked"}, want: "gzip"},
 		{name: "multiple-values", wire: []string{"aws-chunked", "gzip"}, want: "gzip"},
-		// Preserve the existing exact-token grammar; whitespace is not normalized here.
-		{name: "space-before-gzip", wire: []string{"aws-chunked, gzip"}, want: " gzip"},
-		{name: "space-before-transport", wire: []string{"gzip, aws-chunked"}, want: "gzip, aws-chunked"},
+		{name: "space-before-gzip", wire: []string{"aws-chunked, gzip"}, want: "gzip"},
+		{name: "space-before-transport", wire: []string{"gzip, aws-chunked"}, want: "gzip"},
 	} {
 		for _, lowercase := range []bool{false, true} {
 			name := tc.name + "/canonical"
